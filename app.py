@@ -116,6 +116,99 @@ def seconds_to_hms(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+
+def parse_hms_to_seconds(value, default_seconds=0.0, label="time"):
+    """
+    Parse HH:MM:SS, MM:SS, or SS into seconds.
+
+    Examples:
+      06:26:51 -> 23211 seconds
+      26:51    -> 1611 seconds
+      90       -> 90 seconds
+
+    The app uses seconds internally for plotting, but all user-facing time inputs
+    are HH:MM:SS-style strings.
+    """
+    if value is None:
+        return float(default_seconds), None
+    raw = str(value).strip()
+    if raw == "":
+        return float(default_seconds), None
+
+    try:
+        parts = raw.split(":")
+        if len(parts) == 3:
+            h, m, s = parts
+            total = int(h) * 3600 + int(m) * 60 + float(s)
+        elif len(parts) == 2:
+            m, s = parts
+            total = int(m) * 60 + float(s)
+        elif len(parts) == 1:
+            total = float(parts[0])
+        else:
+            raise ValueError
+        if total < 0:
+            raise ValueError
+        return float(total), None
+    except Exception:
+        return float(default_seconds), f"Invalid {label}: '{raw}'. Use HH:MM:SS, MM:SS, or seconds."
+
+
+def seconds_to_hours_for_json(seconds):
+    return float(seconds) / 3600.0
+
+
+def time_label_from_seconds(seconds):
+    return seconds_to_hms(seconds)
+
+
+def make_time_ticks(min_sec, max_sec, n=8):
+    min_sec = float(min_sec) if np.isfinite(min_sec) else 0.0
+    max_sec = float(max_sec) if np.isfinite(max_sec) else max(min_sec + 1.0, 1.0)
+    if max_sec <= min_sec:
+        max_sec = min_sec + 1.0
+    ticks = np.linspace(min_sec, max_sec, n)
+    return ticks.tolist(), [seconds_to_hms(t) for t in ticks]
+
+
+def apply_hms_xaxis(fig, df, rows=None):
+    """Show numeric Plotly x-values as HH:MM:SS tick labels."""
+    if "time_sec" not in df.columns or df.empty:
+        return fig
+    min_sec = float(np.nanmin(df["time_sec"]))
+    max_sec = float(np.nanmax(df["time_sec"]))
+    tickvals, ticktext = make_time_ticks(min_sec, max_sec)
+    if rows is None:
+        fig.update_xaxes(title_text="Time (HH:MM:SS)", tickmode="array", tickvals=tickvals, ticktext=ticktext)
+    else:
+        for row in rows:
+            fig.update_xaxes(
+                title_text="Time (HH:MM:SS)",
+                tickmode="array",
+                tickvals=tickvals,
+                ticktext=ticktext,
+                row=row,
+                col=1,
+            )
+    return fig
+
+
+def get_start_end_seconds(item):
+    """Read visual annotation intervals, supporting old *_hr keys and new *_sec keys."""
+    if "start_sec" in item:
+        start = float(item.get("start_sec", 0.0))
+    else:
+        start = float(item.get("start_hr", 0.0)) * 3600.0
+
+    if "end_sec" in item and item.get("end_sec") is not None:
+        end = float(item.get("end_sec"))
+    elif item.get("end_hr") is not None:
+        end = float(item.get("end_hr")) * 3600.0
+    else:
+        end = None
+    return start, end
+
+
 def safe_name(name):
     return (
         str(name).replace(" ", "_")
@@ -315,10 +408,10 @@ def load_processed_csv_dataframe(df, roi):
     return df, {"input_type": "csv_processed", "note": "CSV already contained processed columns; no reprocessing was done."}
 
 
-def filter_visual_window(df, start_hr, end_hr):
-    if start_hr is None or end_hr is None:
+def filter_visual_window(df, start_sec, end_sec):
+    if start_sec is None or end_sec is None:
         return df
-    return df[(df["elapsed_hours"] >= start_hr) & (df["elapsed_hours"] <= end_hr)].copy()
+    return df[(df["time_sec"] >= start_sec) & (df["time_sec"] <= end_sec)].copy()
 
 
 def finite_limits(values, pad_fraction=0.06):
@@ -395,11 +488,10 @@ def apply_visual_exclusions(df, roi, exclusions, mode="blank"):
     df2 = df.copy()
     mask_all = np.zeros(len(df2), dtype=bool)
     for ex in exclusions:
-        start = float(ex["start_hr"])
-        end = float(ex["end_hr"])
-        if end <= start:
+        start, end = get_start_end_seconds(ex)
+        if end is None or end <= start:
             continue
-        mask_all |= (df2["elapsed_hours"].to_numpy() >= start) & (df2["elapsed_hours"].to_numpy() <= end)
+        mask_all |= (df2["time_sec"].to_numpy() >= start) & (df2["time_sec"].to_numpy() <= end)
 
     if not mask_all.any():
         return df2
@@ -428,9 +520,8 @@ def add_visual_exclusion_shapes(fig, exclusions, rows, show=True):
     if not show:
         return fig
     for ex in exclusions:
-        start = float(ex["start_hr"])
-        end = float(ex["end_hr"])
-        if end <= start:
+        start, end = get_start_end_seconds(ex)
+        if end is None or end <= start:
             continue
         for row in rows:
             fig.add_vrect(
@@ -462,8 +553,7 @@ def add_events_to_fig(fig, events, rows, show_labels=True):
 
     for ev in events:
         name = str(ev.get("name", "Event")).strip() or "Event"
-        start = ev.get("start_hr", None)
-        end = ev.get("end_hr", None)
+        start, end = get_start_end_seconds(ev)
         color = ev.get("color", "#ff4b4b")
         alpha = float(ev.get("alpha", 0.65))
         shade_alpha = float(ev.get("shade_alpha", max(0.05, alpha * 0.35)))
@@ -490,9 +580,9 @@ def add_events_to_fig(fig, events, rows, show_labels=True):
             )
 
         if show_labels:
-            label = f"<b>{name}</b><br>{start:.3f} h"
+            label = f"<b>{name}</b><br>{seconds_to_hms(start)}"
             if has_duration:
-                label += f"–{float(end):.3f} h"
+                label += f"–{seconds_to_hms(float(end))}"
             fig.add_annotation(
                 x=start, y=1.04, xref="x", yref="paper",
                 text=label, showarrow=False,
@@ -529,7 +619,7 @@ def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, sho
             "z-scored dFF",
         ),
     )
-    x = df["elapsed_hours"]
+    x = df["time_sec"]
     if f"{roi}_sig_raw" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465"), row=1, col=1)
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", showlegend=False), row=2, col=1)
@@ -549,7 +639,7 @@ def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, sho
     fig.update_yaxes(title_text="Delta-F", row=3, col=1)
     fig.update_yaxes(title_text="dFF (%)", row=4, col=1)
     fig.update_yaxes(title_text="z-dFF", row=5, col=1)
-    fig.update_xaxes(title_text="Time (hours)", row=5, col=1)
+    apply_hms_xaxis(fig, df, rows=[1, 2, 3, 4, 5])
 
     if limits:
         apply_y_range(fig, 1, limits.get("raw"))
@@ -566,14 +656,14 @@ def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, sho
 def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=650):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07,
                         subplot_titles=("465 nm calcium-dependent signal", "405 nm isosbestic/control signal"))
-    x = df["elapsed_hours"]
+    x = df["time_sec"]
     if f"{roi}_sig_raw" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="465 raw"), row=1, col=1)
     if f"{roi}_uv_raw" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="405 raw"), row=2, col=1)
     fig.update_yaxes(title_text="465 raw", row=1, col=1)
     fig.update_yaxes(title_text="405 raw", row=2, col=1)
-    fig.update_xaxes(title_text="Time (hours)", row=2, col=1)
+    apply_hms_xaxis(fig, df, rows=[1, 2])
     if limits:
         apply_y_range(fig, 1, limits.get("raw"))
         apply_y_range(fig, 2, limits.get("raw"))
@@ -585,7 +675,7 @@ def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=No
 def make_processed_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=760):
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.055,
                         subplot_titles=("Delta-F", "dFF (%) - main normalized trace", "z-scored dFF"))
-    x = df["elapsed_hours"]
+    x = df["time_sec"]
     if f"{roi}_deltaF" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F"), row=1, col=1)
     if f"{roi}_dFF" in df.columns:
@@ -595,7 +685,7 @@ def make_processed_figure(df, roi, limits=None, events=None, exclusions=None, sh
     fig.update_yaxes(title_text="Delta-F", row=1, col=1)
     fig.update_yaxes(title_text="dFF (%)", row=2, col=1)
     fig.update_yaxes(title_text="z-dFF", row=3, col=1)
-    fig.update_xaxes(title_text="Time (hours)", row=3, col=1)
+    apply_hms_xaxis(fig, df, rows=[1, 2, 3])
     if limits:
         apply_y_range(fig, 1, limits.get("deltaF"))
         apply_y_range(fig, 2, limits.get("dFF"))
@@ -607,12 +697,12 @@ def make_processed_figure(df, roi, limits=None, events=None, exclusions=None, sh
 
 def make_dual_delta_dff_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=560):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    x = df["elapsed_hours"]
+    x = df["time_sec"]
     if f"{roi}_deltaF" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F"), secondary_y=False)
     if f"{roi}_dFF" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)"), secondary_y=True)
-    fig.update_xaxes(title_text="Time (hours)")
+    apply_hms_xaxis(fig, df)
     fig.update_yaxes(title_text="Delta-F", secondary_y=False)
     fig.update_yaxes(title_text="dFF (%)", secondary_y=True)
     if limits:
@@ -623,13 +713,11 @@ def make_dual_delta_dff_figure(df, roi, limits=None, events=None, exclusions=Non
     # Single-panel dual-axis graph: add visual markers without row/col args.
     if show_exclusions:
         for ex in exclusions or []:
-            start = float(ex["start_hr"])
-            end = float(ex["end_hr"])
-            if end > start:
+            start, end = get_start_end_seconds(ex)
+            if end is not None and end > start:
                 fig.add_vrect(x0=start, x1=end, fillcolor="rgba(180,180,180,0.13)", line_width=0)
     for ev in events or []:
-        start = ev.get("start_hr", None)
-        end = ev.get("end_hr", None)
+        start, end = get_start_end_seconds(ev)
         if start is None:
             continue
         color = ev.get("color", "#ff4b4b")
@@ -643,7 +731,7 @@ def make_dual_delta_dff_figure(df, roi, limits=None, events=None, exclusions=Non
         if show_event_labels:
             fig.add_annotation(
                 x=float(start), y=1.04, xref="x", yref="paper",
-                text=f"<b>{ev.get('name','Event')}</b>", showarrow=False,
+                text=f"<b>{ev.get('name','Event')}</b><br>{seconds_to_hms(float(start))}", showarrow=False,
                 font=dict(size=10, color=color), bgcolor="rgba(255,255,255,0.60)",
                 bordercolor=color, borderwidth=1, borderpad=2,
             )
@@ -675,108 +763,138 @@ def make_zip_from_results(results, roi):
 # =============================================================================
 
 with st.sidebar:
-    st.header("Inputs")
-    uploaded_files = st.file_uploader(
-        "Upload .ppd or .csv file(s)",
-        type=["ppd", "csv"],
-        accept_multiple_files=True,
-        help="PPD files are sent to ana.py. CSV files are either processed directly or displayed if already processed.",
-    )
-    roi_name = st.text_input("ROI name", value="BLA")
-    scale_mode = st.selectbox("Auto y-axis scaling", ["full", "robust", "none"], index=0)
-    save_full = st.checkbox("Save full 20 Hz processed CSV for PPD runs", value=False)
+    with st.expander("1. Inputs", expanded=True):
+        uploaded_files = st.file_uploader(
+            "Upload .ppd or .csv file(s)",
+            type=["ppd", "csv"],
+            accept_multiple_files=True,
+            help="PPD files are sent to ana.py. CSV files are either processed directly or displayed if already processed.",
+        )
+        roi_name = st.text_input("ROI name", value="BLA")
+        scale_mode = st.selectbox("Auto y-axis scaling", ["full", "robust", "none"], index=0)
+        save_full = st.checkbox("Save full 20 Hz processed CSV for PPD runs", value=False)
 
-    st.divider()
-    st.header("Graph display")
-    graph_size = st.selectbox("Graph size", ["Normal", "Large", "Maximized"], index=0)
-    focus_mode = st.checkbox("Maximize one graph only", value=False)
-    focus_graph = st.selectbox(
-        "Graph to maximize",
-        ["Overview", "Raw channels", "Processed", "Delta-F + dFF"],
-        index=0,
-        disabled=not focus_mode,
-    )
-    show_event_labels = st.checkbox("Show event labels above graphs", value=True)
-    show_hidden_region_shading = st.checkbox("Mark hidden regions with pale gray shading", value=True)
-    st.caption("Mouse/trackpad scroll zoom is disabled. Use graph size/focus mode to view graphs larger.")
+    with st.expander("2. Graph display", expanded=False):
+        graph_size = st.selectbox("Graph size", ["Normal", "Large", "Maximized"], index=0)
+        focus_mode = st.checkbox("Maximize one graph only", value=False)
+        focus_graph = st.selectbox(
+            "Graph to maximize",
+            ["Overview", "Raw channels", "Processed", "Delta-F + dFF"],
+            index=0,
+            disabled=not focus_mode,
+        )
+        show_event_labels = st.checkbox("Show event labels above graphs", value=True)
+        show_hidden_region_shading = st.checkbox("Mark hidden regions with pale gray shading", value=True)
+        st.caption("Mouse/trackpad scroll zoom is disabled. Use graph size/focus mode to view graphs larger.")
 
-    st.divider()
-    st.header("Visual window only")
-    use_window = st.checkbox(
-        "Cut/zoom to a time region for viewing",
-        value=False,
-        help="This only changes what you see on the webpage. It does not change the saved processed CSV.",
-    )
-    start_hr = st.number_input("Start hour", value=0.0, min_value=0.0, step=0.1)
-    end_hr = st.number_input("End hour", value=7.5, min_value=0.0, step=0.1)
+    with st.expander("3. Visual crop window", expanded=False):
+        use_window = st.checkbox(
+            "View only a time window",
+            value=False,
+            help="This only changes what you see on the webpage. It does not change the saved processed CSV.",
+        )
+        window_start_hms = st.text_input("Window start time (HH:MM:SS)", value="00:00:00")
+        window_end_hms = st.text_input("Window end time (HH:MM:SS)", value="07:30:00")
+        start_sec, start_err = parse_hms_to_seconds(window_start_hms, 0.0, "window start time")
+        end_sec, end_err = parse_hms_to_seconds(window_end_hms, 7.5 * 3600, "window end time")
+        if start_err:
+            st.error(start_err)
+        if end_err:
+            st.error(end_err)
+        if use_window and end_sec <= start_sec:
+            st.error("Window end time must be after start time.")
 
-    st.divider()
-    st.header("Hide/remove time periods visually")
-    st.caption("These controls only affect the graph display. They do not alter downloaded processed CSVs.")
-    if st.button("Clear hidden time periods", use_container_width=True):
-        st.session_state["num_exclusions"] = 0
-    exclusion_mode = st.radio(
-        "How to hide selected regions",
-        ["Blank signal but keep true time axis", "Remove rows from visual display"],
-        index=0,
-    )
-    exclusion_mode_code = "blank" if exclusion_mode.startswith("Blank") else "remove_rows"
-    num_exclusions = st.number_input(
-        "Number of time periods to hide",
-        min_value=0,
-        max_value=20,
-        step=1,
-        key="num_exclusions",
-    )
-    visual_exclusions = []
-    for i in range(int(num_exclusions)):
-        with st.expander(f"Hidden region {i + 1}", expanded=True):
-            c1, c2 = st.columns(2)
-            ex_start = c1.number_input(f"Start hour {i + 1}", min_value=0.0, value=0.0, step=0.1, key=f"ex_start_{i}")
-            ex_end = c2.number_input(f"End hour {i + 1}", min_value=0.0, value=0.1, step=0.1, key=f"ex_end_{i}")
-            if ex_end > ex_start:
-                visual_exclusions.append({"start_hr": ex_start, "end_hr": ex_end})
+    with st.expander("4. Hide/remove time periods visually", expanded=False):
+        st.caption("These controls only affect graph display. They do not alter downloaded processed CSVs.")
+        if st.button("Clear hidden time periods", use_container_width=True):
+            st.session_state["num_exclusions"] = 0
+        exclusion_mode = st.radio(
+            "How to hide selected regions",
+            ["Blank signal but keep true time axis", "Remove rows from visual display"],
+            index=0,
+        )
+        exclusion_mode_code = "blank" if exclusion_mode.startswith("Blank") else "remove_rows"
+        num_exclusions = st.number_input(
+            "Number of time periods to hide",
+            min_value=0,
+            max_value=20,
+            step=1,
+            key="num_exclusions",
+        )
+        visual_exclusions = []
+        for i in range(int(num_exclusions)):
+            with st.expander(f"Hidden region {i + 1} timing", expanded=True):
+                ex_start_hms = st.text_input(f"Hidden region {i + 1} start (HH:MM:SS)", value="00:00:00", key=f"ex_start_hms_{i}")
+                ex_end_hms = st.text_input(f"Hidden region {i + 1} end (HH:MM:SS)", value="00:01:00", key=f"ex_end_hms_{i}")
+                ex_start, ex_start_err = parse_hms_to_seconds(ex_start_hms, 0.0, f"hidden region {i + 1} start")
+                ex_end, ex_end_err = parse_hms_to_seconds(ex_end_hms, 60.0, f"hidden region {i + 1} end")
+                if ex_start_err:
+                    st.error(ex_start_err)
+                if ex_end_err:
+                    st.error(ex_end_err)
+                if ex_end > ex_start:
+                    visual_exclusions.append({
+                        "start_sec": ex_start,
+                        "end_sec": ex_end,
+                        "start_hhmmss": seconds_to_hms(ex_start),
+                        "end_hhmmss": seconds_to_hms(ex_end),
+                    })
+                else:
+                    st.warning("End time must be after start time for this hidden region.")
 
-    st.divider()
-    st.header("Event lines / shaded epochs")
-    if st.button("Clear event annotations", use_container_width=True):
-        st.session_state["num_events"] = 0
-    num_events = st.number_input(
-        "Number of events/epochs",
-        min_value=0,
-        max_value=50,
-        step=1,
-        key="num_events",
-    )
-    event_annotations = []
-    for i in range(int(num_events)):
-        with st.expander(f"Event / epoch {i + 1}", expanded=True):
-            name = st.text_input("Event name", value=f"Event {i + 1}", key=f"ev_name_{i}")
-            start = st.number_input("Start hour", min_value=0.0, value=0.0, step=0.01, key=f"ev_start_{i}")
-            has_duration = st.checkbox("This event lasts for a duration", value=False, key=f"ev_duration_{i}")
-            end = None
-            if has_duration:
-                end = st.number_input("End hour", min_value=0.0, value=max(start + 0.01, 0.01), step=0.01, key=f"ev_end_{i}")
-            color = st.color_picker("Line/shade color", value="#ff4b4b", key=f"ev_color_{i}")
-            alpha = st.slider("Dotted line transparency", 0.05, 1.0, 0.65, 0.05, key=f"ev_alpha_{i}")
-            shade_alpha = st.slider("Duration shade transparency", 0.02, 0.80, 0.18, 0.02, key=f"ev_shade_alpha_{i}")
+    with st.expander("5. Event lines / shaded epochs", expanded=False):
+        if st.button("Clear event annotations", use_container_width=True):
+            st.session_state["num_events"] = 0
+        num_events = st.number_input(
+            "Number of events/epochs",
+            min_value=0,
+            max_value=50,
+            step=1,
+            key="num_events",
+        )
+        event_annotations = []
+        for i in range(int(num_events)):
+            with st.expander(f"Event / epoch {i + 1}: name and timing", expanded=True):
+                name = st.text_input("Event name", value=f"Event {i + 1}", key=f"ev_name_{i}")
+                start_hms = st.text_input("Start time (HH:MM:SS)", value="00:00:00", key=f"ev_start_hms_{i}")
+                start, start_time_err = parse_hms_to_seconds(start_hms, 0.0, f"event {i + 1} start time")
+                if start_time_err:
+                    st.error(start_time_err)
+                has_duration = st.checkbox("This event lasts for a duration", value=False, key=f"ev_duration_{i}")
+                end = None
+                end_hms = ""
+                if has_duration:
+                    end_hms = st.text_input("End time (HH:MM:SS)", value=seconds_to_hms(start + 60.0), key=f"ev_end_hms_{i}")
+                    end, end_time_err = parse_hms_to_seconds(end_hms, start + 60.0, f"event {i + 1} end time")
+                    if end_time_err:
+                        st.error(end_time_err)
+                    if end <= start:
+                        st.warning("Event end time must be after start time to shade a duration.")
+                        end = None
+
+            with st.expander(f"Event / epoch {i + 1}: color and shading", expanded=False):
+                color = st.color_picker("Dotted line / shade color", value="#ff4b4b", key=f"ev_color_{i}")
+                alpha = st.slider("Dotted line transparency", 0.05, 1.0, 0.65, 0.05, key=f"ev_alpha_{i}")
+                shade_alpha = st.slider("Duration shade transparency", 0.02, 0.80, 0.18, 0.02, key=f"ev_shade_alpha_{i}")
+
             event_annotations.append({
                 "name": name,
-                "start_hr": float(start),
-                "end_hr": float(end) if end is not None else None,
+                "start_sec": float(start),
+                "end_sec": float(end) if end is not None else None,
+                "start_hhmmss": seconds_to_hms(start),
+                "end_hhmmss": seconds_to_hms(end) if end is not None else None,
                 "color": color,
                 "alpha": float(alpha),
                 "shade_alpha": float(shade_alpha),
             })
 
-    st.divider()
-    st.header("Manual y-scales")
-    st.caption("Leave blank to use autoscale. Type as: min,max")
-    manual_raw = st.text_input("Raw y-scale", value="")
-    manual_fit = st.text_input("Fit-check y-scale", value="")
-    manual_delta = st.text_input("Delta-F y-scale", value="")
-    manual_dff = st.text_input("dFF (%) y-scale", value="")
-    manual_z = st.text_input("z-dFF y-scale", value="")
+    with st.expander("6. Manual y-scales", expanded=False):
+        st.caption("Leave blank to use autoscale. Type as: min,max")
+        manual_raw = st.text_input("Raw y-scale", value="")
+        manual_fit = st.text_input("Fit-check y-scale", value="")
+        manual_delta = st.text_input("Delta-F y-scale", value="")
+        manual_dff = st.text_input("dFF (%) y-scale", value="")
+        manual_z = st.text_input("z-dFF y-scale", value="")
 
 # =============================================================================
 # RUN ANALYSIS
@@ -888,9 +1006,9 @@ else:
 
     st.success(f"Loaded {len(results)} recording(s).")
     c1, c2, c3, c4 = st.columns(4)
-    max_duration = max(float(r["df"]["elapsed_hours"].max()) for r in results)
+    max_duration = max(float(r["df"]["time_sec"].max()) for r in results)
     c1.metric("Recordings loaded", len(results))
-    c2.metric("Max duration", f"{max_duration:.2f} hr")
+    c2.metric("Max duration", seconds_to_hms(max_duration))
     c3.metric("ROI", roi_name)
     c4.metric("Hidden regions", len(visual_exclusions))
 
@@ -898,7 +1016,7 @@ else:
         st.json({
             "auto_limits": {k: list(v) if v else None for k, v in auto.items()},
             "active_limits_after_manual_override": {k: list(v) if v else None for k, v in manual_limits.items()},
-            "visual_window_hours": [start_hr, end_hr] if use_window else "full recording",
+            "visual_window": [seconds_to_hms(start_sec), seconds_to_hms(end_sec)] if use_window else "full recording",
             "note": "Visual window affects only webpage display, not downloaded processed CSV files.",
         })
 
@@ -914,7 +1032,7 @@ else:
 
     for idx, result in enumerate(results, start=1):
         full_df = result["df"]
-        view_df = filter_visual_window(full_df, start_hr, end_hr) if use_window else full_df
+        view_df = filter_visual_window(full_df, start_sec, end_sec) if use_window else full_df
         view_df = apply_visual_exclusions(view_df, roi_name, visual_exclusions, mode=exclusion_mode_code)
         if view_df.empty:
             st.warning(f"{result['name']}: visual window has no data.")
