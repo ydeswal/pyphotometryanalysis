@@ -137,6 +137,147 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+
+# Strong high-contrast light-mode override for Streamlit/BaseWeb widgets.
+st.markdown(
+    """
+    <style>
+    :root { color-scheme: light !important; }
+
+    html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stAppViewBlockContainer"] {
+        background: #ffffff !important;
+        color: #111827 !important;
+    }
+
+    [data-testid="stHeader"], [data-testid="stToolbar"] {
+        background: rgba(255,255,255,0.96) !important;
+        color: #111827 !important;
+    }
+
+    section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div {
+        background: #ffffff !important;
+        color: #111827 !important;
+        border-right: 1px solid #d1d5db !important;
+    }
+
+    section[data-testid="stSidebar"] *:not(svg):not(path) {
+        color: #111827 !important;
+    }
+
+    .small-header {
+        background: #ffffff !important;
+        border: 1px solid #d1d5db !important;
+        border-radius: 0.65rem !important;
+        color: #111827 !important;
+        box-shadow: 0 1px 8px rgba(15,23,42,0.08) !important;
+    }
+
+    .small-header-title,
+    .small-header-subtitle,
+    h1, h2, h3, h4, h5, h6, p, label, span {
+        color: #111827 !important;
+    }
+
+    div[data-testid="stExpander"] {
+        background: #ffffff !important;
+        border: 1px solid #cbd5e1 !important;
+        border-radius: 0.65rem !important;
+        box-shadow: 0 1px 3px rgba(15,23,42,0.05) !important;
+        overflow: hidden !important;
+    }
+
+    div[data-testid="stExpander"] details summary {
+        background: #f8fafc !important;
+        color: #111827 !important;
+        border-bottom: 1px solid #e5e7eb !important;
+    }
+
+    div[data-baseweb="input"],
+    div[data-baseweb="select"] > div,
+    div[data-baseweb="textarea"],
+    input,
+    textarea {
+        background-color: #ffffff !important;
+        color: #111827 !important;
+        border-color: #64748b !important;
+        caret-color: #111827 !important;
+    }
+
+    div[data-baseweb="input"] input,
+    div[data-baseweb="select"] span,
+    div[data-baseweb="select"] div,
+    div[data-baseweb="popover"] div,
+    [role="option"] {
+        color: #111827 !important;
+        background-color: #ffffff !important;
+    }
+
+    div[data-baseweb="popover"],
+    div[data-baseweb="popover"] ul,
+    ul[role="listbox"] {
+        background: #ffffff !important;
+        color: #111827 !important;
+        border: 1px solid #94a3b8 !important;
+    }
+
+    button,
+    [data-testid="stBaseButton-secondary"],
+    [data-testid="stBaseButton-primary"] {
+        background: #ffffff !important;
+        color: #111827 !important;
+        border: 1px solid #64748b !important;
+        box-shadow: none !important;
+    }
+
+    [data-testid="stBaseButton-primary"] {
+        background: #2563eb !important;
+        color: #ffffff !important;
+        border-color: #1d4ed8 !important;
+    }
+
+    [data-testid="stFileUploader"] section,
+    [data-testid="stFileUploader"] div {
+        background: #ffffff !important;
+        color: #111827 !important;
+        border-color: #94a3b8 !important;
+    }
+
+    .stTabs [data-baseweb="tab-list"] {
+        background: #ffffff !important;
+        border-bottom: 1px solid #d1d5db !important;
+    }
+
+    .stTabs [data-baseweb="tab"] {
+        color: #111827 !important;
+        background: #ffffff !important;
+    }
+
+    .stTabs [aria-selected="true"] {
+        color: #dc2626 !important;
+        border-bottom-color: #dc2626 !important;
+    }
+
+    div[data-testid="stMetric"] {
+        background: #ffffff !important;
+        border: 1px solid #d1d5db !important;
+        color: #111827 !important;
+    }
+
+    .note-box-light {
+        border-left: 3px solid #2563eb;
+        padding: 0.45rem 0.6rem;
+        background: #eff6ff;
+        border-radius: 0.35rem;
+        font-size: 0.85rem;
+        margin-bottom: 0.5rem;
+        color: #1f2937;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.markdown(
     """
     <div class="small-header">
@@ -224,31 +365,51 @@ def time_label_from_seconds(seconds):
     return seconds_to_hms(seconds)
 
 
-def make_time_ticks(min_sec, max_sec, n=8):
+def make_time_ticks(min_sec, max_sec, n=None):
+    """Return standard x-axis ticks every 30 minutes, labeled HH:MM:SS."""
+    interval = 30 * 60  # 30 minutes in seconds
     min_sec = float(min_sec) if np.isfinite(min_sec) else 0.0
-    max_sec = float(max_sec) if np.isfinite(max_sec) else max(min_sec + 1.0, 1.0)
+    max_sec = float(max_sec) if np.isfinite(max_sec) else max(min_sec + interval, interval)
     if max_sec <= min_sec:
-        max_sec = min_sec + 1.0
-    ticks = np.linspace(min_sec, max_sec, n)
+        max_sec = min_sec + interval
+
+    start_tick = max(0.0, np.floor(min_sec / interval) * interval)
+    end_tick = np.ceil(max_sec / interval) * interval
+    ticks = np.arange(start_tick, end_tick + interval * 0.5, interval, dtype=float)
+    if ticks.size == 0:
+        ticks = np.array([0.0, float(interval)])
     return ticks.tolist(), [seconds_to_hms(t) for t in ticks]
 
 
 def apply_hms_xaxis(fig, df, rows=None):
-    """Show numeric Plotly x-values as HH:MM:SS tick labels."""
+    """Show standard 30-minute x-axis tick marks as HH:MM:SS without overlapping subplot text."""
     if "time_sec" not in df.columns or df.empty:
         return fig
     min_sec = float(np.nanmin(df["time_sec"]))
     max_sec = float(np.nanmax(df["time_sec"]))
     tickvals, ticktext = make_time_ticks(min_sec, max_sec)
+
     if rows is None:
-        fig.update_xaxes(title_text="Time (HH:MM:SS)", tickmode="array", tickvals=tickvals, ticktext=ticktext)
+        fig.update_xaxes(
+            title_text="Time (HH:MM:SS)",
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+            tickangle=0,
+            automargin=True,
+        )
     else:
+        bottom_row = max(rows)
         for row in rows:
+            show_labels = row == bottom_row
             fig.update_xaxes(
-                title_text="Time (HH:MM:SS)",
+                title_text="Time (HH:MM:SS)" if show_labels else "",
                 tickmode="array",
                 tickvals=tickvals,
                 ticktext=ticktext,
+                showticklabels=show_labels,
+                tickangle=0,
+                automargin=True,
                 row=row,
                 col=1,
             )
@@ -850,31 +1011,56 @@ def finish_fig(fig, height, show_legend=True, df=None):
         template="plotly_white",
         paper_bgcolor="#ffffff",
         plot_bgcolor="#ffffff",
-        font=dict(color="#111827"),
+        font=dict(color="#111827", size=13),
         height=height,
-        margin=dict(l=45, r=25, t=70, b=40),
+        margin=dict(l=70, r=35, t=115, b=70),
         hovermode="x unified",
         dragmode="pan",
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.10,
+            xanchor="left",
+            x=0,
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#d1d5db",
+            borderwidth=1,
+        ),
         showlegend=show_legend,
     )
-    fig.update_xaxes(showgrid=True, gridcolor="#e5e7eb", zeroline=False)
-    fig.update_yaxes(showgrid=True, gridcolor="#e5e7eb", zeroline=False)
+    fig.update_annotations(font=dict(size=14, color="#111827"), yshift=8)
+    fig.update_xaxes(
+        showgrid=True,
+        gridcolor="#e5e7eb",
+        zeroline=False,
+        linecolor="#9ca3af",
+        tickfont=dict(color="#111827", size=11),
+        title_font=dict(color="#111827", size=12),
+        automargin=True,
+    )
+    fig.update_yaxes(
+        showgrid=True,
+        gridcolor="#e5e7eb",
+        zeroline=False,
+        linecolor="#9ca3af",
+        tickfont=dict(color="#111827", size=11),
+        title_font=dict(color="#111827", size=12),
+        automargin=True,
+    )
     return fig
 
 
-def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=900):
-    """Overview without a duplicate dFF row. The single dFF graph lives in the Main dFF tab."""
+def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=850):
+    """Overview without any dFF duplicate. The single dFF graph lives in the Main dFF tab."""
     fig = make_subplots(
-        rows=4,
+        rows=3,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.045,
+        vertical_spacing=0.095,
         subplot_titles=(
             "Raw 465 and 405 together",
             "Correction check: 465 signal and fitted 405",
             "Delta-F corrected signal",
-            "z-scored dFF",
         ),
     )
     x = df["time_sec"]
@@ -887,23 +1073,19 @@ def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, sho
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_fit"], mode="lines", name="UV Fit / fitted 405"), row=2, col=1)
     if f"{roi}_deltaF" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F"), row=3, col=1)
-    if f"{roi}_z_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_z_dFF"], mode="lines", name="z-dFF"), row=4, col=1)
 
     fig.update_yaxes(title_text="Raw", row=1, col=1)
     fig.update_yaxes(title_text="Fit", row=2, col=1)
     fig.update_yaxes(title_text="Delta-F", row=3, col=1)
-    fig.update_yaxes(title_text="z-dFF", row=4, col=1)
-    apply_hms_xaxis(fig, df, rows=[1, 2, 3, 4])
+    apply_hms_xaxis(fig, df, rows=[1, 2, 3])
 
     if limits:
         apply_y_range(fig, 1, limits.get("raw"))
         apply_y_range(fig, 2, limits.get("fit"))
         apply_y_range(fig, 3, limits.get("deltaF"))
-        apply_y_range(fig, 4, limits.get("z_dFF"))
 
-    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1, 2, 3, 4], show=show_exclusions)
-    add_events_to_fig(fig, events or [], rows=[1, 2, 3, 4], show_labels=show_event_labels)
+    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1, 2, 3], show=show_exclusions)
+    add_events_to_fig(fig, events or [], rows=[1, 2, 3], show_labels=show_event_labels)
     return finish_fig(fig, height=height, df=df)
 
 
@@ -1186,7 +1368,7 @@ else:
     }
 
     height_mult = {"Normal": 1.0, "Large": 1.35, "Maximized": 1.85}[graph_size]
-    overview_h = int(1050 * height_mult)
+    overview_h = int(850 * height_mult)
     raw_h = int(650 * height_mult)
     processed_h = int(760 * height_mult)
     dual_h = int(560 * height_mult)
