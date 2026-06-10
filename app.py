@@ -97,6 +97,13 @@ REGRESSION_WINDOW_SEC = 60.0
 BASELINE_PERCENTILE = 10.0
 EXPORT_HZ_DEFAULT = 1.0
 
+PLOTLY_CONFIG = {
+    "scrollZoom": False,  # prevents mouse/trackpad scroll from zooming graphs
+    "displaylogo": False,
+    "responsive": True,
+    "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+}
+
 # =============================================================================
 # HELPERS
 # =============================================================================
@@ -362,7 +369,153 @@ def apply_y_range(fig, row, limit):
         fig.update_yaxes(range=[limit[0], limit[1]], row=row, col=1)
 
 
-def make_overview_figure(df, roi, limits=None):
+def signal_columns(df, roi):
+    """Columns that should be hidden when visual-only time periods are removed."""
+    candidates = [
+        f"{roi}_uv_raw",
+        f"{roi}_sig_raw",
+        f"{roi}_uv_fit",
+        f"{roi}_deltaF",
+        f"{roi}_dFF",
+        f"{roi}_z_dFF",
+        f"{roi}_dff",
+        f"{roi}_z_dff",
+    ]
+    return [c for c in candidates if c in df.columns]
+
+
+def apply_visual_exclusions(df, roi, exclusions, mode="blank"):
+    """
+    Hide selected time periods visually only.
+    The full processed CSV stored in session_state is not changed.
+    """
+    if not exclusions:
+        return df
+
+    df2 = df.copy()
+    mask_all = np.zeros(len(df2), dtype=bool)
+    for ex in exclusions:
+        start = float(ex["start_hr"])
+        end = float(ex["end_hr"])
+        if end <= start:
+            continue
+        mask_all |= (df2["elapsed_hours"].to_numpy() >= start) & (df2["elapsed_hours"].to_numpy() <= end)
+
+    if not mask_all.any():
+        return df2
+
+    if mode == "remove_rows":
+        return df2.loc[~mask_all].copy()
+
+    # Default: blank signal values with NaN, preserving the true time axis.
+    for c in signal_columns(df2, roi):
+        df2.loc[mask_all, c] = np.nan
+    return df2
+
+
+def hex_to_rgba(hex_color, alpha):
+    """Convert #RRGGBB to rgba(r,g,b,a)."""
+    if not isinstance(hex_color, str) or not hex_color.startswith("#") or len(hex_color) != 7:
+        hex_color = "#808080"
+    r = int(hex_color[1:3], 16)
+    g = int(hex_color[3:5], 16)
+    b = int(hex_color[5:7], 16)
+    return f"rgba({r},{g},{b},{float(alpha):.3f})"
+
+
+def add_visual_exclusion_shapes(fig, exclusions, rows, show=True):
+    """Light gray marks for visually hidden/cut regions."""
+    if not show:
+        return fig
+    for ex in exclusions:
+        start = float(ex["start_hr"])
+        end = float(ex["end_hr"])
+        if end <= start:
+            continue
+        for row in rows:
+            fig.add_vrect(
+                x0=start, x1=end,
+                fillcolor="rgba(180,180,180,0.13)",
+                line_width=0,
+                row=row, col=1,
+            )
+            fig.add_vline(
+                x=start, line_width=1, line_dash="dash",
+                line_color="rgba(180,180,180,0.40)",
+                row=row, col=1,
+            )
+            fig.add_vline(
+                x=end, line_width=1, line_dash="dash",
+                line_color="rgba(180,180,180,0.40)",
+                row=row, col=1,
+            )
+    return fig
+
+
+def add_events_to_fig(fig, events, rows, show_labels=True):
+    """
+    Add event lines and optional duration shading.
+    Events are visual annotations only; they do not change the data.
+    """
+    if not events:
+        return fig
+
+    for ev in events:
+        name = str(ev.get("name", "Event")).strip() or "Event"
+        start = ev.get("start_hr", None)
+        end = ev.get("end_hr", None)
+        color = ev.get("color", "#ff4b4b")
+        alpha = float(ev.get("alpha", 0.65))
+        shade_alpha = float(ev.get("shade_alpha", max(0.05, alpha * 0.35)))
+
+        if start is None or not np.isfinite(start):
+            continue
+        start = float(start)
+        has_duration = end is not None and np.isfinite(end) and float(end) > start
+        line_color = hex_to_rgba(color, alpha)
+
+        for row in rows:
+            if has_duration:
+                fig.add_vrect(
+                    x0=start, x1=float(end), fillcolor=color, opacity=shade_alpha,
+                    line_width=0, row=row, col=1,
+                )
+                fig.add_vline(
+                    x=float(end), line_width=1.4, line_dash="dot",
+                    line_color=line_color, row=row, col=1,
+                )
+            fig.add_vline(
+                x=start, line_width=1.4, line_dash="dot",
+                line_color=line_color, row=row, col=1,
+            )
+
+        if show_labels:
+            label = f"<b>{name}</b><br>{start:.3f} h"
+            if has_duration:
+                label += f"–{float(end):.3f} h"
+            fig.add_annotation(
+                x=start, y=1.04, xref="x", yref="paper",
+                text=label, showarrow=False,
+                font=dict(size=10, color=color), align="center",
+                bgcolor="rgba(255,255,255,0.60)",
+                bordercolor=color, borderwidth=1, borderpad=2,
+            )
+    return fig
+
+
+def finish_fig(fig, height, show_legend=True):
+    fig.update_layout(
+        height=height,
+        margin=dict(l=45, r=25, t=70, b=40),
+        hovermode="x unified",
+        dragmode="pan",  # drag pans by default; scroll-wheel zoom is disabled in PLOTLY_CONFIG
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        showlegend=show_legend,
+    )
+    return fig
+
+
+def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=1050):
     fig = make_subplots(
         rows=5,
         cols=1,
@@ -405,16 +558,12 @@ def make_overview_figure(df, roi, limits=None):
         apply_y_range(fig, 4, limits.get("dFF"))
         apply_y_range(fig, 5, limits.get("z_dFF"))
 
-    fig.update_layout(
-        height=1050,
-        margin=dict(l=45, r=25, t=60, b=40),
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-    )
-    return fig
+    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1, 2, 3, 4, 5], show=show_exclusions)
+    add_events_to_fig(fig, events or [], rows=[1, 2, 3, 4, 5], show_labels=show_event_labels)
+    return finish_fig(fig, height=height)
 
 
-def make_raw_independent_figure(df, roi, limits=None):
+def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=650):
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07,
                         subplot_titles=("465 nm calcium-dependent signal", "405 nm isosbestic/control signal"))
     x = df["elapsed_hours"]
@@ -428,11 +577,12 @@ def make_raw_independent_figure(df, roi, limits=None):
     if limits:
         apply_y_range(fig, 1, limits.get("raw"))
         apply_y_range(fig, 2, limits.get("raw"))
-    fig.update_layout(height=650, margin=dict(l=45, r=25, t=60, b=40), hovermode="x unified")
-    return fig
+    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1, 2], show=show_exclusions)
+    add_events_to_fig(fig, events or [], rows=[1, 2], show_labels=show_event_labels)
+    return finish_fig(fig, height=height)
 
 
-def make_processed_figure(df, roi, limits=None):
+def make_processed_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=760):
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.055,
                         subplot_titles=("Delta-F", "dFF (%) - main normalized trace", "z-scored dFF"))
     x = df["elapsed_hours"]
@@ -450,11 +600,12 @@ def make_processed_figure(df, roi, limits=None):
         apply_y_range(fig, 1, limits.get("deltaF"))
         apply_y_range(fig, 2, limits.get("dFF"))
         apply_y_range(fig, 3, limits.get("z_dFF"))
-    fig.update_layout(height=760, margin=dict(l=45, r=25, t=60, b=40), hovermode="x unified")
-    return fig
+    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1, 2, 3], show=show_exclusions)
+    add_events_to_fig(fig, events or [], rows=[1, 2, 3], show_labels=show_event_labels)
+    return finish_fig(fig, height=height)
 
 
-def make_dual_delta_dff_figure(df, roi, limits=None):
+def make_dual_delta_dff_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=560):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     x = df["elapsed_hours"]
     if f"{roi}_deltaF" in df.columns:
@@ -469,8 +620,34 @@ def make_dual_delta_dff_figure(df, roi, limits=None):
             fig.update_yaxes(range=list(limits["deltaF"]), secondary_y=False)
         if limits.get("dFF") is not None:
             fig.update_yaxes(range=list(limits["dFF"]), secondary_y=True)
-    fig.update_layout(height=560, margin=dict(l=45, r=45, t=40, b=40), hovermode="x unified")
-    return fig
+    # Single-panel dual-axis graph: add visual markers without row/col args.
+    if show_exclusions:
+        for ex in exclusions or []:
+            start = float(ex["start_hr"])
+            end = float(ex["end_hr"])
+            if end > start:
+                fig.add_vrect(x0=start, x1=end, fillcolor="rgba(180,180,180,0.13)", line_width=0)
+    for ev in events or []:
+        start = ev.get("start_hr", None)
+        end = ev.get("end_hr", None)
+        if start is None:
+            continue
+        color = ev.get("color", "#ff4b4b")
+        alpha = float(ev.get("alpha", 0.65))
+        shade_alpha = float(ev.get("shade_alpha", max(0.05, alpha * 0.35)))
+        line_color = hex_to_rgba(color, alpha)
+        fig.add_vline(x=float(start), line_width=1.4, line_dash="dot", line_color=line_color)
+        if end is not None and np.isfinite(end) and float(end) > float(start):
+            fig.add_vrect(x0=float(start), x1=float(end), fillcolor=color, opacity=shade_alpha, line_width=0)
+            fig.add_vline(x=float(end), line_width=1.4, line_dash="dot", line_color=line_color)
+        if show_event_labels:
+            fig.add_annotation(
+                x=float(start), y=1.04, xref="x", yref="paper",
+                text=f"<b>{ev.get('name','Event')}</b>", showarrow=False,
+                font=dict(size=10, color=color), bgcolor="rgba(255,255,255,0.60)",
+                bordercolor=color, borderwidth=1, borderpad=2,
+            )
+    return finish_fig(fig, height=height)
 
 
 def make_zip_from_results(results, roi):
@@ -510,6 +687,20 @@ with st.sidebar:
     save_full = st.checkbox("Save full 20 Hz processed CSV for PPD runs", value=False)
 
     st.divider()
+    st.header("Graph display")
+    graph_size = st.selectbox("Graph size", ["Normal", "Large", "Maximized"], index=0)
+    focus_mode = st.checkbox("Maximize one graph only", value=False)
+    focus_graph = st.selectbox(
+        "Graph to maximize",
+        ["Overview", "Raw channels", "Processed", "Delta-F + dFF"],
+        index=0,
+        disabled=not focus_mode,
+    )
+    show_event_labels = st.checkbox("Show event labels above graphs", value=True)
+    show_hidden_region_shading = st.checkbox("Mark hidden regions with pale gray shading", value=True)
+    st.caption("Mouse/trackpad scroll zoom is disabled. Use graph size/focus mode to view graphs larger.")
+
+    st.divider()
     st.header("Visual window only")
     use_window = st.checkbox(
         "Cut/zoom to a time region for viewing",
@@ -518,6 +709,65 @@ with st.sidebar:
     )
     start_hr = st.number_input("Start hour", value=0.0, min_value=0.0, step=0.1)
     end_hr = st.number_input("End hour", value=7.5, min_value=0.0, step=0.1)
+
+    st.divider()
+    st.header("Hide/remove time periods visually")
+    st.caption("These controls only affect the graph display. They do not alter downloaded processed CSVs.")
+    if st.button("Clear hidden time periods", use_container_width=True):
+        st.session_state["num_exclusions"] = 0
+    exclusion_mode = st.radio(
+        "How to hide selected regions",
+        ["Blank signal but keep true time axis", "Remove rows from visual display"],
+        index=0,
+    )
+    exclusion_mode_code = "blank" if exclusion_mode.startswith("Blank") else "remove_rows"
+    num_exclusions = st.number_input(
+        "Number of time periods to hide",
+        min_value=0,
+        max_value=20,
+        step=1,
+        key="num_exclusions",
+    )
+    visual_exclusions = []
+    for i in range(int(num_exclusions)):
+        with st.expander(f"Hidden region {i + 1}", expanded=True):
+            c1, c2 = st.columns(2)
+            ex_start = c1.number_input(f"Start hour {i + 1}", min_value=0.0, value=0.0, step=0.1, key=f"ex_start_{i}")
+            ex_end = c2.number_input(f"End hour {i + 1}", min_value=0.0, value=0.1, step=0.1, key=f"ex_end_{i}")
+            if ex_end > ex_start:
+                visual_exclusions.append({"start_hr": ex_start, "end_hr": ex_end})
+
+    st.divider()
+    st.header("Event lines / shaded epochs")
+    if st.button("Clear event annotations", use_container_width=True):
+        st.session_state["num_events"] = 0
+    num_events = st.number_input(
+        "Number of events/epochs",
+        min_value=0,
+        max_value=50,
+        step=1,
+        key="num_events",
+    )
+    event_annotations = []
+    for i in range(int(num_events)):
+        with st.expander(f"Event / epoch {i + 1}", expanded=True):
+            name = st.text_input("Event name", value=f"Event {i + 1}", key=f"ev_name_{i}")
+            start = st.number_input("Start hour", min_value=0.0, value=0.0, step=0.01, key=f"ev_start_{i}")
+            has_duration = st.checkbox("This event lasts for a duration", value=False, key=f"ev_duration_{i}")
+            end = None
+            if has_duration:
+                end = st.number_input("End hour", min_value=0.0, value=max(start + 0.01, 0.01), step=0.01, key=f"ev_end_{i}")
+            color = st.color_picker("Line/shade color", value="#ff4b4b", key=f"ev_color_{i}")
+            alpha = st.slider("Dotted line transparency", 0.05, 1.0, 0.65, 0.05, key=f"ev_alpha_{i}")
+            shade_alpha = st.slider("Duration shade transparency", 0.02, 0.80, 0.18, 0.02, key=f"ev_shade_alpha_{i}")
+            event_annotations.append({
+                "name": name,
+                "start_hr": float(start),
+                "end_hr": float(end) if end is not None else None,
+                "color": color,
+                "alpha": float(alpha),
+                "shade_alpha": float(shade_alpha),
+            })
 
     st.divider()
     st.header("Manual y-scales")
@@ -534,6 +784,10 @@ with st.sidebar:
 
 if "results" not in st.session_state:
     st.session_state["results"] = []
+if "num_exclusions" not in st.session_state:
+    st.session_state["num_exclusions"] = 0
+if "num_events" not in st.session_state:
+    st.session_state["num_events"] = 0
 
 run_clicked = st.button("Run / refresh analysis", type="primary", use_container_width=True)
 
@@ -626,13 +880,19 @@ else:
         "z_dFF": parse_limit_text(manual_z, auto.get("z_dFF")),
     }
 
+    height_mult = {"Normal": 1.0, "Large": 1.35, "Maximized": 1.85}[graph_size]
+    overview_h = int(1050 * height_mult)
+    raw_h = int(650 * height_mult)
+    processed_h = int(760 * height_mult)
+    dual_h = int(560 * height_mult)
+
     st.success(f"Loaded {len(results)} recording(s).")
     c1, c2, c3, c4 = st.columns(4)
     max_duration = max(float(r["df"]["elapsed_hours"].max()) for r in results)
     c1.metric("Recordings loaded", len(results))
     c2.metric("Max duration", f"{max_duration:.2f} hr")
     c3.metric("ROI", roi_name)
-    c4.metric("Visual crop", "ON" if use_window else "OFF")
+    c4.metric("Hidden regions", len(visual_exclusions))
 
     with st.expander("Current y-axis limits and visual window"):
         st.json({
@@ -642,28 +902,89 @@ else:
             "note": "Visual window affects only webpage display, not downloaded processed CSV files.",
         })
 
+    st.markdown(
+        """
+        <div style="border-left: 3px solid #4ea3ff; padding: 0.45rem 0.6rem; background: rgba(78, 163, 255, 0.09); border-radius: 0.25rem; font-size: 0.85rem; margin-bottom: 0.5rem;">
+        Scroll-wheel zoom is disabled on the graphs. Use <b>Graph display → Graph size</b> or <b>Maximize one graph only</b> for a larger view.
+        Visual crop, hidden regions, and event annotations change only the webpage display, not the downloaded processed CSV.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     for idx, result in enumerate(results, start=1):
         full_df = result["df"]
         view_df = filter_visual_window(full_df, start_hr, end_hr) if use_window else full_df
+        view_df = apply_visual_exclusions(view_df, roi_name, visual_exclusions, mode=exclusion_mode_code)
         if view_df.empty:
             st.warning(f"{result['name']}: visual window has no data.")
             continue
 
         st.markdown(f"## Recording {idx}: `{result['name']}`")
+
+        def render_chart(kind):
+            if kind == "Overview":
+                fig = make_overview_figure(
+                    view_df, roi_name, manual_limits,
+                    events=event_annotations,
+                    exclusions=visual_exclusions,
+                    show_exclusions=show_hidden_region_shading,
+                    show_event_labels=show_event_labels,
+                    height=overview_h,
+                )
+            elif kind == "Raw channels":
+                fig = make_raw_independent_figure(
+                    view_df, roi_name, manual_limits,
+                    events=event_annotations,
+                    exclusions=visual_exclusions,
+                    show_exclusions=show_hidden_region_shading,
+                    show_event_labels=show_event_labels,
+                    height=raw_h,
+                )
+            elif kind == "Processed":
+                fig = make_processed_figure(
+                    view_df, roi_name, manual_limits,
+                    events=event_annotations,
+                    exclusions=visual_exclusions,
+                    show_exclusions=show_hidden_region_shading,
+                    show_event_labels=show_event_labels,
+                    height=processed_h,
+                )
+            else:
+                fig = make_dual_delta_dff_figure(
+                    view_df, roi_name, manual_limits,
+                    events=event_annotations,
+                    exclusions=visual_exclusions,
+                    show_exclusions=show_hidden_region_shading,
+                    show_event_labels=show_event_labels,
+                    height=dual_h,
+                )
+            st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+
+        if focus_mode:
+            st.markdown(f"### Maximized view: {focus_graph}")
+            render_chart(focus_graph)
+            with st.expander("Data preview and downloads"):
+                st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
+                st.dataframe(view_df.head(500), use_container_width=True, height=360)
+                st.download_button(
+                    label=f"Download full processed CSV for {result['name']}",
+                    data=full_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{safe_name(result['name'])}_processed_output.csv",
+                    mime="text/csv",
+                )
+            continue
+
         tabs = st.tabs(["Overview", "Raw channels", "Processed", "Delta-F + dFF", "Data preview", "Settings"])
 
         with tabs[0]:
-            st.plotly_chart(make_overview_figure(view_df, roi_name, manual_limits), use_container_width=True,
-                            config={"scrollZoom": True, "displaylogo": False})
+            render_chart("Overview")
         with tabs[1]:
-            st.plotly_chart(make_raw_independent_figure(view_df, roi_name, manual_limits), use_container_width=True,
-                            config={"scrollZoom": True, "displaylogo": False})
+            render_chart("Raw channels")
         with tabs[2]:
-            st.plotly_chart(make_processed_figure(view_df, roi_name, manual_limits), use_container_width=True,
-                            config={"scrollZoom": True, "displaylogo": False})
+            render_chart("Processed")
         with tabs[3]:
-            st.plotly_chart(make_dual_delta_dff_figure(view_df, roi_name, manual_limits), use_container_width=True,
-                            config={"scrollZoom": True, "displaylogo": False})
+            render_chart("Delta-F + dFF")
         with tabs[4]:
             st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
             st.dataframe(view_df.head(500), use_container_width=True, height=360)
