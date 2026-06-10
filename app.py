@@ -75,6 +75,68 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+
+# Force a clean light-mode appearance regardless of browser/system theme.
+st.markdown(
+    """
+    <style>
+    html, body, [data-testid="stAppViewContainer"], .stApp {
+        background: #f7f9fc !important;
+        color: #111827 !important;
+    }
+    [data-testid="stHeader"] {
+        background: rgba(247,249,252,0.92) !important;
+    }
+    section[data-testid="stSidebar"] {
+        background: #ffffff !important;
+        border-right: 1px solid #e5e7eb !important;
+    }
+    section[data-testid="stSidebar"] * {
+        color: #111827 !important;
+    }
+    .small-header {
+        background: rgba(255,255,255,0.96) !important;
+        border: 1px solid #e5e7eb !important;
+        border-radius: 0.65rem !important;
+        color: #111827 !important;
+        box-shadow: 0 1px 8px rgba(15,23,42,0.06) !important;
+    }
+    .small-header-title, .small-header-subtitle {
+        color: #111827 !important;
+    }
+    div[data-testid="stExpander"] {
+        background: #ffffff !important;
+        border: 1px solid #e5e7eb !important;
+        border-radius: 0.65rem !important;
+    }
+    div[data-testid="stMetric"] {
+        background: #ffffff !important;
+        border: 1px solid #e5e7eb !important;
+        border-radius: 0.55rem !important;
+        padding: 0.35rem 0.55rem !important;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        background: #ffffff !important;
+        border-bottom: 1px solid #e5e7eb !important;
+    }
+    .stTabs [data-baseweb="tab"] {
+        color: #111827 !important;
+    }
+    .note-box-light {
+        border-left: 3px solid #2563eb;
+        padding: 0.45rem 0.6rem;
+        background: #eff6ff;
+        border-radius: 0.35rem;
+        font-size: 0.85rem;
+        margin-bottom: 0.5rem;
+        color: #1f2937;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.markdown(
     """
     <div class="small-header">
@@ -758,12 +820,137 @@ def make_zip_from_results(results, roi):
     buffer.seek(0)
     return buffer.read()
 
+
+
+# =============================================================================
+# OVERRIDES: light-mode Plotly styling, HH:MM:SS hover, and one main dFF graph
+# =============================================================================
+
+def apply_hms_hover(fig, df):
+    """Make hover show Time as HH:MM:SS instead of raw seconds."""
+    if df is None or "elapsed_hhmmss" not in df.columns:
+        return fig
+    hms = df["elapsed_hhmmss"].astype(str).to_numpy()
+    n = len(hms)
+    for trace in fig.data:
+        try:
+            if hasattr(trace, "x") and trace.x is not None and len(trace.x) == n:
+                trace.customdata = hms
+                label = trace.name if trace.name else "value"
+                trace.hovertemplate = f"Time: %{{customdata}}<br>{label}: %{{y:.6g}}<extra></extra>"
+        except Exception:
+            pass
+    return fig
+
+
+def finish_fig(fig, height, show_legend=True, df=None):
+    if df is not None:
+        apply_hms_hover(fig, df)
+    fig.update_layout(
+        template="plotly_white",
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(color="#111827"),
+        height=height,
+        margin=dict(l=45, r=25, t=70, b=40),
+        hovermode="x unified",
+        dragmode="pan",
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
+        showlegend=show_legend,
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#e5e7eb", zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor="#e5e7eb", zeroline=False)
+    return fig
+
+
+def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=900):
+    """Overview without a duplicate dFF row. The single dFF graph lives in the Main dFF tab."""
+    fig = make_subplots(
+        rows=4,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.045,
+        subplot_titles=(
+            "Raw 465 and 405 together",
+            "Correction check: 465 signal and fitted 405",
+            "Delta-F corrected signal",
+            "z-scored dFF",
+        ),
+    )
+    x = df["time_sec"]
+    if f"{roi}_sig_raw" in df.columns:
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", showlegend=False), row=2, col=1)
+    if f"{roi}_uv_raw" in df.columns:
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="UV Raw / 405"), row=1, col=1)
+    if f"{roi}_uv_fit" in df.columns:
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_fit"], mode="lines", name="UV Fit / fitted 405"), row=2, col=1)
+    if f"{roi}_deltaF" in df.columns:
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F"), row=3, col=1)
+    if f"{roi}_z_dFF" in df.columns:
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_z_dFF"], mode="lines", name="z-dFF"), row=4, col=1)
+
+    fig.update_yaxes(title_text="Raw", row=1, col=1)
+    fig.update_yaxes(title_text="Fit", row=2, col=1)
+    fig.update_yaxes(title_text="Delta-F", row=3, col=1)
+    fig.update_yaxes(title_text="z-dFF", row=4, col=1)
+    apply_hms_xaxis(fig, df, rows=[1, 2, 3, 4])
+
+    if limits:
+        apply_y_range(fig, 1, limits.get("raw"))
+        apply_y_range(fig, 2, limits.get("fit"))
+        apply_y_range(fig, 3, limits.get("deltaF"))
+        apply_y_range(fig, 4, limits.get("z_dFF"))
+
+    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1, 2, 3, 4], show=show_exclusions)
+    add_events_to_fig(fig, events or [], rows=[1, 2, 3, 4], show_labels=show_event_labels)
+    return finish_fig(fig, height=height, df=df)
+
+
+def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=650):
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.07,
+        subplot_titles=("465 nm calcium-dependent signal", "405 nm isosbestic/control signal"),
+    )
+    x = df["time_sec"]
+    if f"{roi}_sig_raw" in df.columns:
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="465 raw"), row=1, col=1)
+    if f"{roi}_uv_raw" in df.columns:
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="405 raw"), row=2, col=1)
+    fig.update_yaxes(title_text="465 raw", row=1, col=1)
+    fig.update_yaxes(title_text="405 raw", row=2, col=1)
+    apply_hms_xaxis(fig, df, rows=[1, 2])
+    if limits:
+        apply_y_range(fig, 1, limits.get("raw"))
+        apply_y_range(fig, 2, limits.get("raw"))
+    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1, 2], show=show_exclusions)
+    add_events_to_fig(fig, events or [], rows=[1, 2], show_labels=show_event_labels)
+    return finish_fig(fig, height=height, df=df)
+
+
+def make_main_dff_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=620):
+    """The only dFF graph in the app."""
+    fig = make_subplots(rows=1, cols=1, subplot_titles=("Main dFF (%)",))
+    x = df["time_sec"]
+    if f"{roi}_dFF" in df.columns:
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)"), row=1, col=1)
+    fig.update_yaxes(title_text="dFF (%)", row=1, col=1)
+    apply_hms_xaxis(fig, df, rows=[1])
+    if limits:
+        apply_y_range(fig, 1, limits.get("dFF"))
+    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1], show=show_exclusions)
+    add_events_to_fig(fig, events or [], rows=[1], show_labels=show_event_labels)
+    return finish_fig(fig, height=height, df=df)
+
 # =============================================================================
 # SIDEBAR CONTROLS
 # =============================================================================
 
 with st.sidebar:
-    with st.expander("1. Inputs", expanded=True):
+    with st.expander("Inputs", expanded=True):
         uploaded_files = st.file_uploader(
             "Upload .ppd or .csv file(s)",
             type=["ppd", "csv"],
@@ -774,12 +961,12 @@ with st.sidebar:
         scale_mode = st.selectbox("Auto y-axis scaling", ["full", "robust", "none"], index=0)
         save_full = st.checkbox("Save full 20 Hz processed CSV for PPD runs", value=False)
 
-    with st.expander("2. Graph display", expanded=False):
+    with st.expander("Graph display", expanded=False):
         graph_size = st.selectbox("Graph size", ["Normal", "Large", "Maximized"], index=0)
         focus_mode = st.checkbox("Maximize one graph only", value=False)
         focus_graph = st.selectbox(
             "Graph to maximize",
-            ["Overview", "Raw channels", "Processed", "Delta-F + dFF"],
+            ["Overview", "Raw channels", "Main dFF"],
             index=0,
             disabled=not focus_mode,
         )
@@ -787,7 +974,7 @@ with st.sidebar:
         show_hidden_region_shading = st.checkbox("Mark hidden regions with pale gray shading", value=True)
         st.caption("Mouse/trackpad scroll zoom is disabled. Use graph size/focus mode to view graphs larger.")
 
-    with st.expander("3. Visual crop window", expanded=False):
+    with st.expander("Visual crop window", expanded=False):
         use_window = st.checkbox(
             "View only a time window",
             value=False,
@@ -804,7 +991,7 @@ with st.sidebar:
         if use_window and end_sec <= start_sec:
             st.error("Window end time must be after start time.")
 
-    with st.expander("4. Hide/remove time periods visually", expanded=False):
+    with st.expander("Hide/remove time periods visually", expanded=False):
         st.caption("These controls only affect graph display. They do not alter downloaded processed CSVs.")
         if st.button("Clear hidden time periods", use_container_width=True):
             st.session_state["num_exclusions"] = 0
@@ -842,7 +1029,7 @@ with st.sidebar:
                 else:
                     st.warning("End time must be after start time for this hidden region.")
 
-    with st.expander("5. Event lines / shaded epochs", expanded=False):
+    with st.expander("Event lines / shaded epochs", expanded=False):
         if st.button("Clear event annotations", use_container_width=True):
             st.session_state["num_events"] = 0
         num_events = st.number_input(
@@ -888,7 +1075,7 @@ with st.sidebar:
                 "shade_alpha": float(shade_alpha),
             })
 
-    with st.expander("6. Manual y-scales", expanded=False):
+    with st.expander("Manual y-scales", expanded=False):
         st.caption("Leave blank to use autoscale. Type as: min,max")
         manual_raw = st.text_input("Raw y-scale", value="")
         manual_fit = st.text_input("Fit-check y-scale", value="")
@@ -1022,7 +1209,7 @@ else:
 
     st.markdown(
         """
-        <div style="border-left: 3px solid #4ea3ff; padding: 0.45rem 0.6rem; background: rgba(78, 163, 255, 0.09); border-radius: 0.25rem; font-size: 0.85rem; margin-bottom: 0.5rem;">
+        <div class="note-box-light">
         Scroll-wheel zoom is disabled on the graphs. Use <b>Graph display → Graph size</b> or <b>Maximize one graph only</b> for a larger view.
         Visual crop, hidden regions, and event annotations change only the webpage display, not the downloaded processed CSV.
         </div>
@@ -1059,23 +1246,14 @@ else:
                     show_event_labels=show_event_labels,
                     height=raw_h,
                 )
-            elif kind == "Processed":
-                fig = make_processed_figure(
+            else:
+                fig = make_main_dff_figure(
                     view_df, roi_name, manual_limits,
                     events=event_annotations,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
                     show_event_labels=show_event_labels,
                     height=processed_h,
-                )
-            else:
-                fig = make_dual_delta_dff_figure(
-                    view_df, roi_name, manual_limits,
-                    events=event_annotations,
-                    exclusions=visual_exclusions,
-                    show_exclusions=show_hidden_region_shading,
-                    show_event_labels=show_event_labels,
-                    height=dual_h,
                 )
             st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
 
@@ -1093,17 +1271,15 @@ else:
                 )
             continue
 
-        tabs = st.tabs(["Overview", "Raw channels", "Processed", "Delta-F + dFF", "Data preview", "Settings"])
+        tabs = st.tabs(["Overview", "Raw channels", "Main dFF", "Data preview", "Settings"])
 
         with tabs[0]:
             render_chart("Overview")
         with tabs[1]:
             render_chart("Raw channels")
         with tabs[2]:
-            render_chart("Processed")
+            render_chart("Main dFF")
         with tabs[3]:
-            render_chart("Delta-F + dFF")
-        with tabs[4]:
             st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
             st.dataframe(view_df.head(500), use_container_width=True, height=360)
             st.download_button(
@@ -1112,7 +1288,7 @@ else:
                 file_name=f"{safe_name(result['name'])}_processed_output.csv",
                 mime="text/csv",
             )
-        with tabs[5]:
+        with tabs[4]:
             st.json(result.get("settings", {}))
 
     st.divider()
