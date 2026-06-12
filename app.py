@@ -283,7 +283,7 @@ st.markdown(
     <div class="small-header">
         <div class="small-header-title">Fiber Photometry Analysis</div>
         <div class="small-header-subtitle">
-            Upload .ppd or .csv files → run Jones-style processing → inspect graphs → visually zoom/crop without changing the CSV.
+            Upload .ppd/.csv → inspect raw, dFF, and paper-style z-score sliding-window traces without changing the CSV.
         </div>
     </div>
     """,
@@ -1127,6 +1127,212 @@ def make_main_dff_figure(df, roi, limits=None, events=None, exclusions=None, sho
     add_events_to_fig(fig, events or [], rows=[1], show_labels=show_event_labels)
     return finish_fig(fig, height=height, df=df)
 
+
+def get_paper_zscore_values(df, roi, source="z-dFF column"):
+    """
+    Return a z-score trace for the Lowell/Figure-1N-style visualization.
+
+    Preferred/default source:
+      {roi}_z_dFF if it exists.
+
+    Fallback:
+      z-score the dFF column:
+          z = (dFF - mean(dFF)) / SD(dFF)
+
+    This is a visualization layer. It does not overwrite the processed CSV.
+    """
+    if source == "z-dFF column" and f"{roi}_z_dFF" in df.columns:
+        z = pd.to_numeric(df[f"{roi}_z_dFF"], errors="coerce").to_numpy(dtype=float)
+        label = "z-dFF"
+    elif source == "Re-z-score dFF (%)" and f"{roi}_dFF" in df.columns:
+        y = pd.to_numeric(df[f"{roi}_dFF"], errors="coerce").to_numpy(dtype=float)
+        sd = np.nanstd(y, ddof=1)
+        z = (y - np.nanmean(y)) / sd if sd and np.isfinite(sd) else np.full_like(y, np.nan)
+        label = "z-score of dFF"
+    elif source == "Re-z-score Delta-F" and f"{roi}_deltaF" in df.columns:
+        y = pd.to_numeric(df[f"{roi}_deltaF"], errors="coerce").to_numpy(dtype=float)
+        sd = np.nanstd(y, ddof=1)
+        z = (y - np.nanmean(y)) / sd if sd and np.isfinite(sd) else np.full_like(y, np.nan)
+        label = "z-score of Delta-F"
+    elif f"{roi}_z_dFF" in df.columns:
+        z = pd.to_numeric(df[f"{roi}_z_dFF"], errors="coerce").to_numpy(dtype=float)
+        label = "z-dFF"
+    elif f"{roi}_dFF" in df.columns:
+        y = pd.to_numeric(df[f"{roi}_dFF"], errors="coerce").to_numpy(dtype=float)
+        sd = np.nanstd(y, ddof=1)
+        z = (y - np.nanmean(y)) / sd if sd and np.isfinite(sd) else np.full_like(y, np.nan)
+        label = "z-score of dFF"
+    else:
+        raise ValueError("Could not find z-dFF, dFF, or Delta-F columns for the paper-style z-score graph.")
+    return z, label
+
+
+def sliding_window_mean_by_time(time_sec, values, window_sec=1800.0, centered=True):
+    """
+    Time-aware sliding mean.
+
+    Default window_sec = 1800 seconds = 30 minutes, matching the paper-style
+    long-term trace display.
+    """
+    time_sec = np.asarray(time_sec, dtype=float)
+    values = np.asarray(values, dtype=float)
+    if len(time_sec) == 0:
+        return values
+
+    window_sec = max(float(window_sec), 1.0)
+    order = np.argsort(time_sec)
+    sorted_time = time_sec[order]
+    sorted_values = values[order]
+
+    s = pd.Series(
+        sorted_values,
+        index=pd.to_timedelta(sorted_time, unit="s"),
+    )
+
+    smooth = (
+        s.rolling(
+            window=pd.Timedelta(seconds=window_sec),
+            center=bool(centered),
+            min_periods=1,
+        )
+        .mean()
+        .to_numpy()
+    )
+
+    out = np.empty_like(smooth, dtype=float)
+    out[order] = smooth
+    return out
+
+
+def add_repeating_dark_shading(fig, df, dark_start_sec=43200.0, dark_duration_sec=43200.0, cycle_sec=86400.0, rows=(1,)):
+    """
+    Optional paper-like gray shading for repeated dark-cycle epochs.
+    Uses time_sec x-axis values, not decimal hours.
+    """
+    if df is None or df.empty or "time_sec" not in df.columns:
+        return fig
+
+    x_min = float(np.nanmin(df["time_sec"]))
+    x_max = float(np.nanmax(df["time_sec"]))
+    dark_start_sec = float(dark_start_sec)
+    dark_duration_sec = max(float(dark_duration_sec), 1.0)
+    cycle_sec = max(float(cycle_sec), dark_duration_sec + 1.0)
+
+    # Find a first epoch start before the visible region.
+    first_start = dark_start_sec - np.ceil((dark_start_sec - x_min) / cycle_sec) * cycle_sec
+    epoch_start = first_start
+
+    while epoch_start <= x_max + cycle_sec:
+        epoch_end = epoch_start + dark_duration_sec
+        shade_start = max(epoch_start, x_min)
+        shade_end = min(epoch_end, x_max)
+        if shade_end > shade_start:
+            for row in rows:
+                fig.add_vrect(
+                    x0=shade_start,
+                    x1=shade_end,
+                    fillcolor="rgba(120,120,120,0.16)",
+                    line_width=0,
+                    row=row,
+                    col=1,
+                )
+        epoch_start += cycle_sec
+    return fig
+
+
+def make_paper_style_zscore_figure(
+    df,
+    roi,
+    limits=None,
+    events=None,
+    exclusions=None,
+    show_exclusions=True,
+    show_event_labels=True,
+    height=650,
+    window_sec=1800.0,
+    centered=True,
+    source="z-dFF column",
+    show_raw=True,
+    show_smooth=True,
+    show_dark_shading=False,
+    dark_start_sec=43200.0,
+    dark_duration_sec=43200.0,
+    cycle_sec=86400.0,
+):
+    """
+    Lowell Figure 1N-style graph:
+      black trace = raw z-score trace
+      blue trace  = sliding-window mean z-score trace
+
+    Default sliding mean window = 30 minutes.
+    """
+    z, source_label = get_paper_zscore_values(df, roi, source=source)
+    smooth = sliding_window_mean_by_time(
+        df["time_sec"].to_numpy(dtype=float),
+        z,
+        window_sec=window_sec,
+        centered=centered,
+    )
+
+    window_label = seconds_to_hms(window_sec)
+    subtitle = f"Paper-style z-score with sliding mean window = {window_label}"
+
+    fig = make_subplots(
+        rows=1,
+        cols=1,
+        subplot_titles=(subtitle,),
+    )
+
+    x = df["time_sec"]
+
+    if show_dark_shading:
+        add_repeating_dark_shading(
+            fig,
+            df,
+            dark_start_sec=dark_start_sec,
+            dark_duration_sec=dark_duration_sec,
+            cycle_sec=cycle_sec,
+            rows=(1,),
+        )
+
+    if show_raw:
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=z,
+                mode="lines",
+                name=f"Raw {source_label}",
+                line=dict(color="black", width=0.8),
+                opacity=0.85,
+            ),
+            row=1,
+            col=1,
+        )
+
+    if show_smooth:
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=smooth,
+                mode="lines",
+                name=f"Sliding mean ({window_label})",
+                line=dict(color="#1f77b4", width=2.4),
+            ),
+            row=1,
+            col=1,
+        )
+
+    fig.update_yaxes(title_text="Z score", row=1, col=1)
+    apply_hms_xaxis(fig, df, rows=[1])
+
+    if limits:
+        apply_y_range(fig, 1, limits.get("z_dFF"))
+
+    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1], show=show_exclusions)
+    add_events_to_fig(fig, events or [], rows=[1], show_labels=show_event_labels)
+
+    return finish_fig(fig, height=height, df=df)
+
 # =============================================================================
 # SIDEBAR CONTROLS
 # =============================================================================
@@ -1148,13 +1354,61 @@ with st.sidebar:
         focus_mode = st.checkbox("Maximize one graph only", value=False)
         focus_graph = st.selectbox(
             "Graph to maximize",
-            ["Overview", "Raw channels", "Main dFF"],
+            ["Overview", "Raw channels", "Main dFF", "Paper-style z-score"],
             index=0,
             disabled=not focus_mode,
         )
         show_event_labels = st.checkbox("Show event labels above graphs", value=True)
         show_hidden_region_shading = st.checkbox("Mark hidden regions with pale gray shading", value=True)
         st.caption("Mouse/trackpad scroll zoom is disabled. Use graph size/focus mode to view graphs larger.")
+
+    with st.expander("Paper-style z-score", expanded=False):
+        st.caption("Matches the Figure 1N-style display: black raw z-score trace plus blue sliding-window mean.")
+        paper_z_source = st.selectbox(
+            "Trace source",
+            ["z-dFF column", "Re-z-score dFF (%)", "Re-z-score Delta-F"],
+            index=0,
+            help="Use the existing z-dFF column if available, or calculate a fresh z-score from dFF/Delta-F for display.",
+        )
+        paper_window_hms = st.text_input("Sliding mean window (HH:MM:SS)", value="00:30:00")
+        paper_window_sec, paper_window_err = parse_hms_to_seconds(
+            paper_window_hms,
+            30 * 60,
+            "sliding mean window",
+        )
+        if paper_window_err:
+            st.error(paper_window_err)
+        paper_centered_mean = st.checkbox(
+            "Center the sliding window",
+            value=True,
+            help="Centered smoothing avoids shifting peaks left/right. Turn off for a trailing running mean.",
+        )
+        paper_show_raw = st.checkbox("Show black raw z-score trace", value=True)
+        paper_show_smooth = st.checkbox("Show blue sliding mean trace", value=True)
+
+        with st.expander("Optional paper-like dark-cycle shading", expanded=False):
+            paper_show_dark = st.checkbox("Show repeated gray dark-cycle shading", value=False)
+            paper_dark_start_hms = st.text_input("Dark phase start after recording start (HH:MM:SS)", value="12:00:00")
+            paper_dark_duration_hms = st.text_input("Dark phase duration (HH:MM:SS)", value="12:00:00")
+            paper_cycle_hms = st.text_input("Cycle length (HH:MM:SS)", value="24:00:00")
+            paper_dark_start_sec, paper_dark_start_err = parse_hms_to_seconds(
+                paper_dark_start_hms,
+                12 * 3600,
+                "dark phase start",
+            )
+            paper_dark_duration_sec, paper_dark_duration_err = parse_hms_to_seconds(
+                paper_dark_duration_hms,
+                12 * 3600,
+                "dark phase duration",
+            )
+            paper_cycle_sec, paper_cycle_err = parse_hms_to_seconds(
+                paper_cycle_hms,
+                24 * 3600,
+                "cycle length",
+            )
+            for err in [paper_dark_start_err, paper_dark_duration_err, paper_cycle_err]:
+                if err:
+                    st.error(err)
 
     with st.expander("Visual crop window", expanded=False):
         use_window = st.checkbox(
@@ -1371,6 +1625,7 @@ else:
     overview_h = int(850 * height_mult)
     raw_h = int(650 * height_mult)
     processed_h = int(760 * height_mult)
+    paper_z_h = int(650 * height_mult)
     dual_h = int(560 * height_mult)
 
     st.success(f"Loaded {len(results)} recording(s).")
@@ -1428,6 +1683,26 @@ else:
                     show_event_labels=show_event_labels,
                     height=raw_h,
                 )
+            elif kind == "Paper-style z-score":
+                fig = make_paper_style_zscore_figure(
+                    view_df,
+                    roi_name,
+                    manual_limits,
+                    events=event_annotations,
+                    exclusions=visual_exclusions,
+                    show_exclusions=show_hidden_region_shading,
+                    show_event_labels=show_event_labels,
+                    height=paper_z_h,
+                    window_sec=paper_window_sec,
+                    centered=paper_centered_mean,
+                    source=paper_z_source,
+                    show_raw=paper_show_raw,
+                    show_smooth=paper_show_smooth,
+                    show_dark_shading=paper_show_dark,
+                    dark_start_sec=paper_dark_start_sec,
+                    dark_duration_sec=paper_dark_duration_sec,
+                    cycle_sec=paper_cycle_sec,
+                )
             else:
                 fig = make_main_dff_figure(
                     view_df, roi_name, manual_limits,
@@ -1453,7 +1728,7 @@ else:
                 )
             continue
 
-        tabs = st.tabs(["Overview", "Raw channels", "Main dFF", "Data preview", "Settings"])
+        tabs = st.tabs(["Overview", "Raw channels", "Main dFF", "Paper-style z-score", "Data preview", "Settings"])
 
         with tabs[0]:
             render_chart("Overview")
@@ -1462,6 +1737,8 @@ else:
         with tabs[2]:
             render_chart("Main dFF")
         with tabs[3]:
+            render_chart("Paper-style z-score")
+        with tabs[4]:
             st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
             st.dataframe(view_df.head(500), use_container_width=True, height=360)
             st.download_button(
@@ -1470,7 +1747,7 @@ else:
                 file_name=f"{safe_name(result['name'])}_processed_output.csv",
                 mime="text/csv",
             )
-        with tabs[4]:
+        with tabs[5]:
             st.json(result.get("settings", {}))
 
     st.divider()

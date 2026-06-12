@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Jones-style pyPhotometry .ppd analysis WITHOUT event timestamps,
+Lowell/Douglass-style pyPhotometry .ppd analysis WITHOUT event timestamps,
 with MATCHED AXIS SCALES across multiple recordings.
 
 Why this version exists
@@ -58,7 +58,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, sosfiltfilt, medfilt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -80,11 +80,16 @@ COLUMN_MAP = {
     "405_dark": 3,
 }
 
-# Jones-style defaults used here.
-LOWPASS_HZ = 1.0
+# Lowell/Douglass-style defaults used here.
+LOWPASS_HZ = 10.0
 FILTER_ORDER = 3
 REGRESSION_WINDOW_SEC = 60.0
-BASELINE_PERCENTILE = 10.0
+BASELINE_PERCENTILE = 10.0  # retained only for backward compatibility; Lowell F0 does not use this
+
+# Lowell/Douglass paper method settings.
+MEDIAN_FILTER_SEC = 1.0          # paper says median-filtered; kernel was not specified in the PDF
+F0_LOWPASS_HZ = 0.001           # F0 = 0.001 Hz low-pass filtered 465 nm signal
+LONG_TERM_SMOOTH_SEC = 30 * 60  # 30-minute running average for long-term traces
 
 # Plot/export settings.
 EXPORT_HZ = 1.0              # graphs and main CSV are downsampled to 1 Hz
@@ -190,97 +195,170 @@ def extract_channels(volts: np.ndarray):
 
 
 # =============================================================================
-# JONES-STYLE PHOTOMETRY MATH
+# LOWELL / DOUGLASS PAPER-STYLE PHOTOMETRY MATH
 # =============================================================================
 
-def lowpass(values: np.ndarray, fs: float):
-    """
-    Butterworth low-pass filter, matching the Jones-style preprocessing idea.
+def _odd_kernel_samples(window_sec: float, fs: float, minimum: int = 3) -> int:
+    """Return an odd integer sample window for median filtering."""
+    k = int(round(float(window_sec) * float(fs)))
+    k = max(k, minimum)
+    if k % 2 == 0:
+        k += 1
+    return k
 
-    Technical:
-      sos = butter(FILTER_ORDER, LOWPASS_HZ, fs=fs, btype='lowpass', output='sos')
-      filtered = sosfiltfilt(sos, values)
 
-    Simple:
-      remove fast noise while keeping slower photometry changes.
+def median_filter_trace(values: np.ndarray, fs: float):
     """
-    nyquist = fs / 2
-    if LOWPASS_HZ >= nyquist:
-        warnings.warn("LOWPASS_HZ is too high for this sampling rate; skipping filter.")
+    Median-filter the trace.
+
+    The Lowell/Douglass paper states that all data were median-filtered before
+    the 10 Hz low-pass filter. The PDF does not specify the median-filter kernel,
+    so this script exposes MEDIAN_FILTER_SEC as an editable setting.
+    """
+    if MEDIAN_FILTER_SEC <= 0:
         return values.copy()
-    sos = butter(FILTER_ORDER, LOWPASS_HZ, btype="lowpass", fs=fs, output="sos")
-    return sosfiltfilt(sos, values)
+    kernel = _odd_kernel_samples(MEDIAN_FILTER_SEC, fs)
+    # scipy.signal.medfilt pads edges with zeros, so replace only if finite data exist.
+    return medfilt(values, kernel_size=kernel)
 
 
-def rolling_filtered_to_raw_fit(uv_raw, sig_raw, uv_filt, sig_filt, fs):
+def lowpass(values: np.ndarray, fs: float, cutoff_hz: float | None = None, order: int | None = None):
     """
-    Rolling local regression of 405 onto 465.
+    Zero-phase Butterworth low-pass filter.
 
-    Technical formula inside each centered 60 s window:
-      sig_filt ≈ slope(t) * uv_filt + intercept(t)
+    Lowell/Douglass method:
+      - photometry traces: 10 Hz cutoff
+      - F0 baseline: 0.001 Hz cutoff on the 465 nm signal
 
-      slope(t) = Cov_window(uv_filt, sig_filt) / Var_window(uv_filt)
-      intercept(t) = mean_window(sig_filt) - slope(t) * mean_window(uv_filt)
-
-    Then apply the local fit to the raw 405 channel:
-      uv_fit(t) = slope(t) * uv_raw(t) + intercept(t)
-
-    Then corrected signal:
-      deltaF(t) = sig_raw(t) - uv_fit(t)
+    If cutoff equals/exceeds Nyquist, the function automatically lowers it just
+    below Nyquist so scipy can run safely.
     """
-    window = max(int(round(REGRESSION_WINDOW_SEC * fs)), 5)
-    minp = max(3, window // 5)
+    if cutoff_hz is None:
+        cutoff_hz = LOWPASS_HZ
+    if order is None:
+        order = FILTER_ORDER
 
-    x = pd.Series(uv_filt)
-    y = pd.Series(sig_filt)
-    xy = pd.Series(uv_filt * sig_filt)
-    x2 = pd.Series(uv_filt * uv_filt)
+    nyquist = fs / 2
+    if cutoff_hz <= 0:
+        return values.copy()
+    safe_cutoff = min(float(cutoff_hz), nyquist * 0.99)
+    if safe_cutoff <= 0:
+        return values.copy()
 
-    mx = x.rolling(window, center=True, min_periods=minp).mean()
-    my = y.rolling(window, center=True, min_periods=minp).mean()
-    mxy = xy.rolling(window, center=True, min_periods=minp).mean()
-    mx2 = x2.rolling(window, center=True, min_periods=minp).mean()
+    sos = butter(order, safe_cutoff, btype="lowpass", fs=fs, output="sos")
+    try:
+        return sosfiltfilt(sos, values)
+    except ValueError:
+        # Very short recordings may fail filtfilt pad-length requirements.
+        # Fall back to the original trace rather than crashing.
+        warnings.warn(
+            f"Could not apply {cutoff_hz:g} Hz low-pass filter, likely because the recording is too short. "
+            "Returning the unfiltered trace for this step."
+        )
+        return values.copy()
 
-    cov = mxy - mx * my
-    var = mx2 - mx * mx
 
-    slope = (cov / var.replace(0, np.nan)).bfill().ffill().to_numpy()
-    intercept = (my - slope * mx).bfill().ffill().to_numpy()
+def global_linear_405_fit_to_465(uv_signal, sig_signal):
+    """
+    Lowell/Douglass motion correction:
+      find a single linear best fit to the 405 nm signal, then subtract the fitted
+      405 signal from the 465 nm signal.
 
-    if np.isnan(slope).any() or np.isnan(intercept).any():
-        good = np.isfinite(uv_filt) & np.isfinite(sig_filt)
-        global_slope, global_intercept = np.polyfit(uv_filt[good], sig_filt[good], 1)
-        slope = np.where(np.isfinite(slope), slope, global_slope)
-        intercept = np.where(np.isfinite(intercept), intercept, global_intercept)
+    Formula:
+      fitted_405(t) = slope * signal_405(t) + intercept
+      DeltaF(t)    = signal_465(t) - fitted_405(t)
+    """
+    good = np.isfinite(uv_signal) & np.isfinite(sig_signal)
+    if good.sum() < 3:
+        raise ValueError("Not enough finite samples for 405-to-465 linear fit.")
 
-    uv_fit = slope * uv_raw + intercept
-    delta_f = sig_raw - uv_fit
+    slope, intercept = np.polyfit(uv_signal[good], sig_signal[good], 1)
+    uv_fit = slope * uv_signal + intercept
+    delta_f = sig_signal - uv_fit
     return uv_fit, delta_f, slope, intercept
 
 
-def process_photometry(uv_raw, sig_raw, fs):
-    """Run all Jones-style processing steps."""
-    uv_filt = lowpass(uv_raw, fs)
-    sig_filt = lowpass(sig_raw, fs)
-    uv_fit, delta_f, slope, intercept = rolling_filtered_to_raw_fit(
-        uv_raw, sig_raw, uv_filt, sig_filt, fs
+def rolling_mean_trace(values: np.ndarray, fs: float, window_sec: float, center: bool = True):
+    """Running average used for long-term traces such as the 30 min mean in Figure 1N/2A."""
+    window = max(int(round(float(window_sec) * float(fs))), 1)
+    return (
+        pd.Series(values)
+        .rolling(window=window, center=center, min_periods=max(1, window // 5))
+        .mean()
+        .bfill()
+        .ffill()
+        .to_numpy()
     )
 
-    f0 = float(np.nanpercentile(uv_raw, BASELINE_PERCENTILE))
-    if not np.isfinite(f0) or f0 == 0:
-        raise ValueError(f"Invalid F0: {f0}")
 
-    dff = 100.0 * delta_f / f0
-    z_dff = (dff - np.nanmean(dff)) / np.nanstd(dff, ddof=1)
+def zscore(values: np.ndarray):
+    """Session z-score."""
+    mean = np.nanmean(values)
+    sd = np.nanstd(values, ddof=1)
+    if not np.isfinite(sd) or sd == 0:
+        return np.full_like(values, np.nan, dtype=float)
+    return (values - mean) / sd
+
+
+def process_photometry(uv_raw, sig_raw, fs):
+    """
+    Run Lowell/Douglass-style processing.
+
+    Paper method implemented here:
+      1. Median-filter both 405 and 465 traces.
+      2. Low-pass filter both traces at 10 Hz.
+      3. Motion correction: linear best fit to 405, subtract fitted 405 from 465.
+      4. F0: 0.001 Hz low-pass filtered 465 nm trace across the whole session.
+      5. DF/F0 = (465 - fitted 405) / F0.
+      6. z_DF/F0 = session z-score of DF/F0.
+      7. 30 min running-average columns are also generated for long-term plots.
+    """
+    # 1–2. Median + 10 Hz low-pass.
+    uv_med = median_filter_trace(uv_raw, fs)
+    sig_med = median_filter_trace(sig_raw, fs)
+
+    uv_filt = lowpass(uv_med, fs, cutoff_hz=LOWPASS_HZ)
+    sig_filt = lowpass(sig_med, fs, cutoff_hz=LOWPASS_HZ)
+
+    # 3. Global linear 405 fit, not rolling regression.
+    uv_fit, delta_f, slope, intercept = global_linear_405_fit_to_465(uv_filt, sig_filt)
+
+    # 4. F0 is the 0.001 Hz low-pass filtered 465 trace.
+    f0_trace = lowpass(sig_filt, fs, cutoff_hz=F0_LOWPASS_HZ)
+
+    # Protect against divide-by-zero or negative/invalid baseline values.
+    eps = np.nanmedian(np.abs(f0_trace)) * 1e-12
+    if not np.isfinite(eps) or eps == 0:
+        eps = 1e-12
+    f0_safe = np.where(np.isfinite(f0_trace) & (np.abs(f0_trace) > eps), f0_trace, np.nan)
+
+    # 5. Lowell DF/F0 ratio. This is intentionally NOT multiplied by 100.
+    dff = delta_f / f0_safe
+
+    # Optional percent copy for people who want percent units.
+    dff_percent = 100.0 * dff
+
+    # 6. Session z-score of the Lowell DF/F0 ratio.
+    z_dff = zscore(dff)
+
+    # 7. 30-minute running means for paper-style long-term viewing.
+    dff_30min = rolling_mean_trace(dff, fs, LONG_TERM_SMOOTH_SEC, center=True)
+    z_dff_30min = rolling_mean_trace(z_dff, fs, LONG_TERM_SMOOTH_SEC, center=True)
 
     return {
+        "uv_med": uv_med,
+        "sig_med": sig_med,
         "uv_filt": uv_filt,
         "sig_filt": sig_filt,
         "uv_fit": uv_fit,
         "deltaF": delta_f,
+        "F0_trace": f0_trace,
+        "F0": float(np.nanmedian(f0_trace)),
         "dFF": dff,
+        "dFF_percent": dff_percent,
         "z_dFF": z_dff,
-        "F0": f0,
+        "dFF_30min_mean": dff_30min,
+        "z_dFF_30min_mean": z_dff_30min,
         "slope": slope,
         "intercept": intercept,
     }
@@ -292,12 +370,29 @@ def make_dataframe(time_sec, uv_raw, sig_raw, processed, roi):
         "elapsed_hours": time_sec / 3600,
         f"{roi}_uv_raw": uv_raw,
         f"{roi}_sig_raw": sig_raw,
-        f"{roi}_uv_filt_1Hz_lowpass": processed["uv_filt"],
-        f"{roi}_sig_filt_1Hz_lowpass": processed["sig_filt"],
+
+        # Median-filtered and 10 Hz low-pass-filtered traces.
+        f"{roi}_uv_median_filtered": processed["uv_med"],
+        f"{roi}_sig_median_filtered": processed["sig_med"],
+        f"{roi}_uv_filt_10Hz_lowpass": processed["uv_filt"],
+        f"{roi}_sig_filt_10Hz_lowpass": processed["sig_filt"],
+
+        # Motion correction and Lowell/Douglass DF/F0.
         f"{roi}_uv_fit": processed["uv_fit"],
         f"{roi}_deltaF": processed["deltaF"],
+        f"{roi}_F0_0p001Hz": processed["F0_trace"],
+
+        # Main app-compatible column: Lowell DF/F0 ratio, not percent.
         f"{roi}_dFF": processed["dFF"],
+        f"{roi}_DF_F0": processed["dFF"],
+
+        # Optional percent copy.
+        f"{roi}_dFF_percent": processed["dFF_percent"],
+
+        # Z-score and paper-style 30 min running averages.
         f"{roi}_z_dFF": processed["z_dFF"],
+        f"{roi}_dFF_30min_mean": processed["dFF_30min_mean"],
+        f"{roi}_z_dFF_30min_mean": processed["z_dFF_30min_mean"],
     })
     df["elapsed_hhmmss"] = [seconds_to_hms(x) for x in df["time_sec"]]
     return df
@@ -544,30 +639,30 @@ def plot_G(df, outdir, roi, limits):
     set_ylim(axes[0], limits, "deltaF")
 
     axes[1].plot(df["elapsed_hours"], df[f"{roi}_dFF"], linewidth=0.8)
-    axes[1].set_title("Main Delta-F/F plot")
-    axes[1].set_ylabel("dFF (%)")
+    axes[1].set_title("Main DF/F0 plot")
+    axes[1].set_ylabel("DF/F0")
     set_ylim(axes[1], limits, "dFF")
 
     axes[2].plot(df["elapsed_hours"], df[f"{roi}_z_dFF"], linewidth=0.8)
-    axes[2].set_title("z-scored dFF")
-    axes[2].set_ylabel("z-dFF")
+    axes[2].set_title("z-scored DF/F0")
+    axes[2].set_ylabel("z-DF/F0")
     axes[2].set_xlabel("Time (hours)")
     set_ylim(axes[2], limits, "z_dFF")
     set_xlim_hours(axes[2], limits)
 
-    fig.suptitle(f"Plot G: Jones-style processed outputs - {roi}")
-    return savefig(fig, outdir / f"plot_G_jones_deltaF_dff_z_{roi}.png")
+    fig.suptitle(f"Plot G: Lowell-style processed outputs - {roi}")
+    return savefig(fig, outdir / f"plot_G_lowell_deltaF_DF_F0_z_{roi}.png")
 
 
 def plot_H(df, outdir, roi, limits):
     fig, ax1 = plt.subplots(figsize=(16, 6))
     ax2 = ax1.twinx()
     l1, = ax1.plot(df["elapsed_hours"], df[f"{roi}_deltaF"], linewidth=0.8, label="Delta-F")
-    l2, = ax2.plot(df["elapsed_hours"], df[f"{roi}_dFF"], linewidth=0.8, label="dFF (%)")
+    l2, = ax2.plot(df["elapsed_hours"], df[f"{roi}_dFF"], linewidth=0.8, label="DF/F0")
     ax1.set_title(f"Plot H: Delta-F and dFF on the same graph - {roi}")
     ax1.set_xlabel("Time (hours)")
     ax1.set_ylabel("Delta-F")
-    ax2.set_ylabel("dFF (%)")
+    ax2.set_ylabel("DF/F0")
     set_ylim(ax1, limits, "deltaF")
     set_ylim(ax2, limits, "dFF")
     set_xlim_hours(ax1, limits)
@@ -582,7 +677,7 @@ def make_interactive(df, outdir, roi, limits):
             "Raw 465 and 405 together",
             "Correction check: 465 signal and fitted 405",
             "Delta-F corrected signal",
-            "dFF (%)",
+            "DF/F0",
             "z-scored dFF",
         ),
     )
@@ -592,14 +687,14 @@ def make_interactive(df, outdir, roi, limits):
     fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465"), row=2, col=1)
     fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_fit"], mode="lines", name="UV Fit / fitted 405"), row=2, col=1)
     fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F"), row=3, col=1)
-    fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)"), row=4, col=1)
-    fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_z_dFF"], mode="lines", name="z-dFF"), row=5, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="DF/F0"), row=4, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_z_dFF"], mode="lines", name="z-DF/F0"), row=5, col=1)
 
     fig.update_yaxes(title_text="Raw signal", row=1, col=1)
     fig.update_yaxes(title_text="Fit check", row=2, col=1)
     fig.update_yaxes(title_text="Delta-F", row=3, col=1)
-    fig.update_yaxes(title_text="dFF (%)", row=4, col=1)
-    fig.update_yaxes(title_text="z-dFF", row=5, col=1)
+    fig.update_yaxes(title_text="DF/F0", row=4, col=1)
+    fig.update_yaxes(title_text="z-DF/F0", row=5, col=1)
 
     if limits is not None:
         fig.update_yaxes(range=limits["raw_both"], row=1, col=1)
@@ -614,18 +709,18 @@ def make_interactive(df, outdir, roi, limits):
             fig.update_xaxes(range=limits["x_hours"], row=row, col=1)
 
     fig.update_layout(
-        title=f"Interactive Jones-style photometry outputs - {roi} - matched scales - no event data used",
+        title=f"Interactive Lowell-style photometry outputs - {roi} - matched scales - no event data used",
         height=1100, width=1500, hovermode="x unified",
         legend=dict(x=1.02, y=1.0), margin=dict(l=80, r=260, t=90, b=60),
     )
-    path = outdir / f"interactive_jones_style_no_events_{roi}.html"
+    path = outdir / f"interactive_lowell_style_no_events_{roi}.html"
     fig.write_html(path, include_plotlyjs="cdn")
     return path
 
 
 def write_readme(outdir, roi, ppd_path, header, fs, processed, limits, scale_mode):
     path = outdir / "README_NO_EVENTS_MATCHED_SCALES.md"
-    path.write_text(f"""# Jones-style no-event pyPhotometry analysis with matched axes
+    path.write_text(f"""# Lowell-style no-event pyPhotometry analysis with matched axes
 
 ## Input file
 
@@ -677,37 +772,35 @@ Assumed pyPhotometry 2EX_1EM_pulsed layout:
 
 ## Processing formulas
 
-Low-pass filter:
+Median + low-pass filter:
 
 ```text
-{roi}_sig_filt = 1 Hz low-pass filtered {roi}_sig_raw
-{roi}_uv_filt  = 1 Hz low-pass filtered {roi}_uv_raw
+{roi}_sig_median_filtered = median-filtered {roi}_sig_raw
+{roi}_uv_median_filtered  = median-filtered {roi}_uv_raw
+{roi}_sig_filt_10Hz_lowpass = 10 Hz low-pass filtered {roi}_sig_median_filtered
+{roi}_uv_filt_10Hz_lowpass  = 10 Hz low-pass filtered {roi}_uv_median_filtered
 ```
 
-Rolling regression:
+Motion correction:
 
 ```text
-{roi}_sig_filt ≈ slope(t) × {roi}_uv_filt + intercept(t)
-{roi}_uv_fit = slope(t) × {roi}_uv_raw + intercept(t)
+{roi}_uv_fit = slope × {roi}_uv_filt_10Hz_lowpass + intercept
+{roi}_deltaF = {roi}_sig_filt_10Hz_lowpass - {roi}_uv_fit
 ```
 
-Corrected signal:
-
-```text
-{roi}_deltaF = {roi}_sig_raw - {roi}_uv_fit
-```
+This uses one global linear best fit to the 405 nm signal, matching the Lowell/Douglass paper method.
 
 F0:
 
 ```text
-F0 = {BASELINE_PERCENTILE}th percentile of {roi}_uv_raw
-F0 = {processed['F0']}
+F0(t) = 0.001 Hz low-pass filtered {roi}_sig_filt_10Hz_lowpass across the whole session
+F0 median = {processed['F0']}
 ```
 
 dFF:
 
 ```text
-{roi}_dFF = 100 × {roi}_deltaF / F0
+{roi}_dFF = {roi}_deltaF / F0(t)
 ```
 
 z-dFF:
@@ -721,10 +814,10 @@ z-dFF:
 Use:
 
 ```text
-plot_G_jones_deltaF_dff_z_{roi}.png
+plot_G_lowell_deltaF_DF_F0_z_{roi}.png
 ```
 
-The middle panel is the main dFF (%) trace.
+The middle panel is the main Lowell-style DF/F0 trace. The column is still named `{roi}_dFF` for app compatibility, but it is a ratio, not percent.
 
 ## Axis limits used
 
@@ -737,11 +830,13 @@ The middle panel is the main dFF (%) trace.
 ```json
 {json.dumps({
     'sampling_rate_hz': fs,
-    'lowpass_hz': LOWPASS_HZ,
+    'photometry_lowpass_hz': LOWPASS_HZ,
     'filter_order': FILTER_ORDER,
-    'regression_window_sec': REGRESSION_WINDOW_SEC,
-    'baseline_method': 'uv_raw_percentile_session',
-    'baseline_percentile': BASELINE_PERCENTILE,
+    'median_filter_sec': MEDIAN_FILTER_SEC,
+    'long_term_smooth_sec': LONG_TERM_SMOOTH_SEC,
+    'motion_correction': 'global_linear_best_fit_405_to_465',
+    'baseline_method': 'lowpass_filtered_465_signal_whole_session',
+    'baseline_lowpass_hz': F0_LOWPASS_HZ,
     'F0': processed['F0'],
     'event_data_used': False,
 }, indent=2)}
@@ -793,12 +888,14 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
         "shared_axis_limits_applied": limits is not None,
         "lowpass_hz": LOWPASS_HZ,
         "filter_order": FILTER_ORDER,
-        "regression_window_sec": REGRESSION_WINDOW_SEC,
-        "baseline_method": "uv_raw_percentile_session",
-        "baseline_percentile": BASELINE_PERCENTILE,
+        "median_filter_sec": MEDIAN_FILTER_SEC,
+        "long_term_smooth_sec": LONG_TERM_SMOOTH_SEC,
+        "motion_correction": "global_linear_best_fit_405_to_465",
+        "baseline_method": "lowpass_filtered_465_signal_whole_session",
+        "baseline_lowpass_hz": F0_LOWPASS_HZ,
         "F0": processed["F0"],
         "deltaF_formula": f"{roi}_deltaF = {roi}_sig_raw - {roi}_uv_fit",
-        "dFF_formula": f"{roi}_dFF = 100 * {roi}_deltaF / F0",
+        "dFF_formula": f"{roi}_dFF = {roi}_deltaF / F0_trace",
     }
     (outdir / "ANALYSIS_SETTINGS_NO_EVENTS_MATCHED_SCALES.json").write_text(json.dumps(settings, indent=2))
     (outdir / "PPD_HEADER.json").write_text(json.dumps(header, indent=2))
@@ -828,7 +925,7 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Jones-style .ppd analysis with no events and matched axes across recordings."
+        description="Lowell-style .ppd analysis with no events and matched axes across recordings."
     )
     parser.add_argument(
         "ppd",
@@ -903,8 +1000,8 @@ def main():
         print("Global axis limits saved to GLOBAL_AXIS_LIMITS_USED_FOR_ALL_RECORDINGS.json")
     for folder in output_folders:
         print(f"Output folder: {folder.resolve()}")
-        print(f"  Main dFF plot: {folder / f'plot_G_jones_deltaF_dff_z_{roi}.png'}")
-        print(f"  Interactive HTML: {folder / f'interactive_jones_style_no_events_{roi}.html'}")
+        print(f"  Main DF/F0 plot: {folder / f'plot_G_lowell_deltaF_DF_F0_z_{roi}.png'}")
+        print(f"  Interactive HTML: {folder / f'interactive_lowell_style_no_events_{roi}.html'}")
 
 
 if __name__ == "__main__":
