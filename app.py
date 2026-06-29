@@ -283,7 +283,7 @@ st.markdown(
     <div class="small-header">
         <div class="small-header-title">Fiber Photometry Analysis</div>
         <div class="small-header-subtitle">
-            Upload .ppd/.csv → inspect raw, dFF, and paper-style z-score sliding-window traces without changing the CSV.
+            Upload .ppd/.csv → inspect raw, dFF, and z-score sliding-window traces without changing the CSV.
         </div>
     </div>
     """,
@@ -1128,23 +1128,23 @@ def make_main_dff_figure(df, roi, limits=None, events=None, exclusions=None, sho
     return finish_fig(fig, height=height, df=df)
 
 
-def get_paper_zscore_values(df, roi, source="z-dFF column"):
+def get_zscore_values(df, roi, source="z-dFF column"):
     """
-    Return a z-score trace for the Lowell/Figure-1N-style visualization.
+    Return a z-score trace for the long-term z-score visualization.
 
     Preferred/default source:
       {roi}_z_dFF if it exists.
 
     Fallback:
-      z-score the dFF column:
-          z = (dFF - mean(dFF)) / SD(dFF)
+      z-score the dFF or Delta-F column:
+          z = (trace - mean(trace)) / SD(trace)
 
     This is a visualization layer. It does not overwrite the processed CSV.
     """
     if source == "z-dFF column" and f"{roi}_z_dFF" in df.columns:
         z = pd.to_numeric(df[f"{roi}_z_dFF"], errors="coerce").to_numpy(dtype=float)
         label = "z-dFF"
-    elif source == "Re-z-score dFF (%)" and f"{roi}_dFF" in df.columns:
+    elif source == "Re-z-score dFF" and f"{roi}_dFF" in df.columns:
         y = pd.to_numeric(df[f"{roi}_dFF"], errors="coerce").to_numpy(dtype=float)
         sd = np.nanstd(y, ddof=1)
         z = (y - np.nanmean(y)) / sd if sd and np.isfinite(sd) else np.full_like(y, np.nan)
@@ -1163,7 +1163,7 @@ def get_paper_zscore_values(df, roi, source="z-dFF column"):
         z = (y - np.nanmean(y)) / sd if sd and np.isfinite(sd) else np.full_like(y, np.nan)
         label = "z-score of dFF"
     else:
-        raise ValueError("Could not find z-dFF, dFF, or Delta-F columns for the paper-style z-score graph.")
+        raise ValueError("Could not find z-dFF, dFF, or Delta-F columns for the z-score graph.")
     return z, label
 
 
@@ -1171,8 +1171,7 @@ def sliding_window_mean_by_time(time_sec, values, window_sec=1800.0, centered=Tr
     """
     Time-aware sliding mean.
 
-    Default window_sec = 1800 seconds = 30 minutes, matching the paper-style
-    long-term trace display.
+    Default window_sec = 1800 seconds = 30 minutes.
     """
     time_sec = np.asarray(time_sec, dtype=float)
     values = np.asarray(values, dtype=float)
@@ -1204,9 +1203,21 @@ def sliding_window_mean_by_time(time_sec, values, window_sec=1800.0, centered=Tr
     return out
 
 
+def get_zscore_and_smooth(df, roi, source="z-dFF column", window_sec=1800.0, centered=True):
+    """Return raw z-score and sliding-window mean z-score traces."""
+    z, source_label = get_zscore_values(df, roi, source=source)
+    smooth = sliding_window_mean_by_time(
+        df["time_sec"].to_numpy(dtype=float),
+        z,
+        window_sec=window_sec,
+        centered=centered,
+    )
+    return z, smooth, source_label
+
+
 def add_repeating_dark_shading(fig, df, dark_start_sec=43200.0, dark_duration_sec=43200.0, cycle_sec=86400.0, rows=(1,)):
     """
-    Optional paper-like gray shading for repeated dark-cycle epochs.
+    Optional gray shading for repeated dark-cycle epochs.
     Uses time_sec x-axis values, not decimal hours.
     """
     if df is None or df.empty or "time_sec" not in df.columns:
@@ -1218,7 +1229,6 @@ def add_repeating_dark_shading(fig, df, dark_start_sec=43200.0, dark_duration_se
     dark_duration_sec = max(float(dark_duration_sec), 1.0)
     cycle_sec = max(float(cycle_sec), dark_duration_sec + 1.0)
 
-    # Find a first epoch start before the visible region.
     first_start = dark_start_sec - np.ceil((dark_start_sec - x_min) / cycle_sec) * cycle_sec
     epoch_start = first_start
 
@@ -1240,7 +1250,7 @@ def add_repeating_dark_shading(fig, df, dark_start_sec=43200.0, dark_duration_se
     return fig
 
 
-def make_paper_style_zscore_figure(
+def make_zscore_sliding_mean_figure(
     df,
     roi,
     limits=None,
@@ -1260,29 +1270,20 @@ def make_paper_style_zscore_figure(
     cycle_sec=86400.0,
 ):
     """
-    Lowell Figure 1N-style graph:
+    Long-term z-score graph:
       black trace = raw z-score trace
       blue trace  = sliding-window mean z-score trace
 
     Default sliding mean window = 30 minutes.
     """
-    z, source_label = get_paper_zscore_values(df, roi, source=source)
-    smooth = sliding_window_mean_by_time(
-        df["time_sec"].to_numpy(dtype=float),
-        z,
-        window_sec=window_sec,
-        centered=centered,
+    z, smooth, source_label = get_zscore_and_smooth(
+        df, roi, source=source, window_sec=window_sec, centered=centered
     )
 
     window_label = seconds_to_hms(window_sec)
-    subtitle = f"Paper-style z-score with sliding mean window = {window_label}"
+    subtitle = f"Z-score with sliding mean window = {window_label}"
 
-    fig = make_subplots(
-        rows=1,
-        cols=1,
-        subplot_titles=(subtitle,),
-    )
-
+    fig = make_subplots(rows=1, cols=1, subplot_titles=(subtitle,))
     x = df["time_sec"]
 
     if show_dark_shading:
@@ -1333,6 +1334,246 @@ def make_paper_style_zscore_figure(
 
     return finish_fig(fig, height=height, df=df)
 
+
+def summarize_zscore_ranges(df, z, smooth, periods, analysis_trace="Sliding mean"):
+    """
+    Calculate z-score summary statistics for multiple time windows.
+
+    The graph display is visual-only; these calculations do not change the CSV.
+    """
+    rows = []
+    time_sec = df["time_sec"].to_numpy(dtype=float)
+
+    for idx, period in enumerate(periods, start=1):
+        start = float(period["start_sec"])
+        end = float(period["end_sec"])
+        if end <= start:
+            continue
+
+        mask = (time_sec >= start) & (time_sec <= end)
+        if not mask.any():
+            rows.append({
+                "Range": period.get("name", f"Range {idx}"),
+                "Start": seconds_to_hms(start),
+                "End": seconds_to_hms(end),
+                "N samples": 0,
+                "Trace used": analysis_trace,
+                "Average z-score": np.nan,
+                "Min z-score": np.nan,
+                "Max z-score": np.nan,
+                "Z-score range": np.nan,
+            })
+            continue
+
+        values = z[mask] if analysis_trace == "Raw z-score" else smooth[mask]
+        finite = values[np.isfinite(values)]
+
+        if finite.size == 0:
+            mean_val = min_val = max_val = range_val = np.nan
+        else:
+            mean_val = float(np.nanmean(finite))
+            min_val = float(np.nanmin(finite))
+            max_val = float(np.nanmax(finite))
+            range_val = max_val - min_val
+
+        rows.append({
+            "Range": period.get("name", f"Range {idx}"),
+            "Start": seconds_to_hms(start),
+            "End": seconds_to_hms(end),
+            "N samples": int(finite.size),
+            "Trace used": analysis_trace,
+            "Average z-score": mean_val,
+            "Min z-score": min_val,
+            "Max z-score": max_val,
+            "Z-score range": range_val,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def add_zscore_range_shapes_and_stats(
+    fig,
+    df,
+    z,
+    smooth,
+    periods,
+    analysis_trace="Sliding mean",
+    show_average_line=True,
+    show_annotations=True,
+):
+    """Add range shading, boundary lines, and average z-score line segments."""
+    if not periods:
+        return fig, pd.DataFrame()
+
+    stats_df = summarize_zscore_ranges(df, z, smooth, periods, analysis_trace=analysis_trace)
+
+    for idx, period in enumerate(periods, start=1):
+        start = float(period["start_sec"])
+        end = float(period["end_sec"])
+        if end <= start:
+            continue
+
+        color = period.get("color", "#f59e0b")
+        shade_alpha = float(period.get("shade_alpha", 0.18))
+        line_alpha = float(period.get("line_alpha", 0.75))
+        line_color = hex_to_rgba(color, line_alpha)
+
+        fig.add_vrect(x0=start, x1=end, fillcolor=color, opacity=shade_alpha, line_width=0, row=1, col=1)
+        fig.add_vline(x=start, line_width=1.3, line_dash="dash", line_color=line_color, row=1, col=1)
+        fig.add_vline(x=end, line_width=1.3, line_dash="dash", line_color=line_color, row=1, col=1)
+
+        if idx - 1 < len(stats_df):
+            row = stats_df.iloc[idx - 1]
+            avg = row["Average z-score"]
+            min_z = row["Min z-score"]
+            max_z = row["Max z-score"]
+            z_range = row["Z-score range"]
+
+            if np.isfinite(avg) and show_average_line:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[start, end],
+                        y=[avg, avg],
+                        mode="lines",
+                        name=f"{period.get('name', f'Range {idx}')} average z",
+                        line=dict(color=color, width=3, dash="solid"),
+                        hovertemplate=(
+                            f"{period.get('name', f'Range {idx}')}<br>"
+                            f"Average z-score: {avg:.4g}<br>"
+                            f"Start: {seconds_to_hms(start)}<br>"
+                            f"End: {seconds_to_hms(end)}<extra></extra>"
+                        ),
+                    ),
+                    row=1,
+                    col=1,
+                )
+
+            if show_annotations and np.isfinite(avg):
+                label = (
+                    f"<b>{period.get('name', f'Range {idx}')}</b><br>"
+                    f"Avg z = {avg:.3g}<br>"
+                    f"Min = {min_z:.3g}, Max = {max_z:.3g}<br>"
+                    f"Range = {z_range:.3g}"
+                )
+                fig.add_annotation(
+                    x=(start + end) / 2,
+                    y=avg,
+                    xref="x",
+                    yref="y",
+                    text=label,
+                    showarrow=True,
+                    arrowhead=2,
+                    ax=0,
+                    ay=-45,
+                    font=dict(size=11, color="#111827"),
+                    bgcolor="rgba(255,255,255,0.88)",
+                    bordercolor=color,
+                    borderwidth=1,
+                    borderpad=4,
+                )
+
+    return fig, stats_df
+
+
+def make_zscore_range_analysis_figure(
+    df,
+    roi,
+    limits=None,
+    events=None,
+    exclusions=None,
+    show_exclusions=True,
+    show_event_labels=True,
+    height=700,
+    window_sec=1800.0,
+    centered=True,
+    source="z-dFF column",
+    show_raw=True,
+    show_smooth=True,
+    show_dark_shading=False,
+    dark_start_sec=43200.0,
+    dark_duration_sec=43200.0,
+    cycle_sec=86400.0,
+    range_periods=None,
+    range_trace="Sliding mean",
+    show_average_line=True,
+    show_range_annotations=True,
+):
+    """
+    Z-score graph with user-defined time windows.
+
+    It uses the same z-score source and sliding-window size as the main z-score graph.
+    For each selected range, the app calculates average z-score, min z-score,
+    max z-score, and max-min range.
+    """
+    z, smooth, source_label = get_zscore_and_smooth(
+        df, roi, source=source, window_sec=window_sec, centered=centered
+    )
+
+    window_label = seconds_to_hms(window_sec)
+    subtitle = f"Z-score range analysis; sliding mean window = {window_label}"
+
+    fig = make_subplots(rows=1, cols=1, subplot_titles=(subtitle,))
+    x = df["time_sec"]
+
+    if show_dark_shading:
+        add_repeating_dark_shading(
+            fig,
+            df,
+            dark_start_sec=dark_start_sec,
+            dark_duration_sec=dark_duration_sec,
+            cycle_sec=cycle_sec,
+            rows=(1,),
+        )
+
+    if show_raw:
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=z,
+                mode="lines",
+                name=f"Raw {source_label}",
+                line=dict(color="black", width=0.8),
+                opacity=0.65,
+            ),
+            row=1,
+            col=1,
+        )
+
+    if show_smooth:
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=smooth,
+                mode="lines",
+                name=f"Sliding mean ({window_label})",
+                line=dict(color="#1f77b4", width=2.4),
+            ),
+            row=1,
+            col=1,
+        )
+
+    fig, stats_df = add_zscore_range_shapes_and_stats(
+        fig,
+        df,
+        z,
+        smooth,
+        range_periods or [],
+        analysis_trace=range_trace,
+        show_average_line=show_average_line,
+        show_annotations=show_range_annotations,
+    )
+
+    fig.update_yaxes(title_text="Z score", row=1, col=1)
+    apply_hms_xaxis(fig, df, rows=[1])
+
+    if limits:
+        apply_y_range(fig, 1, limits.get("z_dFF"))
+
+    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1], show=show_exclusions)
+    add_events_to_fig(fig, events or [], rows=[1], show_labels=show_event_labels)
+
+    return finish_fig(fig, height=height, df=df), stats_df
+
 # =============================================================================
 # SIDEBAR CONTROLS
 # =============================================================================
@@ -1354,7 +1595,7 @@ with st.sidebar:
         focus_mode = st.checkbox("Maximize one graph only", value=False)
         focus_graph = st.selectbox(
             "Graph to maximize",
-            ["Overview", "Raw channels", "Main dFF", "Paper-style z-score"],
+            ["Overview", "Raw channels", "Main dFF", "Z-score sliding mean", "Z-score range analysis"],
             index=0,
             disabled=not focus_mode,
         )
@@ -1362,53 +1603,116 @@ with st.sidebar:
         show_hidden_region_shading = st.checkbox("Mark hidden regions with pale gray shading", value=True)
         st.caption("Mouse/trackpad scroll zoom is disabled. Use graph size/focus mode to view graphs larger.")
 
-    with st.expander("Paper-style z-score", expanded=False):
-        st.caption("Matches the Figure 1N-style display: black raw z-score trace plus blue sliding-window mean.")
-        paper_z_source = st.selectbox(
+    with st.expander("Z-score sliding mean", expanded=False):
+        st.caption("Display a raw z-score trace with an adjustable sliding-window mean.")
+        z_source = st.selectbox(
             "Trace source",
-            ["z-dFF column", "Re-z-score dFF (%)", "Re-z-score Delta-F"],
+            ["z-dFF column", "Re-z-score dFF", "Re-z-score Delta-F"],
             index=0,
             help="Use the existing z-dFF column if available, or calculate a fresh z-score from dFF/Delta-F for display.",
         )
-        paper_window_hms = st.text_input("Sliding mean window (HH:MM:SS)", value="00:30:00")
-        paper_window_sec, paper_window_err = parse_hms_to_seconds(
-            paper_window_hms,
+        z_window_hms = st.text_input("Sliding mean window (HH:MM:SS)", value="00:30:00")
+        z_window_sec, z_window_err = parse_hms_to_seconds(
+            z_window_hms,
             30 * 60,
             "sliding mean window",
         )
-        if paper_window_err:
-            st.error(paper_window_err)
-        paper_centered_mean = st.checkbox(
+        if z_window_err:
+            st.error(z_window_err)
+        z_centered_mean = st.checkbox(
             "Center the sliding window",
             value=True,
             help="Centered smoothing avoids shifting peaks left/right. Turn off for a trailing running mean.",
         )
-        paper_show_raw = st.checkbox("Show black raw z-score trace", value=True)
-        paper_show_smooth = st.checkbox("Show blue sliding mean trace", value=True)
+        z_show_raw = st.checkbox("Show black raw z-score trace", value=True)
+        z_show_smooth = st.checkbox("Show blue sliding mean trace", value=True)
 
-        with st.expander("Optional paper-like dark-cycle shading", expanded=False):
-            paper_show_dark = st.checkbox("Show repeated gray dark-cycle shading", value=False)
-            paper_dark_start_hms = st.text_input("Dark phase start after recording start (HH:MM:SS)", value="12:00:00")
-            paper_dark_duration_hms = st.text_input("Dark phase duration (HH:MM:SS)", value="12:00:00")
-            paper_cycle_hms = st.text_input("Cycle length (HH:MM:SS)", value="24:00:00")
-            paper_dark_start_sec, paper_dark_start_err = parse_hms_to_seconds(
-                paper_dark_start_hms,
+        with st.expander("Optional dark-cycle shading", expanded=False):
+            z_show_dark = st.checkbox("Show repeated gray dark-cycle shading", value=False)
+            z_dark_start_hms = st.text_input("Dark phase start after recording start (HH:MM:SS)", value="12:00:00")
+            z_dark_duration_hms = st.text_input("Dark phase duration (HH:MM:SS)", value="12:00:00")
+            z_cycle_hms = st.text_input("Cycle length (HH:MM:SS)", value="24:00:00")
+            z_dark_start_sec, z_dark_start_err = parse_hms_to_seconds(
+                z_dark_start_hms,
                 12 * 3600,
                 "dark phase start",
             )
-            paper_dark_duration_sec, paper_dark_duration_err = parse_hms_to_seconds(
-                paper_dark_duration_hms,
+            z_dark_duration_sec, z_dark_duration_err = parse_hms_to_seconds(
+                z_dark_duration_hms,
                 12 * 3600,
                 "dark phase duration",
             )
-            paper_cycle_sec, paper_cycle_err = parse_hms_to_seconds(
-                paper_cycle_hms,
+            z_cycle_sec, z_cycle_err = parse_hms_to_seconds(
+                z_cycle_hms,
                 24 * 3600,
                 "cycle length",
             )
-            for err in [paper_dark_start_err, paper_dark_duration_err, paper_cycle_err]:
+            for err in [z_dark_start_err, z_dark_duration_err, z_cycle_err]:
                 if err:
                     st.error(err)
+
+    with st.expander("Z-score range analysis", expanded=False):
+        st.caption("Mark one or more time ranges and calculate the average, min, max, and range of the z-score trace.")
+        z_range_trace = st.selectbox(
+            "Trace to summarize inside each range",
+            ["Sliding mean", "Raw z-score"],
+            index=0,
+            help="The graph still shows both traces if enabled above. This only controls the statistics and average-line overlay.",
+        )
+        z_show_average_line = st.checkbox("Show average z-score line inside each range", value=True)
+        z_show_range_annotations = st.checkbox("Show average/range labels on graph", value=True)
+        z_show_stats_table = st.checkbox("Show statistics table below graph", value=True)
+
+        if st.button("Clear z-score ranges", use_container_width=True):
+            st.session_state["num_z_ranges"] = 0
+
+        num_z_ranges = st.number_input(
+            "Number of z-score ranges",
+            min_value=0,
+            max_value=30,
+            step=1,
+            key="num_z_ranges",
+        )
+
+        z_range_periods = []
+        for i in range(int(num_z_ranges)):
+            with st.expander(f"Z-score range {i + 1}: timing", expanded=True):
+                range_name = st.text_input("Range name", value=f"Range {i + 1}", key=f"z_range_name_{i}")
+                range_start_hms = st.text_input("Start time (HH:MM:SS)", value="00:00:00", key=f"z_range_start_hms_{i}")
+                range_end_hms = st.text_input("End time (HH:MM:SS)", value="00:30:00", key=f"z_range_end_hms_{i}")
+                range_start_sec, range_start_err = parse_hms_to_seconds(
+                    range_start_hms,
+                    0.0,
+                    f"z-score range {i + 1} start",
+                )
+                range_end_sec, range_end_err = parse_hms_to_seconds(
+                    range_end_hms,
+                    30 * 60,
+                    f"z-score range {i + 1} end",
+                )
+                if range_start_err:
+                    st.error(range_start_err)
+                if range_end_err:
+                    st.error(range_end_err)
+                if range_end_sec <= range_start_sec:
+                    st.warning("End time must be after start time for this z-score range.")
+
+            with st.expander(f"Z-score range {i + 1}: color", expanded=False):
+                range_color = st.color_picker("Range color", value="#f59e0b", key=f"z_range_color_{i}")
+                range_shade_alpha = st.slider("Range shade transparency", 0.02, 0.80, 0.18, 0.02, key=f"z_range_shade_alpha_{i}")
+                range_line_alpha = st.slider("Range boundary transparency", 0.05, 1.0, 0.75, 0.05, key=f"z_range_line_alpha_{i}")
+
+            if range_end_sec > range_start_sec:
+                z_range_periods.append({
+                    "name": range_name,
+                    "start_sec": float(range_start_sec),
+                    "end_sec": float(range_end_sec),
+                    "start_hhmmss": seconds_to_hms(range_start_sec),
+                    "end_hhmmss": seconds_to_hms(range_end_sec),
+                    "color": range_color,
+                    "shade_alpha": float(range_shade_alpha),
+                    "line_alpha": float(range_line_alpha),
+                })
 
     with st.expander("Visual crop window", expanded=False):
         use_window = st.checkbox(
@@ -1529,6 +1833,8 @@ if "num_exclusions" not in st.session_state:
     st.session_state["num_exclusions"] = 0
 if "num_events" not in st.session_state:
     st.session_state["num_events"] = 0
+if "num_z_ranges" not in st.session_state:
+    st.session_state["num_z_ranges"] = 0
 
 run_clicked = st.button("Run / refresh analysis", type="primary", use_container_width=True)
 
@@ -1625,7 +1931,8 @@ else:
     overview_h = int(850 * height_mult)
     raw_h = int(650 * height_mult)
     processed_h = int(760 * height_mult)
-    paper_z_h = int(650 * height_mult)
+    z_h = int(650 * height_mult)
+    z_range_h = int(720 * height_mult)
     dual_h = int(560 * height_mult)
 
     st.success(f"Loaded {len(results)} recording(s).")
@@ -1683,8 +1990,8 @@ else:
                     show_event_labels=show_event_labels,
                     height=raw_h,
                 )
-            elif kind == "Paper-style z-score":
-                fig = make_paper_style_zscore_figure(
+            elif kind == "Z-score sliding mean":
+                fig = make_zscore_sliding_mean_figure(
                     view_df,
                     roi_name,
                     manual_limits,
@@ -1692,17 +1999,60 @@ else:
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
                     show_event_labels=show_event_labels,
-                    height=paper_z_h,
-                    window_sec=paper_window_sec,
-                    centered=paper_centered_mean,
-                    source=paper_z_source,
-                    show_raw=paper_show_raw,
-                    show_smooth=paper_show_smooth,
-                    show_dark_shading=paper_show_dark,
-                    dark_start_sec=paper_dark_start_sec,
-                    dark_duration_sec=paper_dark_duration_sec,
-                    cycle_sec=paper_cycle_sec,
+                    height=z_h,
+                    window_sec=z_window_sec,
+                    centered=z_centered_mean,
+                    source=z_source,
+                    show_raw=z_show_raw,
+                    show_smooth=z_show_smooth,
+                    show_dark_shading=z_show_dark,
+                    dark_start_sec=z_dark_start_sec,
+                    dark_duration_sec=z_dark_duration_sec,
+                    cycle_sec=z_cycle_sec,
                 )
+            elif kind == "Z-score range analysis":
+                fig, z_stats_df = make_zscore_range_analysis_figure(
+                    view_df,
+                    roi_name,
+                    manual_limits,
+                    events=event_annotations,
+                    exclusions=visual_exclusions,
+                    show_exclusions=show_hidden_region_shading,
+                    show_event_labels=show_event_labels,
+                    height=z_range_h,
+                    window_sec=z_window_sec,
+                    centered=z_centered_mean,
+                    source=z_source,
+                    show_raw=z_show_raw,
+                    show_smooth=z_show_smooth,
+                    show_dark_shading=z_show_dark,
+                    dark_start_sec=z_dark_start_sec,
+                    dark_duration_sec=z_dark_duration_sec,
+                    cycle_sec=z_cycle_sec,
+                    range_periods=z_range_periods,
+                    range_trace=z_range_trace,
+                    show_average_line=z_show_average_line,
+                    show_range_annotations=z_show_range_annotations,
+                )
+                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+                if z_show_stats_table and z_stats_df is not None and not z_stats_df.empty:
+                    st.dataframe(
+                        z_stats_df.style.format({
+                            "Average z-score": "{:.4f}",
+                            "Min z-score": "{:.4f}",
+                            "Max z-score": "{:.4f}",
+                            "Z-score range": "{:.4f}",
+                        }),
+                        use_container_width=True,
+                        height=min(420, 105 + 35 * len(z_stats_df)),
+                    )
+                    st.download_button(
+                        label="Download z-score range statistics as CSV",
+                        data=z_stats_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{safe_name(result['name'])}_zscore_range_statistics.csv",
+                        mime="text/csv",
+                    )
+                return
             else:
                 fig = make_main_dff_figure(
                     view_df, roi_name, manual_limits,
@@ -1728,7 +2078,7 @@ else:
                 )
             continue
 
-        tabs = st.tabs(["Overview", "Raw channels", "Main dFF", "Paper-style z-score", "Data preview", "Settings"])
+        tabs = st.tabs(["Overview", "Raw channels", "Main dFF", "Z-score sliding mean", "Z-score range analysis", "Data preview", "Settings"])
 
         with tabs[0]:
             render_chart("Overview")
@@ -1737,8 +2087,10 @@ else:
         with tabs[2]:
             render_chart("Main dFF")
         with tabs[3]:
-            render_chart("Paper-style z-score")
+            render_chart("Z-score sliding mean")
         with tabs[4]:
+            render_chart("Z-score range analysis")
+        with tabs[5]:
             st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
             st.dataframe(view_df.head(500), use_container_width=True, height=360)
             st.download_button(
@@ -1747,7 +2099,7 @@ else:
                 file_name=f"{safe_name(result['name'])}_processed_output.csv",
                 mime="text/csv",
             )
-        with tabs[5]:
+        with tabs[6]:
             st.json(result.get("settings", {}))
 
     st.divider()
