@@ -307,6 +307,23 @@ PLOTLY_CONFIG = {
     "modeBarButtonsToRemove": ["lasso2d", "select2d"],
 }
 
+DEFAULT_GRAPH_COLORS = {
+    "sig_raw": "#636EFA",
+    "uv_raw": "#00CC96",
+    "uv_fit": "#AB63FA",
+    "deltaF": "#FFA15A",
+    "dff": "#EF553B",
+    "raw_z": "#111111",
+    "z_smooth": "#1f77b4",
+    "range_average": "#f59e0b",
+}
+
+
+def graph_color(name):
+    """Return user-selected graph color, or a sensible default."""
+    return st.session_state.get(f"color_{name}", DEFAULT_GRAPH_COLORS.get(name, "#111111"))
+
+
 # =============================================================================
 # HELPERS
 # =============================================================================
@@ -366,8 +383,13 @@ def time_label_from_seconds(seconds):
 
 
 def make_time_ticks(min_sec, max_sec, n=None):
-    """Return standard x-axis ticks every 30 minutes, labeled HH:MM:SS."""
-    interval = 30 * 60  # 30 minutes in seconds
+    """
+    Return clean hour-based x-axis ticks.
+
+    The graph x-axis uses seconds internally so hover can still show HH:MM:SS,
+    but the visible tick labels are simple elapsed hours: 0, 1, 2, 3, ...
+    """
+    interval = 3600.0  # 1 hour
     min_sec = float(min_sec) if np.isfinite(min_sec) else 0.0
     max_sec = float(max_sec) if np.isfinite(max_sec) else max(min_sec + interval, interval)
     if max_sec <= min_sec:
@@ -376,13 +398,18 @@ def make_time_ticks(min_sec, max_sec, n=None):
     start_tick = max(0.0, np.floor(min_sec / interval) * interval)
     end_tick = np.ceil(max_sec / interval) * interval
     ticks = np.arange(start_tick, end_tick + interval * 0.5, interval, dtype=float)
-    if ticks.size == 0:
-        ticks = np.array([0.0, float(interval)])
-    return ticks.tolist(), [seconds_to_hms(t) for t in ticks]
+
+    if ticks.size < 2 and (max_sec - min_sec) <= interval:
+        ticks = np.arange(0.0, max(interval, max_sec) + 1800.0, 1800.0, dtype=float)
+        labels = [f"{t / 3600:g}" for t in ticks]
+    else:
+        labels = [str(int(round(t / 3600.0))) for t in ticks]
+
+    return ticks.tolist(), labels
 
 
 def apply_hms_xaxis(fig, df, rows=None):
-    """Show standard 30-minute x-axis tick marks as HH:MM:SS without overlapping subplot text."""
+    """Show clean elapsed-hour x-axis marks while keeping HH:MM:SS hover."""
     if "time_sec" not in df.columns or df.empty:
         return fig
     min_sec = float(np.nanmin(df["time_sec"]))
@@ -391,7 +418,7 @@ def apply_hms_xaxis(fig, df, rows=None):
 
     if rows is None:
         fig.update_xaxes(
-            title_text="Time (HH:MM:SS)",
+            title_text="Time (hours)",
             tickmode="array",
             tickvals=tickvals,
             ticktext=ticktext,
@@ -403,7 +430,7 @@ def apply_hms_xaxis(fig, df, rows=None):
         for row in rows:
             show_labels = row == bottom_row
             fig.update_xaxes(
-                title_text="Time (HH:MM:SS)" if show_labels else "",
+                title_text="Time (hours)" if show_labels else "",
                 tickmode="array",
                 tickvals=tickvals,
                 ticktext=ticktext,
@@ -464,8 +491,26 @@ def standardize_time(df):
 
     df = df.dropna(subset=["time_sec"]).sort_values("time_sec").reset_index(drop=True)
 
-    # If time appears to be milliseconds, convert to seconds.
-    if df["time_sec"].max() > 100000 and df["time_sec"].median() > 1000:
+    # Only convert milliseconds to seconds when the input truly looks like ms.
+    #
+    # IMPORTANT:
+    # A 48-hour recording in seconds has max(time_sec) around 172800.
+    # The old rule divided any long recording by 1000, which made 48 hours
+    # display as ~2 minutes 53 seconds. Do not use max(time_sec) alone.
+    time_col_lower = str(time_col).lower()
+    time_values = df["time_sec"].to_numpy(dtype=float)
+    diffs = np.diff(time_values)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    median_step = float(np.nanmedian(diffs)) if diffs.size else np.nan
+
+    looks_like_ms_name = any(token in time_col_lower for token in ["time_ms", "ms", "msec", "millisecond"])
+    looks_like_ms_values = (
+        np.isfinite(median_step)
+        and median_step > 1.0
+        and float(np.nanmax(time_values)) > 1_000_000
+    )
+
+    if looks_like_ms_name or looks_like_ms_values:
         df["time_sec"] = df["time_sec"] / 1000.0
 
     df["elapsed_hours"] = df["time_sec"] / 3600.0
@@ -844,18 +889,18 @@ def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, sho
     )
     x = df["time_sec"]
     if f"{roi}_sig_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", showlegend=False), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", line=dict(color=graph_color("sig_raw"))), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", showlegend=False, line=dict(color=graph_color("sig_raw"))), row=2, col=1)
     if f"{roi}_uv_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="UV Raw / 405"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="UV Raw / 405", line=dict(color=graph_color("uv_raw"))), row=1, col=1)
     if f"{roi}_uv_fit" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_fit"], mode="lines", name="UV Fit / fitted 405"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_fit"], mode="lines", name="UV Fit / fitted 405", line=dict(color=graph_color("uv_fit"))), row=2, col=1)
     if f"{roi}_deltaF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F"), row=3, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F", line=dict(color=graph_color("deltaF"))), row=3, col=1)
     if f"{roi}_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)"), row=4, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)", line=dict(color=graph_color("dff"))), row=4, col=1)
     if f"{roi}_z_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_z_dFF"], mode="lines", name="z-dFF"), row=5, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_z_dFF"], mode="lines", name="z-dFF", line=dict(color=graph_color("raw_z"))), row=5, col=1)
 
     fig.update_yaxes(title_text="Raw", row=1, col=1)
     fig.update_yaxes(title_text="Fit", row=2, col=1)
@@ -881,9 +926,9 @@ def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=No
                         subplot_titles=("465 nm calcium-dependent signal", "405 nm isosbestic/control signal"))
     x = df["time_sec"]
     if f"{roi}_sig_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="465 raw"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="465 raw", line=dict(color=graph_color("sig_raw"))), row=1, col=1)
     if f"{roi}_uv_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="405 raw"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="405 raw", line=dict(color=graph_color("uv_raw"))), row=2, col=1)
     fig.update_yaxes(title_text="465 raw", row=1, col=1)
     fig.update_yaxes(title_text="405 raw", row=2, col=1)
     apply_hms_xaxis(fig, df, rows=[1, 2])
@@ -900,11 +945,11 @@ def make_processed_figure(df, roi, limits=None, events=None, exclusions=None, sh
                         subplot_titles=("Delta-F", "dFF (%) - main normalized trace", "z-scored dFF"))
     x = df["time_sec"]
     if f"{roi}_deltaF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F", line=dict(color=graph_color("deltaF"))), row=1, col=1)
     if f"{roi}_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)", line=dict(color=graph_color("dff"))), row=2, col=1)
     if f"{roi}_z_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_z_dFF"], mode="lines", name="z-dFF"), row=3, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_z_dFF"], mode="lines", name="z-dFF", line=dict(color=graph_color("raw_z"))), row=3, col=1)
     fig.update_yaxes(title_text="Delta-F", row=1, col=1)
     fig.update_yaxes(title_text="dFF (%)", row=2, col=1)
     fig.update_yaxes(title_text="z-dFF", row=3, col=1)
@@ -922,9 +967,9 @@ def make_dual_delta_dff_figure(df, roi, limits=None, events=None, exclusions=Non
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     x = df["time_sec"]
     if f"{roi}_deltaF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F"), secondary_y=False)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F", line=dict(color=graph_color("deltaF"))), secondary_y=False)
     if f"{roi}_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)"), secondary_y=True)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)", line=dict(color=graph_color("dff"))), secondary_y=True)
     apply_hms_xaxis(fig, df)
     fig.update_yaxes(title_text="Delta-F", secondary_y=False)
     fig.update_yaxes(title_text="dFF (%)", secondary_y=True)
@@ -1065,14 +1110,14 @@ def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, sho
     )
     x = df["time_sec"]
     if f"{roi}_sig_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", showlegend=False), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", line=dict(color=graph_color("sig_raw"))), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", showlegend=False, line=dict(color=graph_color("sig_raw"))), row=2, col=1)
     if f"{roi}_uv_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="UV Raw / 405"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="UV Raw / 405", line=dict(color=graph_color("uv_raw"))), row=1, col=1)
     if f"{roi}_uv_fit" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_fit"], mode="lines", name="UV Fit / fitted 405"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_fit"], mode="lines", name="UV Fit / fitted 405", line=dict(color=graph_color("uv_fit"))), row=2, col=1)
     if f"{roi}_deltaF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F"), row=3, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F", line=dict(color=graph_color("deltaF"))), row=3, col=1)
 
     fig.update_yaxes(title_text="Raw", row=1, col=1)
     fig.update_yaxes(title_text="Fit", row=2, col=1)
@@ -1099,9 +1144,9 @@ def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=No
     )
     x = df["time_sec"]
     if f"{roi}_sig_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="465 raw"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="465 raw", line=dict(color=graph_color("sig_raw"))), row=1, col=1)
     if f"{roi}_uv_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="405 raw"), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="405 raw", line=dict(color=graph_color("uv_raw"))), row=2, col=1)
     fig.update_yaxes(title_text="465 raw", row=1, col=1)
     fig.update_yaxes(title_text="405 raw", row=2, col=1)
     apply_hms_xaxis(fig, df, rows=[1, 2])
@@ -1118,7 +1163,7 @@ def make_main_dff_figure(df, roi, limits=None, events=None, exclusions=None, sho
     fig = make_subplots(rows=1, cols=1, subplot_titles=("Main dFF (%)",))
     x = df["time_sec"]
     if f"{roi}_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)", line=dict(color=graph_color("dff"))), row=1, col=1)
     fig.update_yaxes(title_text="dFF (%)", row=1, col=1)
     apply_hms_xaxis(fig, df, rows=[1])
     if limits:
@@ -1303,7 +1348,7 @@ def make_zscore_sliding_mean_figure(
                 y=z,
                 mode="lines",
                 name=f"Raw {source_label}",
-                line=dict(color="black", width=0.8),
+                line=dict(color=graph_color("raw_z"), width=0.8),
                 opacity=0.85,
             ),
             row=1,
@@ -1317,7 +1362,7 @@ def make_zscore_sliding_mean_figure(
                 y=smooth,
                 mode="lines",
                 name=f"Sliding mean ({window_label})",
-                line=dict(color="#1f77b4", width=2.4),
+                line=dict(color=graph_color("z_smooth"), width=2.4),
             ),
             row=1,
             col=1,
@@ -1413,7 +1458,7 @@ def add_zscore_range_shapes_and_stats(
         if end <= start:
             continue
 
-        color = period.get("color", "#f59e0b")
+        color = period.get("color", graph_color("range_average"))
         shade_alpha = float(period.get("shade_alpha", 0.18))
         line_alpha = float(period.get("line_alpha", 0.75))
         line_color = hex_to_rgba(color, line_alpha)
@@ -1532,7 +1577,7 @@ def make_zscore_range_analysis_figure(
                 y=z,
                 mode="lines",
                 name=f"Raw {source_label}",
-                line=dict(color="black", width=0.8),
+                line=dict(color=graph_color("raw_z"), width=0.8),
                 opacity=0.65,
             ),
             row=1,
@@ -1546,7 +1591,7 @@ def make_zscore_range_analysis_figure(
                 y=smooth,
                 mode="lines",
                 name=f"Sliding mean ({window_label})",
-                line=dict(color="#1f77b4", width=2.4),
+                line=dict(color=graph_color("z_smooth"), width=2.4),
             ),
             row=1,
             col=1,
@@ -1574,9 +1619,172 @@ def make_zscore_range_analysis_figure(
 
     return finish_fig(fig, height=height, df=df), stats_df
 
+
+def filter_events_for_context(events, recording_name, graph_kind):
+    """
+    Filter event annotations so events can be applied only to selected recordings
+    and/or selected graph tabs.
+    """
+    filtered = []
+    for ev in events or []:
+        target_recordings = ev.get("target_recordings", ["All recordings"])
+        target_graphs = ev.get("target_graphs", ["All graphs"])
+        recording_ok = (not target_recordings or "All recordings" in target_recordings or recording_name in target_recordings)
+        graph_ok = (not target_graphs or "All graphs" in target_graphs or graph_kind in target_graphs)
+        if recording_ok and graph_ok:
+            filtered.append(ev)
+    return filtered
+
+
+def render_zscore_display_controls(base_key):
+    """Z-score controls shown inside the z-score graph tab/focus window."""
+    st.markdown("#### Z-score display settings")
+    c1, c2, c3 = st.columns([1.2, 1.0, 1.0])
+    with c1:
+        z_source = st.selectbox(
+            "Trace source",
+            ["z-dFF column", "Re-z-score dFF", "Re-z-score Delta-F"],
+            index=0,
+            key=f"{base_key}_z_source",
+            help="Use the existing z-dFF column if available, or calculate a fresh z-score from dFF/Delta-F for display.",
+        )
+    with c2:
+        z_window_hms = st.text_input(
+            "Sliding mean window",
+            value="00:30:00",
+            key=f"{base_key}_z_window_hms",
+            help="Use HH:MM:SS, for example 00:10:00, 00:30:00, or 01:00:00.",
+        )
+    with c3:
+        z_centered_mean = st.checkbox(
+            "Centered window",
+            value=True,
+            key=f"{base_key}_z_centered_mean",
+            help="Centered smoothing avoids shifting peaks left/right. Turn off for a trailing running mean.",
+        )
+    z_window_sec, z_window_err = parse_hms_to_seconds(z_window_hms, 30 * 60, "sliding mean window")
+    if z_window_err:
+        st.error(z_window_err)
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        z_show_raw = st.checkbox("Show raw z-score trace", value=True, key=f"{base_key}_z_show_raw")
+    with c5:
+        z_show_smooth = st.checkbox("Show sliding mean trace", value=True, key=f"{base_key}_z_show_smooth")
+    with c6:
+        z_show_dark = st.checkbox("Show dark-cycle shading", value=False, key=f"{base_key}_z_show_dark")
+    with st.expander("Dark-cycle shading settings", expanded=False):
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            z_dark_start_hms = st.text_input("Dark phase start", value="12:00:00", key=f"{base_key}_z_dark_start_hms")
+        with d2:
+            z_dark_duration_hms = st.text_input("Dark phase duration", value="12:00:00", key=f"{base_key}_z_dark_duration_hms")
+        with d3:
+            z_cycle_hms = st.text_input("Cycle length", value="24:00:00", key=f"{base_key}_z_cycle_hms")
+        z_dark_start_sec, z_dark_start_err = parse_hms_to_seconds(z_dark_start_hms, 12 * 3600, "dark phase start")
+        z_dark_duration_sec, z_dark_duration_err = parse_hms_to_seconds(z_dark_duration_hms, 12 * 3600, "dark phase duration")
+        z_cycle_sec, z_cycle_err = parse_hms_to_seconds(z_cycle_hms, 24 * 3600, "cycle length")
+        for err in [z_dark_start_err, z_dark_duration_err, z_cycle_err]:
+            if err:
+                st.error(err)
+    return {
+        "source": z_source,
+        "window_sec": z_window_sec,
+        "centered": z_centered_mean,
+        "show_raw": z_show_raw,
+        "show_smooth": z_show_smooth,
+        "show_dark": z_show_dark,
+        "dark_start_sec": z_dark_start_sec,
+        "dark_duration_sec": z_dark_duration_sec,
+        "cycle_sec": z_cycle_sec,
+    }
+
+
+def render_zscore_range_controls(base_key):
+    """Z-score range controls shown inside the range-analysis tab/focus window."""
+    st.markdown("#### Z-score range settings")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        z_range_trace = st.selectbox("Trace to summarize", ["Sliding mean", "Raw z-score"], index=0, key=f"{base_key}_z_range_trace")
+    with c2:
+        z_show_average_line = st.checkbox("Show average z-score line", value=True, key=f"{base_key}_z_show_average_line")
+    with c3:
+        z_show_range_annotations = st.checkbox("Show average/range labels", value=True, key=f"{base_key}_z_show_range_annotations")
+    z_show_stats_table = st.checkbox("Show statistics table below graph", value=True, key=f"{base_key}_z_show_stats_table")
+    if st.button("Clear z-score ranges", use_container_width=True, key=f"{base_key}_clear_z_ranges"):
+        st.session_state[f"{base_key}_num_z_ranges"] = 0
+    num_z_ranges = st.number_input("Number of z-score ranges", min_value=0, max_value=30, step=1, key=f"{base_key}_num_z_ranges")
+    z_range_periods = []
+    for i in range(int(num_z_ranges)):
+        with st.container():
+            st.markdown(f"**Z-score range {i + 1}**")
+            c1, c2, c3 = st.columns([1.2, 1, 1])
+            with c1:
+                range_name = st.text_input("Range name", value=f"Range {i + 1}", key=f"{base_key}_z_range_name_{i}")
+            with c2:
+                range_start_hms = st.text_input("Start time", value="00:00:00", key=f"{base_key}_z_range_start_hms_{i}")
+            with c3:
+                range_end_hms = st.text_input("End time", value="00:30:00", key=f"{base_key}_z_range_end_hms_{i}")
+            range_start_sec, range_start_err = parse_hms_to_seconds(range_start_hms, 0.0, f"z-score range {i + 1} start")
+            range_end_sec, range_end_err = parse_hms_to_seconds(range_end_hms, 30 * 60, f"z-score range {i + 1} end")
+            if range_start_err:
+                st.error(range_start_err)
+            if range_end_err:
+                st.error(range_end_err)
+            if range_end_sec <= range_start_sec:
+                st.warning("End time must be after start time for this z-score range.")
+            with st.container():
+                st.markdown("Range color")
+                c4, c5, c6 = st.columns(3)
+                with c4:
+                    range_color = st.color_picker("Range color", value="#f59e0b", key=f"{base_key}_z_range_color_{i}")
+                with c5:
+                    range_shade_alpha = st.slider("Shade transparency", 0.02, 0.80, 0.18, 0.02, key=f"{base_key}_z_range_shade_alpha_{i}")
+                with c6:
+                    range_line_alpha = st.slider("Boundary transparency", 0.05, 1.0, 0.75, 0.05, key=f"{base_key}_z_range_line_alpha_{i}")
+            if range_end_sec > range_start_sec:
+                z_range_periods.append({
+                    "name": range_name,
+                    "start_sec": float(range_start_sec),
+                    "end_sec": float(range_end_sec),
+                    "start_hhmmss": seconds_to_hms(range_start_sec),
+                    "end_hhmmss": seconds_to_hms(range_end_sec),
+                    "color": range_color,
+                    "shade_alpha": float(range_shade_alpha),
+                    "line_alpha": float(range_line_alpha),
+                })
+    return {
+        "range_trace": z_range_trace,
+        "show_average_line": z_show_average_line,
+        "show_range_annotations": z_show_range_annotations,
+        "show_stats_table": z_show_stats_table,
+        "range_periods": z_range_periods,
+    }
+
+
 # =============================================================================
 # SIDEBAR CONTROLS
 # =============================================================================
+
+if "results" not in st.session_state:
+    st.session_state["results"] = []
+if "num_exclusions" not in st.session_state:
+    st.session_state["num_exclusions"] = 0
+if "num_events" not in st.session_state:
+    st.session_state["num_events"] = 0
+
+GRAPH_TARGET_OPTIONS = [
+    "All graphs",
+    "Overview",
+    "Raw channels",
+    "Main dFF",
+    "Z-score sliding mean",
+    "Z-score range analysis",
+]
+
+recording_target_options = ["All recordings"] + [
+    str(r.get("name", f"Recording {i+1}"))
+    for i, r in enumerate(st.session_state.get("results", []))
+]
 
 with st.sidebar:
     with st.expander("Inputs", expanded=True):
@@ -1603,116 +1811,16 @@ with st.sidebar:
         show_hidden_region_shading = st.checkbox("Mark hidden regions with pale gray shading", value=True)
         st.caption("Mouse/trackpad scroll zoom is disabled. Use graph size/focus mode to view graphs larger.")
 
-    with st.expander("Z-score sliding mean", expanded=False):
-        st.caption("Display a raw z-score trace with an adjustable sliding-window mean.")
-        z_source = st.selectbox(
-            "Trace source",
-            ["z-dFF column", "Re-z-score dFF", "Re-z-score Delta-F"],
-            index=0,
-            help="Use the existing z-dFF column if available, or calculate a fresh z-score from dFF/Delta-F for display.",
-        )
-        z_window_hms = st.text_input("Sliding mean window (HH:MM:SS)", value="00:30:00")
-        z_window_sec, z_window_err = parse_hms_to_seconds(
-            z_window_hms,
-            30 * 60,
-            "sliding mean window",
-        )
-        if z_window_err:
-            st.error(z_window_err)
-        z_centered_mean = st.checkbox(
-            "Center the sliding window",
-            value=True,
-            help="Centered smoothing avoids shifting peaks left/right. Turn off for a trailing running mean.",
-        )
-        z_show_raw = st.checkbox("Show black raw z-score trace", value=True)
-        z_show_smooth = st.checkbox("Show blue sliding mean trace", value=True)
-
-        with st.expander("Optional dark-cycle shading", expanded=False):
-            z_show_dark = st.checkbox("Show repeated gray dark-cycle shading", value=False)
-            z_dark_start_hms = st.text_input("Dark phase start after recording start (HH:MM:SS)", value="12:00:00")
-            z_dark_duration_hms = st.text_input("Dark phase duration (HH:MM:SS)", value="12:00:00")
-            z_cycle_hms = st.text_input("Cycle length (HH:MM:SS)", value="24:00:00")
-            z_dark_start_sec, z_dark_start_err = parse_hms_to_seconds(
-                z_dark_start_hms,
-                12 * 3600,
-                "dark phase start",
-            )
-            z_dark_duration_sec, z_dark_duration_err = parse_hms_to_seconds(
-                z_dark_duration_hms,
-                12 * 3600,
-                "dark phase duration",
-            )
-            z_cycle_sec, z_cycle_err = parse_hms_to_seconds(
-                z_cycle_hms,
-                24 * 3600,
-                "cycle length",
-            )
-            for err in [z_dark_start_err, z_dark_duration_err, z_cycle_err]:
-                if err:
-                    st.error(err)
-
-    with st.expander("Z-score range analysis", expanded=False):
-        st.caption("Mark one or more time ranges and calculate the average, min, max, and range of the z-score trace.")
-        z_range_trace = st.selectbox(
-            "Trace to summarize inside each range",
-            ["Sliding mean", "Raw z-score"],
-            index=0,
-            help="The graph still shows both traces if enabled above. This only controls the statistics and average-line overlay.",
-        )
-        z_show_average_line = st.checkbox("Show average z-score line inside each range", value=True)
-        z_show_range_annotations = st.checkbox("Show average/range labels on graph", value=True)
-        z_show_stats_table = st.checkbox("Show statistics table below graph", value=True)
-
-        if st.button("Clear z-score ranges", use_container_width=True):
-            st.session_state["num_z_ranges"] = 0
-
-        num_z_ranges = st.number_input(
-            "Number of z-score ranges",
-            min_value=0,
-            max_value=30,
-            step=1,
-            key="num_z_ranges",
-        )
-
-        z_range_periods = []
-        for i in range(int(num_z_ranges)):
-            with st.expander(f"Z-score range {i + 1}: timing", expanded=True):
-                range_name = st.text_input("Range name", value=f"Range {i + 1}", key=f"z_range_name_{i}")
-                range_start_hms = st.text_input("Start time (HH:MM:SS)", value="00:00:00", key=f"z_range_start_hms_{i}")
-                range_end_hms = st.text_input("End time (HH:MM:SS)", value="00:30:00", key=f"z_range_end_hms_{i}")
-                range_start_sec, range_start_err = parse_hms_to_seconds(
-                    range_start_hms,
-                    0.0,
-                    f"z-score range {i + 1} start",
-                )
-                range_end_sec, range_end_err = parse_hms_to_seconds(
-                    range_end_hms,
-                    30 * 60,
-                    f"z-score range {i + 1} end",
-                )
-                if range_start_err:
-                    st.error(range_start_err)
-                if range_end_err:
-                    st.error(range_end_err)
-                if range_end_sec <= range_start_sec:
-                    st.warning("End time must be after start time for this z-score range.")
-
-            with st.expander(f"Z-score range {i + 1}: color", expanded=False):
-                range_color = st.color_picker("Range color", value="#f59e0b", key=f"z_range_color_{i}")
-                range_shade_alpha = st.slider("Range shade transparency", 0.02, 0.80, 0.18, 0.02, key=f"z_range_shade_alpha_{i}")
-                range_line_alpha = st.slider("Range boundary transparency", 0.05, 1.0, 0.75, 0.05, key=f"z_range_line_alpha_{i}")
-
-            if range_end_sec > range_start_sec:
-                z_range_periods.append({
-                    "name": range_name,
-                    "start_sec": float(range_start_sec),
-                    "end_sec": float(range_end_sec),
-                    "start_hhmmss": seconds_to_hms(range_start_sec),
-                    "end_hhmmss": seconds_to_hms(range_end_sec),
-                    "color": range_color,
-                    "shade_alpha": float(range_shade_alpha),
-                    "line_alpha": float(range_line_alpha),
-                })
+    with st.expander("Graph colors", expanded=False):
+        st.caption("These colors apply across all graph tabs unless an event/range has its own color.")
+        st.color_picker("465 raw / signal", value=DEFAULT_GRAPH_COLORS["sig_raw"], key="color_sig_raw")
+        st.color_picker("405 raw / isosbestic", value=DEFAULT_GRAPH_COLORS["uv_raw"], key="color_uv_raw")
+        st.color_picker("Fitted 405", value=DEFAULT_GRAPH_COLORS["uv_fit"], key="color_uv_fit")
+        st.color_picker("Delta-F", value=DEFAULT_GRAPH_COLORS["deltaF"], key="color_deltaF")
+        st.color_picker("dFF", value=DEFAULT_GRAPH_COLORS["dff"], key="color_dff")
+        st.color_picker("Raw z-score", value=DEFAULT_GRAPH_COLORS["raw_z"], key="color_raw_z")
+        st.color_picker("Sliding mean z-score", value=DEFAULT_GRAPH_COLORS["z_smooth"], key="color_z_smooth")
+        st.color_picker("Default range average line", value=DEFAULT_GRAPH_COLORS["range_average"], key="color_range_average")
 
     with st.expander("Visual crop window", expanded=False):
         use_window = st.checkbox(
@@ -1750,7 +1858,8 @@ with st.sidebar:
         )
         visual_exclusions = []
         for i in range(int(num_exclusions)):
-            with st.expander(f"Hidden region {i + 1} timing", expanded=True):
+            with st.container():
+                st.markdown(f"**Hidden region {i + 1} timing**")
                 ex_start_hms = st.text_input(f"Hidden region {i + 1} start (HH:MM:SS)", value="00:00:00", key=f"ex_start_hms_{i}")
                 ex_end_hms = st.text_input(f"Hidden region {i + 1} end (HH:MM:SS)", value="00:01:00", key=f"ex_end_hms_{i}")
                 ex_start, ex_start_err = parse_hms_to_seconds(ex_start_hms, 0.0, f"hidden region {i + 1} start")
@@ -1781,7 +1890,8 @@ with st.sidebar:
         )
         event_annotations = []
         for i in range(int(num_events)):
-            with st.expander(f"Event / epoch {i + 1}: name and timing", expanded=True):
+            with st.container():
+                st.markdown(f"**Event / epoch {i + 1}: name and timing**")
                 name = st.text_input("Event name", value=f"Event {i + 1}", key=f"ev_name_{i}")
                 start_hms = st.text_input("Start time (HH:MM:SS)", value="00:00:00", key=f"ev_start_hms_{i}")
                 start, start_time_err = parse_hms_to_seconds(start_hms, 0.0, f"event {i + 1} start time")
@@ -1799,7 +1909,25 @@ with st.sidebar:
                         st.warning("Event end time must be after start time to shade a duration.")
                         end = None
 
-            with st.expander(f"Event / epoch {i + 1}: color and shading", expanded=False):
+            with st.container():
+                st.markdown(f"**Event / epoch {i + 1}: apply to**")
+                target_recordings = st.multiselect(
+                    "Apply to recording(s)",
+                    options=recording_target_options,
+                    default=["All recordings"],
+                    key=f"ev_target_recordings_{i}",
+                    help="Use this if you uploaded multiple recordings and only want the event on one of them.",
+                )
+                target_graphs = st.multiselect(
+                    "Apply to graph tab(s)",
+                    options=GRAPH_TARGET_OPTIONS,
+                    default=["All graphs"],
+                    key=f"ev_target_graphs_{i}",
+                    help="Use this if you only want the event line on selected graph tabs.",
+                )
+
+            with st.container():
+                st.markdown(f"**Event / epoch {i + 1}: color and shading**")
                 color = st.color_picker("Dotted line / shade color", value="#ff4b4b", key=f"ev_color_{i}")
                 alpha = st.slider("Dotted line transparency", 0.05, 1.0, 0.65, 0.05, key=f"ev_alpha_{i}")
                 shade_alpha = st.slider("Duration shade transparency", 0.02, 0.80, 0.18, 0.02, key=f"ev_shade_alpha_{i}")
@@ -1813,6 +1941,8 @@ with st.sidebar:
                 "color": color,
                 "alpha": float(alpha),
                 "shade_alpha": float(shade_alpha),
+                "target_recordings": target_recordings,
+                "target_graphs": target_graphs,
             })
 
     with st.expander("Manual y-scales", expanded=False):
@@ -1972,10 +2102,15 @@ else:
         st.markdown(f"## Recording {idx}: `{result['name']}`")
 
         def render_chart(kind):
+            events_for_this_graph = filter_events_for_context(
+                event_annotations,
+                str(result["name"]),
+                kind,
+            )
             if kind == "Overview":
                 fig = make_overview_figure(
                     view_df, roi_name, manual_limits,
-                    events=event_annotations,
+                    events=events_for_this_graph,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
                     show_event_labels=show_event_labels,
@@ -1984,58 +2119,61 @@ else:
             elif kind == "Raw channels":
                 fig = make_raw_independent_figure(
                     view_df, roi_name, manual_limits,
-                    events=event_annotations,
+                    events=events_for_this_graph,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
                     show_event_labels=show_event_labels,
                     height=raw_h,
                 )
             elif kind == "Z-score sliding mean":
+                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zslide")
                 fig = make_zscore_sliding_mean_figure(
                     view_df,
                     roi_name,
                     manual_limits,
-                    events=event_annotations,
+                    events=events_for_this_graph,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
                     show_event_labels=show_event_labels,
                     height=z_h,
-                    window_sec=z_window_sec,
-                    centered=z_centered_mean,
-                    source=z_source,
-                    show_raw=z_show_raw,
-                    show_smooth=z_show_smooth,
-                    show_dark_shading=z_show_dark,
-                    dark_start_sec=z_dark_start_sec,
-                    dark_duration_sec=z_dark_duration_sec,
-                    cycle_sec=z_cycle_sec,
+                    window_sec=zcfg["window_sec"],
+                    centered=zcfg["centered"],
+                    source=zcfg["source"],
+                    show_raw=zcfg["show_raw"],
+                    show_smooth=zcfg["show_smooth"],
+                    show_dark_shading=zcfg["show_dark"],
+                    dark_start_sec=zcfg["dark_start_sec"],
+                    dark_duration_sec=zcfg["dark_duration_sec"],
+                    cycle_sec=zcfg["cycle_sec"],
                 )
             elif kind == "Z-score range analysis":
+                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zrange")
+                zrange_cfg = render_zscore_range_controls(f"{safe_name(result['name'])}_{idx}")
                 fig, z_stats_df = make_zscore_range_analysis_figure(
                     view_df,
                     roi_name,
                     manual_limits,
-                    events=event_annotations,
+                    events=events_for_this_graph,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
                     show_event_labels=show_event_labels,
                     height=z_range_h,
-                    window_sec=z_window_sec,
-                    centered=z_centered_mean,
-                    source=z_source,
-                    show_raw=z_show_raw,
-                    show_smooth=z_show_smooth,
-                    show_dark_shading=z_show_dark,
-                    dark_start_sec=z_dark_start_sec,
-                    dark_duration_sec=z_dark_duration_sec,
-                    cycle_sec=z_cycle_sec,
-                    range_periods=z_range_periods,
-                    range_trace=z_range_trace,
-                    show_average_line=z_show_average_line,
-                    show_range_annotations=z_show_range_annotations,
+                    window_sec=zcfg["window_sec"],
+                    centered=zcfg["centered"],
+                    source=zcfg["source"],
+                    show_raw=zcfg["show_raw"],
+                    show_smooth=zcfg["show_smooth"],
+                    show_dark_shading=zcfg["show_dark"],
+                    dark_start_sec=zcfg["dark_start_sec"],
+                    dark_duration_sec=zcfg["dark_duration_sec"],
+                    cycle_sec=zcfg["cycle_sec"],
+                    range_periods=zrange_cfg["range_periods"],
+                    range_trace=zrange_cfg["range_trace"],
+                    show_average_line=zrange_cfg["show_average_line"],
+                    show_range_annotations=zrange_cfg["show_range_annotations"],
                 )
                 st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
-                if z_show_stats_table and z_stats_df is not None and not z_stats_df.empty:
+                if zrange_cfg["show_stats_table"] and z_stats_df is not None and not z_stats_df.empty:
                     st.dataframe(
                         z_stats_df.style.format({
                             "Average z-score": "{:.4f}",
@@ -2056,7 +2194,7 @@ else:
             else:
                 fig = make_main_dff_figure(
                     view_df, roi_name, manual_limits,
-                    events=event_annotations,
+                    events=events_for_this_graph,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
                     show_event_labels=show_event_labels,
