@@ -56,7 +56,7 @@ TRACE_COLORS = {
     "uv_fit": "#CC79A7",
     "deltaF": "#E69F00",
     "dff": "#D55E00",
-    "raw_z": "#8c96a3",
+    "raw_z": "#6b7280",
     "z_smooth": "#0072B2",
     "range_average": "#E69F00",
     "lick": "#7C3AED",

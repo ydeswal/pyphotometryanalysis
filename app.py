@@ -639,53 +639,101 @@ def add_visual_exclusion_shapes(fig, exclusions, rows, show=True):
     return fig
 
 
-def add_events_to_fig(fig, events, rows, show_labels=True):
+def add_events_to_fig(fig, events, rows, show_labels=True, x_span=None):
     """
-    Add event lines and optional duration shading.
-    Events are visual annotations only; they do not change the data.
+    Add event lines, optional duration shading, and non-colliding labels.
+
+    Labels used to sit at a fixed y = 1.04 in paper coordinates, directly on top
+    of the subplot title, and every event used the same height, so events close
+    together in time printed on top of each other. Two changes:
+
+      * Labels are drawn just inside the top of the first panel rather than
+        above it, so they can never collide with the subplot title.
+      * Labels are staggered across three levels. Each event takes the highest
+        free level whose previous label is far enough away in x, so neighbouring
+        events step down instead of overlapping.
+
+    Each annotation is tagged name="pp_event" so finish_fig leaves its styling
+    alone. Without the tag, finish_fig's blanket update_annotations() call
+    repainted every event label to size-14 black and shifted it upward.
     """
     if not events:
         return fig
 
-    for ev in events:
+    # Work out the x range so "far enough away" means something in data units.
+    if x_span is None:
+        xs = []
+        for tr in fig.data:
+            if getattr(tr, "x", None) is not None and len(tr.x):
+                try:
+                    xs.append((float(np.nanmin(tr.x)), float(np.nanmax(tr.x))))
+                except Exception:
+                    pass
+        x_span = (max(b for _, b in xs) - min(a for a, _ in xs)) if xs else 0.0
+    min_sep = (x_span * 0.13) if x_span else 0.0
+
+    LEVELS = [0.97, 0.87, 0.77]        # fraction of the first panel's height
+    last_x_at_level = [-np.inf] * len(LEVELS)
+    label_row = rows[0] if rows else 1
+
+    ordered = sorted(
+        [e for e in events if get_start_end_seconds(e)[0] is not None],
+        key=lambda e: float(get_start_end_seconds(e)[0]),
+    )
+
+    for ev in ordered:
         name = str(ev.get("name", "Event")).strip() or "Event"
-        start, end = get_start_end_seconds(ev)
+        start_s, end_s = get_start_end_seconds(ev)
         color = ev.get("color", "#ff4b4b")
         alpha = float(ev.get("alpha", 0.65))
         shade_alpha = float(ev.get("shade_alpha", max(0.05, alpha * 0.35)))
 
-        if start is None or not np.isfinite(start):
+        if start_s is None or not np.isfinite(start_s):
             continue
-        start = float(start)
-        has_duration = end is not None and np.isfinite(end) and float(end) > start
+        start_s = float(start_s)
+        has_duration = end_s is not None and np.isfinite(end_s) and float(end_s) > start_s
         line_color = hex_to_rgba(color, alpha)
 
         for row in rows:
             if has_duration:
                 fig.add_vrect(
-                    x0=start, x1=float(end), fillcolor=color, opacity=shade_alpha,
+                    x0=start_s, x1=float(end_s), fillcolor=color, opacity=shade_alpha,
                     line_width=0, row=row, col=1,
                 )
                 fig.add_vline(
-                    x=float(end), line_width=1.4, line_dash="dot",
+                    x=float(end_s), line_width=1.4, line_dash="dot",
                     line_color=line_color, row=row, col=1,
                 )
             fig.add_vline(
-                x=start, line_width=1.4, line_dash="dot",
+                x=start_s, line_width=1.4, line_dash="dot",
                 line_color=line_color, row=row, col=1,
             )
 
-        if show_labels:
-            label = f"<b>{name}</b><br>{seconds_to_hms(start)}"
-            if has_duration:
-                label += f"–{seconds_to_hms(float(end))}"
-            fig.add_annotation(
-                x=start, y=1.04, xref="x", yref="paper",
-                text=label, showarrow=False,
-                font=dict(size=10, color=color), align="center",
-                bgcolor="rgba(255,255,255,0.60)",
-                bordercolor=color, borderwidth=1, borderpad=2,
-            )
+        if not show_labels:
+            continue
+
+        # Take the highest level that is clear at this x position.
+        level = len(LEVELS) - 1
+        for i in range(len(LEVELS)):
+            if start_s - last_x_at_level[i] >= min_sep:
+                level = i
+                break
+        last_x_at_level[level] = start_s
+
+        label = f"<b>{name}</b><br>{seconds_to_hms(start_s)}"
+        if has_duration:
+            label += f"\u2013{seconds_to_hms(float(end_s))}"
+
+        fig.add_annotation(
+            x=start_s, y=LEVELS[level],
+            yref="y domain", row=label_row, col=1,
+            text=label, showarrow=False,
+            font=dict(size=9.5, color=color),
+            align="center", xanchor="left", xshift=3,
+            bgcolor="rgba(255,255,255,0.88)",
+            bordercolor=color, borderwidth=1, borderpad=2,
+            name="pp_event",
+        )
     return fig
 
 
@@ -811,22 +859,35 @@ def finish_fig(fig, height, show_legend=True, df=None):
         plot_bgcolor="#ffffff",
         font=dict(color="#111827", size=13),
         height=height,
-        margin=dict(l=70, r=35, t=115, b=70),
+        margin=dict(l=70, r=35, t=95, b=70),
         hovermode="x unified",
         dragmode="pan",
         legend=dict(
             orientation="h",
             yanchor="bottom",
-            y=1.10,
+            y=1.06,
             xanchor="left",
             x=0,
-            bgcolor="rgba(255,255,255,0.85)",
-            bordercolor="#d1d5db",
+            bgcolor="rgba(255,255,255,0.92)",
+            bordercolor="#cbd5e1",
             borderwidth=1,
+            # Without an explicit font the legend text rendered almost white on
+            # white and was effectively invisible.
+            font=dict(color="#111827", size=12),
+            itemwidth=40,
         ),
         showlegend=show_legend,
     )
-    fig.update_annotations(font=dict(size=14, color="#111827"), yshift=8)
+
+    # Restyle subplot titles only. The previous blanket update_annotations()
+    # call also hit the event labels, overriding their size and colour and
+    # shifting them up into the titles.
+    for ann in fig.layout.annotations:
+        if getattr(ann, "name", None) == "pp_event":
+            continue
+        ann.font.size = 13
+        ann.font.color = "#111827"
+        ann.yshift = 6
     fig.update_xaxes(
         showgrid=True,
         gridcolor="#e5e7eb",
