@@ -34,8 +34,13 @@ import pandas as pd
 from scipy.signal import butter, sosfiltfilt
 from scipy.ndimage import median_filter as _nd_median_filter
 
+# Samples per filtering block. Chosen so the float64 working copies inside
+# sosfiltfilt stay well under ~100 MB regardless of how long the recording is.
+_FILTER_BLOCK = 2_000_000
+
 __all__ = [
     "read_ppd",
+    "decimate_after_lowpass",
     "median_filter_trace",
     "lowpass",
     "fit_control_to_signal",
@@ -65,6 +70,7 @@ DEFAULTS = {
     "dff_units": "ratio",          # "ratio" or "percent"
     "zscore_mode": "session",      # "session" | "baseline" | "robust"
     "long_term_smooth_sec": 1800.0,
+    "keep_intermediates": False,
 }
 
 
@@ -90,7 +96,8 @@ def _parse_version(version_string) -> tuple:
         return (0, 0, 0)
 
 
-def read_ppd(ppd_path) -> dict:
+def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
+             with_time=False) -> dict:
     """
     Read a pyPhotometry .ppd file into named signals.
 
@@ -127,6 +134,7 @@ def read_ppd(ppd_path) -> dict:
     when the file is new-format pulsed.
     """
     ppd_path = Path(ppd_path)
+    dtype = np.dtype(dtype)
     with open(ppd_path, "rb") as f:
         header_size = int.from_bytes(f.read(2), "little")
         header = json.loads(f.read(header_size).decode("utf-8"))
@@ -148,8 +156,12 @@ def read_ppd(ppd_path) -> dict:
     while len(vpd) < n_analog:
         vpd.append(vpd[-1])
 
-    analog_all = (raw >> 1).astype(np.float64)
-    digital_all = (raw & 1).astype(np.uint8)
+    # Do NOT convert the whole stream at once. For a 48 h recording the data
+    # block is 90 million uint16 words; `(raw >> 1).astype(np.float64)` would
+    # allocate a single 719 MB array before a single channel is extracted.
+    # Channels are sliced out of the uint16 buffer first and converted
+    # individually, in float32 - a 15-bit ADC value needs 15 bits of mantissa
+    # and float32 has 24, so nothing is lost.
 
     # ---- decide the frame layout -------------------------------------------
     is_pulsed = "pulsed" in mode.lower()
@@ -181,36 +193,51 @@ def read_ppd(ppd_path) -> dict:
         "volts_per_division": vpd,
     }
 
+    def _analog(offset):
+        """Slice one interleaved stream and convert just that slice."""
+        return (raw[offset::words_per_frame] >> 1).astype(dtype)
+
+    def _digital(offset):
+        return (raw[offset::words_per_frame] & 1).astype(np.uint8)
+
     if words_per_frame == 2 * n_analog:
         # New-format pulsed: LED-on and LED-off stored separately.
         out["frame_layout"] = "pulsed_v1.1_led_on_off"
         for ch in range(n_analog):
-            on = analog_all[2 * ch:: words_per_frame] * vpd[ch]
-            off = analog_all[2 * ch + 1:: words_per_frame] * vpd[ch]
+            on = _analog(2 * ch)
+            off = _analog(2 * ch + 1)
             n = min(len(on), len(off))
-            out[f"analog_{ch + 1}_raw_LED_on"] = on[:n]
-            out[f"analog_{ch + 1}_raw_baseline"] = off[:n]
-            out[f"analog_{ch + 1}"] = on[:n] - off[:n]
-            out[f"digital_{ch + 1}"] = digital_all[2 * ch:: words_per_frame][:n]
+            on, off = on[:n], off[:n]
+            on *= vpd[ch]
+            off *= vpd[ch]
+            if keep_components:
+                out[f"analog_{ch + 1}_raw_LED_on"] = on.copy()
+                out[f"analog_{ch + 1}_raw_baseline"] = off.copy()
+            on -= off          # in place; avoids a third full-length array
+            out[f"analog_{ch + 1}"] = on
+            out[f"digital_{ch + 1}"] = _digital(2 * ch)[:n]
+            del off
     else:
         # Continuous, or pulsed written before v1.1 (already dark-subtracted).
         out["frame_layout"] = "one_word_per_channel"
         for ch in range(n_analog):
-            sig = analog_all[ch:: words_per_frame] * vpd[ch]
+            sig = _analog(ch)
+            sig *= vpd[ch]
             out[f"analog_{ch + 1}"] = sig
-            out[f"digital_{ch + 1}"] = digital_all[ch:: words_per_frame][: len(sig)]
+            out[f"digital_{ch + 1}"] = _digital(ch)[: len(sig)]
 
+    del raw
     n_samples = len(out["analog_1"])
-    for ch in range(n_analog):
-        for suffix in ("", "_raw_LED_on", "_raw_baseline"):
-            key = f"analog_{ch + 1}{suffix}"
-            if key in out:
-                out[key] = np.asarray(out[key][:n_samples], dtype=float)
-        dkey = f"digital_{ch + 1}"
-        if dkey in out:
-            out[dkey] = np.asarray(out[dkey][:n_samples], dtype=np.uint8)
 
-    out["time_sec"] = np.arange(n_samples, dtype=float) / fs
+    out["n_samples"] = n_samples
+    out["duration_sec"] = n_samples / fs
+    # The time axis is NOT materialised by default. At 48 h it is 180 MB of
+    # float64 - 45% of everything this function retains - and it is trivially
+    # reconstructible as arange(n)/fs. Callers that need it ask for it.
+    # float64 is required: at 48 h the values reach 172,800 and float32 would
+    # quantise them to about 0.01 s.
+    if with_time:
+        out["time_sec"] = np.arange(n_samples, dtype=np.float64) / fs
     return out
 
 
@@ -236,7 +263,12 @@ def median_filter_trace(values: np.ndarray, fs: float, window_sec: float) -> np.
     kernel that is ~3e9 operations and it corrupts the first and last half-kernel
     of the trace. ndimage uses a proper rolling histogram and reflects the edges.
     """
-    values = np.asarray(values, dtype=float)
+    # Preserve the input dtype. Casting float32 to float64 here doubled memory
+    # on every long recording for no numerical benefit: a 15-bit ADC value fits
+    # comfortably in float32's 24-bit mantissa.
+    values = np.asarray(values)
+    if not np.issubdtype(values.dtype, np.floating):
+        values = values.astype(np.float32)
     if window_sec is None or window_sec <= 0:
         return values.copy()
     k = int(round(float(window_sec) * float(fs)))
@@ -259,7 +291,10 @@ def lowpass(values, fs, cutoff_hz, order=3):
     filter on the decimated series, then interpolate back. This is both far more
     numerically stable and dramatically faster.
     """
-    values = np.asarray(values, dtype=float)
+    values = np.asarray(values)
+    if not np.issubdtype(values.dtype, np.floating):
+        values = values.astype(np.float32)
+    in_dtype = values.dtype
     fs = float(fs)
     if cutoff_hz is None or cutoff_hz <= 0 or values.size < 12:
         return values.copy()
@@ -285,8 +320,36 @@ def lowpass(values, fs, cutoff_hz, order=3):
     if values.size <= padlen:
         warnings.warn("Trace too short for zero-phase filtering; returning unfiltered.")
         return values.copy()
+
+    # Long traces are filtered in overlapping blocks so peak memory does not
+    # scale with recording length. sosfiltfilt promotes its input to float64 and
+    # allocates several working copies; on a 48 h recording at 130 Hz that is
+    # over a gigabyte for a single channel, which is what made multi-day files
+    # crash. Each block is filtered with a generous margin on both sides and
+    # only the interior is kept, so the result is identical to filtering the
+    # whole array at once.
+    if values.size > _FILTER_BLOCK:
+        margin = max(int(round(20.0 * fs / max(cutoff, 1e-9))), 10 * padlen)
+        margin = min(margin, values.size // 2)
+        out = np.empty_like(values)
+        step = _FILTER_BLOCK
+        for start in range(0, values.size, step):
+            stop = min(start + step, values.size)
+            lo = max(0, start - margin)
+            hi = min(values.size, stop + margin)
+            try:
+                seg = sosfiltfilt(sos, values[lo:hi])
+            except ValueError:
+                seg = values[lo:hi].astype(np.float64)
+            out[start:stop] = seg[start - lo: stop - lo].astype(in_dtype, copy=False)
+            del seg
+        return out
+
     try:
-        return sosfiltfilt(sos, values)
+        # sosfiltfilt promotes to float64 and makes several working copies. On a
+        # 48 h trace that is over a gigabyte per channel, so the result is cast
+        # straight back down.
+        return sosfiltfilt(sos, values).astype(in_dtype, copy=False)
     except ValueError:
         warnings.warn("Low-pass filter failed; returning unfiltered trace.")
         return values.copy()
@@ -378,7 +441,9 @@ def compute_f0(signal, fs, method="lowpass", lowpass_hz=0.001,
     "percentile"         : single session-wide percentile (classic short sessions).
     "median"             : session median.
     """
-    signal = np.asarray(signal, dtype=float)
+    signal = np.asarray(signal)
+    if not np.issubdtype(signal.dtype, np.floating):
+        signal = signal.astype(np.float32)
 
     if method == "lowpass":
         f0 = lowpass(signal, fs, lowpass_hz)
@@ -514,8 +579,27 @@ def crop_and_rezero(df, start_sec=None, end_sec=None, rezero=True,
 # FULL PIPELINE
 # =============================================================================
 
+def decimate_after_lowpass(values, factor):
+    """
+    Reduce the sample rate by an integer factor by averaging within bins.
+
+    Safe only AFTER low-pass filtering: the 10 Hz filter has already removed
+    everything above 10 Hz, so sampling faster than ~20 Hz stores no additional
+    information. Dropping from 130 Hz to 20 Hz cuts memory more than sixfold
+    while leaving the analysed signal untouched.
+    """
+    values = np.asarray(values)
+    factor = int(max(1, factor))
+    if factor == 1:
+        return values
+    n = (len(values) // factor) * factor
+    if n == 0:
+        return values
+    return values[:n].reshape(-1, factor).mean(axis=1)
+
+
 def process_photometry(signal_raw, control_raw, fs, settings=None,
-                       baseline_mask=None):
+                       baseline_mask=None, analysis_hz=None, consume=False):
     """
     Run the full corrected pipeline on one recording.
 
@@ -535,14 +619,42 @@ def process_photometry(signal_raw, control_raw, fs, settings=None,
     if settings:
         cfg.update(settings)
 
-    signal_raw = np.asarray(signal_raw, dtype=float)
-    control_raw = np.asarray(control_raw, dtype=float)
+    signal_raw = np.asarray(signal_raw)
+    control_raw = np.asarray(control_raw)
 
-    sig_med = median_filter_trace(signal_raw, fs, cfg["median_filter_sec"])
-    ctl_med = median_filter_trace(control_raw, fs, cfg["median_filter_sec"])
+    keep = cfg.get("keep_intermediates", False)
 
-    sig_filt = lowpass(sig_med, fs, cfg["lowpass_hz"], cfg["filter_order"])
-    ctl_filt = lowpass(ctl_med, fs, cfg["lowpass_hz"], cfg["filter_order"])
+    # Channels are taken through median + low-pass ONE AT A TIME, and each
+    # intermediate is released as soon as it has been consumed. Doing both
+    # channels stage by stage meant six full-rate arrays were alive at once;
+    # at 48 h and 130 Hz that is 540 MB of signal before any working copies.
+    #
+    # When consume=True the caller has promised it holds no other reference to
+    # the input arrays, so they can be freed here too.
+    def _prep(raw):
+        med = median_filter_trace(raw, fs, cfg["median_filter_sec"])
+        filt = lowpass(med, fs, cfg["lowpass_hz"], cfg["filter_order"])
+        return (med, filt) if keep else (None, filt)
+
+    sig_med, sig_filt = _prep(signal_raw)
+    if consume:
+        del signal_raw
+        signal_raw = None
+    ctl_med, ctl_filt = _prep(control_raw)
+    if consume:
+        del control_raw
+        control_raw = None
+
+    # Optional decimation, applied only after low-pass filtering.
+    decim = 1
+    if analysis_hz and analysis_hz > 0 and fs > analysis_hz:
+        nyquist_needed = 2.5 * cfg["lowpass_hz"]
+        target = max(float(analysis_hz), nyquist_needed)
+        decim = int(max(1, np.floor(fs / target)))
+        if decim > 1:
+            sig_filt = decimate_after_lowpass(sig_filt, decim)
+            ctl_filt = decimate_after_lowpass(ctl_filt, decim)
+            fs = fs / decim
 
     # Step 4: BOTH sides filtered. The old CSV path fitted on filtered traces but
     # then subtracted from the RAW traces, reinjecting all the high-frequency
@@ -571,6 +683,7 @@ def process_photometry(signal_raw, control_raw, fs, settings=None,
     )
 
     return {
+        "fs": fs, "decimation_factor": decim,
         "sig_med": sig_med, "ctl_med": ctl_med,
         "sig_filt": sig_filt, "ctl_filt": ctl_filt,
         "ctl_fit": ctl_fit, "deltaF": delta_f,

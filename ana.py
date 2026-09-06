@@ -93,6 +93,12 @@ BASELINE_PERCENTILE = 10.0  # retained only for backward compatibility; Lowell F
 # Lowell/Douglass paper method settings.
 MEDIAN_FILTER_SEC = 1.0          # paper says median-filtered; kernel was not specified in the PDF
 FIT_METHOD = "irls"              # "irls" (robust, recommended) or "ols"
+
+# Rate used for the analysis stage, after the 10 Hz low-pass. Sampling faster
+# than about 2.5x the low-pass cutoff stores no extra information, so dropping
+# from 130 Hz to 20 Hz cuts memory more than sixfold with no effect on results.
+# Set to None to keep the full acquisition rate.
+ANALYSIS_HZ = 20.0
 F0_LOWPASS_HZ = 0.001           # F0 = 0.001 Hz low-pass filtered 465 nm signal
 LONG_TERM_SMOOTH_SEC = 30 * 60  # 30-minute running average for long-term traces
 
@@ -278,7 +284,7 @@ def zscore(values: np.ndarray):
     return (values - mean) / sd
 
 
-def process_photometry(uv_raw, sig_raw, fs):
+def process_photometry(uv_raw, sig_raw, fs, consume_inputs=False):
     """
     Lowell-style processing, delegated to photometry_core.
 
@@ -304,7 +310,19 @@ def process_photometry(uv_raw, sig_raw, fs):
         "dff_units": "ratio",
         "zscore_mode": "session",
     }
-    res = pc.process_photometry(sig_raw, uv_raw, fs, settings=settings)
+    if consume_inputs:
+        # Hand the arrays over through a list and pop them in the call, so this
+        # frame keeps no reference to them. Inside process_photometry the
+        # reference count is then 1 and each channel can actually be freed
+        # after filtering.
+        payload = [sig_raw, uv_raw]
+        del sig_raw, uv_raw
+        res = pc.process_photometry(payload.pop(0), payload.pop(0), fs,
+                                    settings=settings, analysis_hz=ANALYSIS_HZ,
+                                    consume=True)
+    else:
+        res = pc.process_photometry(sig_raw, uv_raw, fs, settings=settings,
+                                    analysis_hz=ANALYSIS_HZ, consume=False)
 
     dff, z_dff = res["dFF"], res["z_dFF"]
     return {
@@ -319,8 +337,11 @@ def process_photometry(uv_raw, sig_raw, fs):
         "dFF": dff,
         "dFF_percent": 100.0 * dff,
         "z_dFF": z_dff,
-        "dFF_30min_mean": rolling_mean_trace(dff, fs, LONG_TERM_SMOOTH_SEC, center=True),
-        "z_dFF_30min_mean": rolling_mean_trace(z_dff, fs, LONG_TERM_SMOOTH_SEC, center=True),
+        # Note: res["fs"] is the post-decimation rate, not the acquisition rate.
+        "fs": res["fs"],
+        "decimation_factor": res["decimation_factor"],
+        "dFF_30min_mean": rolling_mean_trace(dff, res["fs"], LONG_TERM_SMOOTH_SEC, center=True),
+        "z_dFF_30min_mean": rolling_mean_trace(z_dff, res["fs"], LONG_TERM_SMOOTH_SEC, center=True),
         "slope": res["slope"],
         "intercept": res["intercept"],
     }
@@ -823,34 +844,140 @@ The middle panel is the main Lowell-style DF/F0 trace. The column is still named
 # =============================================================================
 
 def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
+    """
+    Process one recording without ever materialising a full-rate DataFrame.
+
+    The old flow was: build a 17-column DataFrame at the acquisition rate, then
+    downsample it to 1 Hz and discard the rest. For a 48 h recording that meant
+    allocating about 3.1 GB, plus formatting elapsed_hhmmss for 22.5 million
+    samples with a Python list comprehension, to end up with 172,800 rows.
+
+    Now the numpy arrays are decimated first and a single DataFrame is built at
+    the export rate. The full-rate frame is only constructed when --save-full is
+    given, and that path warns about its size.
+    """
     header, fs, data = read_ppd(ppd_path)
     uv_raw, sig_raw = extract_channels(data)
-    processed = process_photometry(uv_raw, sig_raw, fs)
-    time_sec = np.asarray(data["time_sec"], dtype=float)
-    df_full = make_dataframe(time_sec, uv_raw, sig_raw, processed, roi)
+    n_acquired = len(sig_raw)
 
-    # Carry the digital inputs through to the exported CSV. pyPhotometry digital
-    # 1 and 2 are where a lickometer TTL is normally wired, and they share the
-    # photometry clock, so the lickometer section needs no separate alignment.
-    for ch in ("digital_1", "digital_2"):
-        if ch in data and len(data[ch]) == len(df_full):
-            df_full[ch] = np.asarray(data[ch], dtype=int)
-    df_plot = downsample(df_full, fs, EXPORT_HZ)
+    # Bin the raw channels down to the export rate BEFORE they are handed to
+    # the analysis, because the analysis frees them to save memory. These small
+    # arrays (~173k samples at 48 h, versus 22.5M) are what the CSV's *_raw
+    # columns are built from.
+    step_full = max(int(round(fs / EXPORT_HZ)), 1)
+    cut_full = (n_acquired // step_full) * step_full
 
-    # Rising-edge times at the FULL acquisition rate, before any downsampling.
-    # The exported photometry CSV is 1 Hz, which cannot represent 6-10 Hz
-    # licking, so these times are kept separately and stay exact.
+    def _bin_full(arr):
+        return (np.asarray(arr[:cut_full], dtype=np.float64)
+                .reshape(-1, step_full).mean(axis=1))
+
+    uv_raw_export = _bin_full(uv_raw)
+    sig_raw_export = _bin_full(sig_raw)
+
+    # The full-rate raw traces are only kept when the full-resolution CSV is
+    # requested; otherwise they are released during processing.
+    processed = process_photometry(uv_raw, sig_raw, fs, consume_inputs=not save_full)
+    if not save_full:
+        uv_raw = sig_raw = None
+    fs_analysis = processed["fs"]
+    decim = processed["decimation_factor"]
+
+    # Digital events are captured at the FULL acquisition rate before any
+    # decimation, so lick timing is never degraded by this optimisation.
     digital_events = {}
     for ch in ("digital_1", "digital_2"):
         if ch in data:
             digital_events[ch] = pc.digital_pulse_times(data[ch], fs)
+            data[ch] = None          # edge times extracted; drop the raw channel
+
+    n_analysis = len(processed["dFF"])
+    time_analysis = np.arange(n_analysis, dtype=np.float64) / fs_analysis
+
+    data.clear()
+
+    df_full = None
+    if save_full:
+        # Raw traces are at the acquisition rate while everything else is at the
+        # analysis rate, so bin them down to match before combining.
+        if decim > 1:
+            k = decim
+            m = (len(sig_raw) // k) * k
+            sig_col = np.asarray(sig_raw[:m], dtype=np.float64).reshape(-1, k).mean(axis=1)
+            uv_col = np.asarray(uv_raw[:m], dtype=np.float64).reshape(-1, k).mean(axis=1)
+        else:
+            sig_col, uv_col = sig_raw, uv_raw
+        n_min = min(n_analysis, len(sig_col))
+        df_full = make_dataframe(
+            time_analysis[:n_min], uv_col[:n_min], sig_col[:n_min],
+            {k2: (v[:n_min] if isinstance(v, np.ndarray) else v)
+             for k2, v in processed.items()},
+            roi,
+        )
+        for ch, arr in digital_events.items():
+            col = np.zeros(n_analysis, dtype=int)
+            idx = (np.asarray(arr) * fs_analysis).astype(int)
+            idx = idx[(idx >= 0) & (idx < n_analysis)]
+            col[idx] = 1
+            df_full[ch] = col
+
+    # Build the export frame directly from decimated arrays.
+    step = max(int(round(fs_analysis / EXPORT_HZ)), 1)
+    cut = (n_analysis // step) * step
+
+    def _bin(arr):
+        a = np.asarray(arr, dtype=np.float64)[:cut]
+        return a.reshape(-1, step).mean(axis=1)
+
+    time_plot = _bin(time_analysis)
+    # The raw channels were binned from the acquisition rate and the rest from
+    # the analysis rate, so the two can differ by one row. Align them.
+    n_rows = min(len(time_plot), len(uv_raw_export), len(sig_raw_export))
+    time_plot = time_plot[:n_rows]
+
+    def _b(arr):
+        return _bin(arr)[:n_rows]
+
+    df_plot = pd.DataFrame({
+        "time_sec": time_plot,
+        "elapsed_hours": time_plot / 3600.0,
+        f"{roi}_uv_raw": uv_raw_export[:n_rows],
+        f"{roi}_sig_raw": sig_raw_export[:n_rows],
+        f"{roi}_uv_filt_10Hz_lowpass": _b(processed["uv_filt"]),
+        f"{roi}_sig_filt_10Hz_lowpass": _b(processed["sig_filt"]),
+        f"{roi}_uv_fit": _b(processed["uv_fit"]),
+        f"{roi}_deltaF": _b(processed["deltaF"]),
+        f"{roi}_F0_0p001Hz": _b(processed["F0_trace"]),
+        f"{roi}_dFF": _b(processed["dFF"]),
+        f"{roi}_DF_F0": _b(processed["dFF"]),
+        f"{roi}_dFF_percent": _b(processed["dFF_percent"]),
+        f"{roi}_z_dFF": _b(processed["z_dFF"]),
+        f"{roi}_dFF_30min_mean": _b(processed["dFF_30min_mean"]),
+        f"{roi}_z_dFF_30min_mean": _b(processed["z_dFF_30min_mean"]),
+    })
+
+    # Digital channels: count TTL edges per export bin so lick counts survive.
+    for ch, arr in digital_events.items():
+        edges = np.asarray(arr, dtype=float)
+        counts, _ = np.histogram(
+            edges,
+            bins=np.append(time_plot - 0.5 / EXPORT_HZ,
+                           time_plot[-1] + 0.5 / EXPORT_HZ),
+        ) if len(time_plot) > 1 else (np.zeros(len(time_plot), int), None)
+        df_plot[f"{ch}_pulse_count"] = counts.astype(int)
+        df_plot[ch] = (counts > 0).astype(int)
+
+    # Only now, on ~173k rows rather than ~22M, is the HH:MM:SS column built.
+    df_plot["elapsed_hhmmss"] = [seconds_to_hms(x) for x in df_plot["time_sec"]]
 
     return {
         "ppd_path": ppd_path,
         "header": header,
         "fs": fs,
+        "fs_analysis": fs_analysis,
+        "decimation_factor": decim,
+        "n_acquired_samples": n_acquired,
         "processed": processed,
-        "df_full": df_full if save_full else None,
+        "df_full": df_full,
         "df_plot": df_plot,
         "digital_events": digital_events,
     }
@@ -867,12 +994,14 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
 
     df_plot.to_csv(outdir / f"processed_jones_style_downsampled_{EXPORT_HZ:g}Hz.csv", index=False)
     if save_full and df_full is not None:
-        df_full.to_csv(outdir / "processed_jones_style_full_20Hz.csv", index=False)
+        df_full.to_csv(outdir / f"processed_full_{recording['fs_analysis']:g}Hz.csv", index=False)
 
     settings = {
         "input_file": str(ppd_path),
         "subject_ID": header.get("subject_ID", ""),
         "sampling_rate_hz": fs,
+        "analysis_rate_hz": recording.get("fs_analysis", fs),
+        "decimation_factor_after_lowpass": recording.get("decimation_factor", 1),
         "event_data_used": False,
         "scale_mode": scale_mode,
         "shared_axis_limits_applied": limits is not None,

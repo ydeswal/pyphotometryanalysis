@@ -54,13 +54,21 @@ lick   = (rng.random(N) < 0.02).astype(np.uint8)
 
 print("\n=== 1. NEW-FORMAT PULSED .ppd (v1.1+) ===")
 write_ppd("t_new.ppd", "2EX_1EM_pulsed", "1.1.1", N, g_on, g_off, i_on, i_off, dig1=lick)
-d = pc.read_ppd("t_new.ppd")
+d = pc.read_ppd("t_new.ppd", keep_components=True, with_time=True)
 check("frame layout detected", d["frame_layout"] == "pulsed_v1.1_led_on_off", d["frame_layout"])
 check("analog_1 == 465on - 465off", approx(d["analog_1"], g_on - g_off, 1e-4))
 check("analog_2 == 405on - 405off", approx(d["analog_2"], i_on - i_off, 1e-4))
 check("LED-on component preserved", approx(d["analog_1_raw_LED_on"], g_on, 1e-4))
 check("digital_1 recovered (lickometer TTL)", np.array_equal(d["digital_1"], lick))
 check("sample count", len(d["analog_1"]) == N, f"{len(d['analog_1'])}")
+d_lean = pc.read_ppd("t_new.ppd")
+check("LED components omitted by default (saves memory)",
+      "analog_1_raw_LED_on" not in d_lean)
+check("lean read still correct", approx(d_lean["analog_1"], g_on - g_off, 1e-4))
+check("signals are float32", d_lean["analog_1"].dtype == np.float32,
+      str(d_lean["analog_1"].dtype))
+check("time axis omitted by default", "time_sec" not in d_lean)
+check("time axis float64 when requested", d["time_sec"].dtype == np.float64)
 
 print("\n=== 2. OLD-FORMAT / CONTINUOUS .ppd (2 words per frame) ===")
 write_ppd("t_old.ppd", "2EX_2EM_continuous", "1.0.0", N, g_on, None, i_on, None,

@@ -1899,10 +1899,41 @@ if run_clicked:
             with tempfile.TemporaryDirectory() as tmp:
                 tmp = Path(tmp)
                 saved_files = []
+                total_mb = 0.0
                 for f in uploaded_files:
                     path = tmp / safe_name(f.name)
-                    path.write_bytes(f.getbuffer())
+                    # Stream to disk and release the in-memory buffer straight
+                    # away. A 48 h .ppd is ~180 MB and holding several of them
+                    # in RAM on top of the analysis is enough to end the session.
+                    with open(path, "wb") as out_fh:
+                        out_fh.write(f.getbuffer())
+                    total_mb += path.stat().st_size / 1e6
+                    try:
+                        f.seek(0)
+                    except Exception:
+                        pass
                     saved_files.append(path)
+
+                # A pyPhotometry .ppd is 8 bytes per sample-frame, so file size
+                # predicts duration and therefore memory.
+                approx_hours = (total_mb * 1e6) / (8 * 130.0 * 3600) if total_mb else 0
+                if total_mb > 250:
+                    th.note(
+                        f"These files total {total_mb:.0f} MB (roughly {approx_hours:.0f} h "
+                        "of recording). Streamlit Community Cloud caps how much memory an "
+                        "app may use, and a job this size may exceed it and restart the app. "
+                        "If that happens, run the analysis locally instead: "
+                        "<code>streamlit run app.py</code>, which has no such cap.",
+                        kind="warn",
+                    )
+                elif total_mb > 120:
+                    th.note(
+                        f"These files total {total_mb:.0f} MB (roughly {approx_hours:.0f} h). "
+                        "This should work, but it is close to the memory available on "
+                        "Streamlit Community Cloud. Running locally is more reliable for "
+                        "multi-day recordings.",
+                        kind="warn",
+                    )
 
                 ppd_files = [p for p in saved_files if p.suffix.lower() == ".ppd"]
                 csv_files = [p for p in saved_files if p.suffix.lower() == ".csv"]
