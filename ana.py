@@ -62,6 +62,10 @@ from scipy.signal import butter, sosfiltfilt, medfilt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# All maths lives in photometry_core so this script and the Streamlit app
+# can never diverge again.
+import photometry_core as pc
+
 # =============================================================================
 # USER SETTINGS YOU CAN EDIT
 # =============================================================================
@@ -88,6 +92,7 @@ BASELINE_PERCENTILE = 10.0  # retained only for backward compatibility; Lowell F
 
 # Lowell/Douglass paper method settings.
 MEDIAN_FILTER_SEC = 1.0          # paper says median-filtered; kernel was not specified in the PDF
+FIT_METHOD = "irls"              # "irls" (robust, recommended) or "ols"
 F0_LOWPASS_HZ = 0.001           # F0 = 0.001 Hz low-pass filtered 465 nm signal
 LONG_TERM_SMOOTH_SEC = 30 * 60  # 30-minute running average for long-term traces
 
@@ -138,60 +143,33 @@ def find_ppd_file(path: Path) -> Path:
 
 def read_ppd(ppd_path: Path):
     """
-    Read pyPhotometry .ppd file.
+    Read a .ppd file via photometry_core.
 
-    .ppd structure:
-      first 2 bytes       = JSON header size
-      next header bytes   = JSON header
-      remaining bytes     = uint16 interleaved data
+    The previous implementation always reshaped the data block into
+    `n_analog_signals + n_digital_signals` = 4 columns. That is correct only for
+    pulsed recordings saved by pyPhotometry v1.1+. For continuous-mode files, or
+    any pulsed file written before v1.1, a frame is 2 words wide, and reshaping
+    to 4 interleaved two consecutive timepoints. The result was that the "465"
+    and "405" traces became the same quantity (measured correlation r = 1.0000)
+    and the recording duration was halved. photometry_core.read_ppd picks the
+    layout from the header instead of assuming one.
 
-    pyPhotometry stores analog value in upper bits, so the analog conversion uses
-    raw >> 1. The lowest bit is digital state.
+    Returns (header, sampling_rate, signals_dict) - note the third element is now
+    a dict of named signals rather than an anonymous voltage matrix.
     """
-    with open(ppd_path, "rb") as f:
-        header_size = int.from_bytes(f.read(2), "little")
-        header = json.loads(f.read(header_size).decode("utf-8"))
-        raw = np.frombuffer(f.read(), dtype="<u2")
-
-    n_streams = int(header["n_analog_signals"]) + int(header["n_digital_signals"])
-    if raw.size % n_streams != 0:
-        raise ValueError("Raw .ppd data length is not divisible by number of streams.")
-
-    data = raw.reshape(-1, n_streams)
-
-    volts_per_division = header.get("volts_per_division", [1.0])
-    if len(volts_per_division) == 1:
-        vpd = [float(volts_per_division[0])] * n_streams
-    else:
-        vpd = [float(x) for x in volts_per_division]
-
-    volts = np.zeros_like(data, dtype=float)
-    for i in range(n_streams):
-        volts[:, i] = (data[:, i] >> 1).astype(float) * vpd[min(i, len(vpd) - 1)]
-
-    fs = float(header["sampling_rate"])
-    return header, fs, volts
+    data = pc.read_ppd(ppd_path)
+    return data["header"], data["sampling_rate"], data
 
 
-def extract_channels(volts: np.ndarray):
+def extract_channels(data):
     """
-    Extract dark-subtracted 465 and 405 signals.
+    Return (uv_raw, sig_raw) = (405 isosbestic, 465 signal), dark-subtracted.
 
-    Formula:
-      sig_raw = 465_on - 465_dark
-      uv_raw  = 405_on - 405_dark
-
-    Simple meaning:
-      subtract the LED-off/background level from each LED-on measurement.
+    In pulsed modes photometry_core has already subtracted the LED-off baseline
+    from the LED-on sample for each channel, exactly as the pyPhotometry spec
+    prescribes. analog_1 is the 465 signal and analog_2 the 405 isosbestic.
     """
-    required_col = max(COLUMN_MAP.values())
-    if volts.shape[1] <= required_col:
-        raise ValueError(
-            f"This file has {volts.shape[1]} streams, but COLUMN_MAP requires column {required_col}."
-        )
-    sig_raw = volts[:, COLUMN_MAP["465_on"]] - volts[:, COLUMN_MAP["465_dark"]]
-    uv_raw = volts[:, COLUMN_MAP["405_on"]] - volts[:, COLUMN_MAP["405_dark"]]
-    return uv_raw, sig_raw
+    return np.asarray(data["analog_2"], dtype=float), np.asarray(data["analog_1"], dtype=float)
 
 
 # =============================================================================
@@ -302,65 +280,49 @@ def zscore(values: np.ndarray):
 
 def process_photometry(uv_raw, sig_raw, fs):
     """
-    Run Lowell/Douglass-style processing.
+    Lowell-style processing, delegated to photometry_core.
 
-    Paper method implemented here:
-      1. Median-filter both 405 and 465 traces.
-      2. Low-pass filter both traces at 10 Hz.
-      3. Motion correction: linear best fit to 405, subtract fitted 405 from 465.
-      4. F0: 0.001 Hz low-pass filtered 465 nm trace across the whole session.
-      5. DF/F0 = (465 - fitted 405) / F0.
-      6. z_DF/F0 = session z-score of DF/F0.
-      7. 30 min running-average columns are also generated for long-term plots.
+    Pipeline: median filter -> 10 Hz low-pass on both channels -> fit the
+    filtered 405 onto the filtered 465 -> deltaF -> F0 as a very slow low-pass of
+    the 465 channel -> dF/F -> session z-score, plus 30-min running means for
+    the long-timescale figures.
+
+    Two changes from the old in-file implementation:
+      * the 405 fit defaults to IRLS rather than OLS, so real calcium transients
+        are down-weighted instead of being partly fitted away;
+      * the 0.001 Hz F0 filter is computed on a decimated series, which is both
+        numerically stable and far faster than designing a Butterworth that
+        close to DC at the full sampling rate.
     """
-    # 1–2. Median + 10 Hz low-pass.
-    uv_med = median_filter_trace(uv_raw, fs)
-    sig_med = median_filter_trace(sig_raw, fs)
+    settings = {
+        "median_filter_sec": MEDIAN_FILTER_SEC,
+        "lowpass_hz": LOWPASS_HZ,
+        "filter_order": FILTER_ORDER,
+        "fit_method": FIT_METHOD,
+        "f0_method": "lowpass",
+        "f0_lowpass_hz": F0_LOWPASS_HZ,
+        "dff_units": "ratio",
+        "zscore_mode": "session",
+    }
+    res = pc.process_photometry(sig_raw, uv_raw, fs, settings=settings)
 
-    uv_filt = lowpass(uv_med, fs, cutoff_hz=LOWPASS_HZ)
-    sig_filt = lowpass(sig_med, fs, cutoff_hz=LOWPASS_HZ)
-
-    # 3. Global linear 405 fit, not rolling regression.
-    uv_fit, delta_f, slope, intercept = global_linear_405_fit_to_465(uv_filt, sig_filt)
-
-    # 4. F0 is the 0.001 Hz low-pass filtered 465 trace.
-    f0_trace = lowpass(sig_filt, fs, cutoff_hz=F0_LOWPASS_HZ)
-
-    # Protect against divide-by-zero or negative/invalid baseline values.
-    eps = np.nanmedian(np.abs(f0_trace)) * 1e-12
-    if not np.isfinite(eps) or eps == 0:
-        eps = 1e-12
-    f0_safe = np.where(np.isfinite(f0_trace) & (np.abs(f0_trace) > eps), f0_trace, np.nan)
-
-    # 5. Lowell DF/F0 ratio. This is intentionally NOT multiplied by 100.
-    dff = delta_f / f0_safe
-
-    # Optional percent copy for people who want percent units.
-    dff_percent = 100.0 * dff
-
-    # 6. Session z-score of the Lowell DF/F0 ratio.
-    z_dff = zscore(dff)
-
-    # 7. 30-minute running means for paper-style long-term viewing.
-    dff_30min = rolling_mean_trace(dff, fs, LONG_TERM_SMOOTH_SEC, center=True)
-    z_dff_30min = rolling_mean_trace(z_dff, fs, LONG_TERM_SMOOTH_SEC, center=True)
-
+    dff, z_dff = res["dFF"], res["z_dFF"]
     return {
-        "uv_med": uv_med,
-        "sig_med": sig_med,
-        "uv_filt": uv_filt,
-        "sig_filt": sig_filt,
-        "uv_fit": uv_fit,
-        "deltaF": delta_f,
-        "F0_trace": f0_trace,
-        "F0": float(np.nanmedian(f0_trace)),
+        "uv_med": res["ctl_med"],
+        "sig_med": res["sig_med"],
+        "uv_filt": res["ctl_filt"],
+        "sig_filt": res["sig_filt"],
+        "uv_fit": res["ctl_fit"],
+        "deltaF": res["deltaF"],
+        "F0_trace": res["F0_trace"],
+        "F0": res["F0"],
         "dFF": dff,
-        "dFF_percent": dff_percent,
+        "dFF_percent": 100.0 * dff,
         "z_dFF": z_dff,
-        "dFF_30min_mean": dff_30min,
-        "z_dFF_30min_mean": z_dff_30min,
-        "slope": slope,
-        "intercept": intercept,
+        "dFF_30min_mean": rolling_mean_trace(dff, fs, LONG_TERM_SMOOTH_SEC, center=True),
+        "z_dFF_30min_mean": rolling_mean_trace(z_dff, fs, LONG_TERM_SMOOTH_SEC, center=True),
+        "slope": res["slope"],
+        "intercept": res["intercept"],
     }
 
 
@@ -404,8 +366,19 @@ def downsample(df, fs, export_hz):
     bin_size = max(int(round(fs / export_hz)), 1)
     tmp = df.copy()
     tmp["export_bin"] = np.arange(len(tmp)) // bin_size
-    numeric_cols = tmp.select_dtypes(include=[np.number]).columns
+    numeric_cols = [c for c in tmp.select_dtypes(include=[np.number]).columns
+                    if not c.startswith("digital_")]
+    digital_cols = [c for c in tmp.columns if c.startswith("digital_")]
+
     out = tmp.groupby("export_bin", as_index=False)[numeric_cols].mean()
+
+    # Digital inputs are events, not levels. Averaging a TTL over a bin turns a
+    # lick into a fraction and destroys the rising edge, so count edges per bin
+    # instead and keep the lick count intact.
+    for c in digital_cols:
+        edges = (tmp[c].astype(int).diff() == 1).astype(int)
+        out[f"{c}_pulse_count"] = edges.groupby(tmp["export_bin"]).sum().to_numpy()
+        out[c] = (out[f"{c}_pulse_count"] > 0).astype(int)
     out["elapsed_hhmmss"] = [seconds_to_hms(x) for x in out["time_sec"]]
     return out.drop(columns=["export_bin"], errors="ignore")
 
@@ -850,12 +823,28 @@ The middle panel is the main Lowell-style DF/F0 trace. The column is still named
 # =============================================================================
 
 def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
-    header, fs, volts = read_ppd(ppd_path)
-    uv_raw, sig_raw = extract_channels(volts)
+    header, fs, data = read_ppd(ppd_path)
+    uv_raw, sig_raw = extract_channels(data)
     processed = process_photometry(uv_raw, sig_raw, fs)
-    time_sec = np.arange(len(sig_raw), dtype=float) / fs
+    time_sec = np.asarray(data["time_sec"], dtype=float)
     df_full = make_dataframe(time_sec, uv_raw, sig_raw, processed, roi)
+
+    # Carry the digital inputs through to the exported CSV. pyPhotometry digital
+    # 1 and 2 are where a lickometer TTL is normally wired, and they share the
+    # photometry clock, so the lickometer section needs no separate alignment.
+    for ch in ("digital_1", "digital_2"):
+        if ch in data and len(data[ch]) == len(df_full):
+            df_full[ch] = np.asarray(data[ch], dtype=int)
     df_plot = downsample(df_full, fs, EXPORT_HZ)
+
+    # Rising-edge times at the FULL acquisition rate, before any downsampling.
+    # The exported photometry CSV is 1 Hz, which cannot represent 6-10 Hz
+    # licking, so these times are kept separately and stay exact.
+    digital_events = {}
+    for ch in ("digital_1", "digital_2"):
+        if ch in data:
+            digital_events[ch] = pc.digital_pulse_times(data[ch], fs)
+
     return {
         "ppd_path": ppd_path,
         "header": header,
@@ -863,6 +852,7 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
         "processed": processed,
         "df_full": df_full if save_full else None,
         "df_plot": df_plot,
+        "digital_events": digital_events,
     }
 
 
@@ -890,7 +880,7 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
         "filter_order": FILTER_ORDER,
         "median_filter_sec": MEDIAN_FILTER_SEC,
         "long_term_smooth_sec": LONG_TERM_SMOOTH_SEC,
-        "motion_correction": "global_linear_best_fit_405_to_465",
+        "motion_correction": f"{FIT_METHOD}_linear_fit_405_to_465_on_filtered_traces",
         "baseline_method": "lowpass_filtered_465_signal_whole_session",
         "baseline_lowpass_hz": F0_LOWPASS_HZ,
         "F0": processed["F0"],
@@ -898,6 +888,13 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
         "dFF_formula": f"{roi}_dFF = {roi}_deltaF / F0_trace",
     }
     (outdir / "ANALYSIS_SETTINGS_NO_EVENTS_MATCHED_SCALES.json").write_text(json.dumps(settings, indent=2))
+
+    # Full-rate digital event times, for the lickometer section.
+    for ch, times in (recording.get("digital_events") or {}).items():
+        if len(times):
+            pd.DataFrame({"event_time_sec": times}).to_csv(
+                outdir / f"event_times_{ch}.csv", index=False
+            )
     (outdir / "PPD_HEADER.json").write_text(json.dumps(header, indent=2))
 
     paths = [

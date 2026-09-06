@@ -13,6 +13,11 @@ from scipy.signal import butter, sosfiltfilt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# Shared, validated maths + UI modules.
+import photometry_core as pc
+import lickometer as lk
+import theme as th
+
 # =============================================================================
 # PAGE STYLE: SMALL HEADER + WIDE GRAPH WORKSPACE
 # =============================================================================
@@ -23,281 +28,31 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.markdown(
-    """
-    <style>
-    .block-container {
-        padding-top: 0.7rem !important;
-        padding-left: 1.4rem !important;
-        padding-right: 1.4rem !important;
-        max-width: 100% !important;
-    }
+# A single scoped stylesheet lives in theme.py, and base colours come from
+# .streamlit/config.toml. The three overlapping !important blocks that used to
+# sit here were what broke the sidebar multiselect chips.
+th.inject_theme()
 
-    .small-header {
-        position: sticky;
-        top: 0;
-        z-index: 999;
-        background: rgba(14, 17, 23, 0.96);
-        border-bottom: 1px solid rgba(255,255,255,0.12);
-        padding: 0.35rem 0.25rem 0.45rem 0.25rem;
-        margin-bottom: 0.6rem;
-    }
-
-    .small-header-title {
-        font-size: 1.05rem;
-        font-weight: 700;
-        line-height: 1.1;
-        margin: 0;
-    }
-
-    .small-header-subtitle {
-        font-size: 0.78rem;
-        opacity: 0.70;
-        margin-top: 0.15rem;
-    }
-
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 0.35rem;
-    }
-
-    .stTabs [data-baseweb="tab"] {
-        height: 2.0rem;
-        padding-left: 0.65rem;
-        padding-right: 0.65rem;
-        font-size: 0.85rem;
-    }
-
-    section[data-testid="stSidebar"] {
-        min-width: 335px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-
-# Force a clean light-mode appearance regardless of browser/system theme.
-st.markdown(
-    """
-    <style>
-    html, body, [data-testid="stAppViewContainer"], .stApp {
-        background: #f7f9fc !important;
-        color: #111827 !important;
-    }
-    [data-testid="stHeader"] {
-        background: rgba(247,249,252,0.92) !important;
-    }
-    section[data-testid="stSidebar"] {
-        background: #ffffff !important;
-        border-right: 1px solid #e5e7eb !important;
-    }
-    section[data-testid="stSidebar"] * {
-        color: #111827 !important;
-    }
-    .small-header {
-        background: rgba(255,255,255,0.96) !important;
-        border: 1px solid #e5e7eb !important;
-        border-radius: 0.65rem !important;
-        color: #111827 !important;
-        box-shadow: 0 1px 8px rgba(15,23,42,0.06) !important;
-    }
-    .small-header-title, .small-header-subtitle {
-        color: #111827 !important;
-    }
-    div[data-testid="stExpander"] {
-        background: #ffffff !important;
-        border: 1px solid #e5e7eb !important;
-        border-radius: 0.65rem !important;
-    }
-    div[data-testid="stMetric"] {
-        background: #ffffff !important;
-        border: 1px solid #e5e7eb !important;
-        border-radius: 0.55rem !important;
-        padding: 0.35rem 0.55rem !important;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        background: #ffffff !important;
-        border-bottom: 1px solid #e5e7eb !important;
-    }
-    .stTabs [data-baseweb="tab"] {
-        color: #111827 !important;
-    }
-    .note-box-light {
-        border-left: 3px solid #2563eb;
-        padding: 0.45rem 0.6rem;
-        background: #eff6ff;
-        border-radius: 0.35rem;
-        font-size: 0.85rem;
-        margin-bottom: 0.5rem;
-        color: #1f2937;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-
-# Strong high-contrast light-mode override for Streamlit/BaseWeb widgets.
-st.markdown(
-    """
-    <style>
-    :root { color-scheme: light !important; }
-
-    html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stAppViewBlockContainer"] {
-        background: #ffffff !important;
-        color: #111827 !important;
-    }
-
-    [data-testid="stHeader"], [data-testid="stToolbar"] {
-        background: rgba(255,255,255,0.96) !important;
-        color: #111827 !important;
-    }
-
-    section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div {
-        background: #ffffff !important;
-        color: #111827 !important;
-        border-right: 1px solid #d1d5db !important;
-    }
-
-    section[data-testid="stSidebar"] *:not(svg):not(path) {
-        color: #111827 !important;
-    }
-
-    .small-header {
-        background: #ffffff !important;
-        border: 1px solid #d1d5db !important;
-        border-radius: 0.65rem !important;
-        color: #111827 !important;
-        box-shadow: 0 1px 8px rgba(15,23,42,0.08) !important;
-    }
-
-    .small-header-title,
-    .small-header-subtitle,
-    h1, h2, h3, h4, h5, h6, p, label, span {
-        color: #111827 !important;
-    }
-
-    div[data-testid="stExpander"] {
-        background: #ffffff !important;
-        border: 1px solid #cbd5e1 !important;
-        border-radius: 0.65rem !important;
-        box-shadow: 0 1px 3px rgba(15,23,42,0.05) !important;
-        overflow: hidden !important;
-    }
-
-    div[data-testid="stExpander"] details summary {
-        background: #f8fafc !important;
-        color: #111827 !important;
-        border-bottom: 1px solid #e5e7eb !important;
-    }
-
-    div[data-baseweb="input"],
-    div[data-baseweb="select"] > div,
-    div[data-baseweb="textarea"],
-    input,
-    textarea {
-        background-color: #ffffff !important;
-        color: #111827 !important;
-        border-color: #64748b !important;
-        caret-color: #111827 !important;
-    }
-
-    div[data-baseweb="input"] input,
-    div[data-baseweb="select"] span,
-    div[data-baseweb="select"] div,
-    div[data-baseweb="popover"] div,
-    [role="option"] {
-        color: #111827 !important;
-        background-color: #ffffff !important;
-    }
-
-    div[data-baseweb="popover"],
-    div[data-baseweb="popover"] ul,
-    ul[role="listbox"] {
-        background: #ffffff !important;
-        color: #111827 !important;
-        border: 1px solid #94a3b8 !important;
-    }
-
-    button,
-    [data-testid="stBaseButton-secondary"],
-    [data-testid="stBaseButton-primary"] {
-        background: #ffffff !important;
-        color: #111827 !important;
-        border: 1px solid #64748b !important;
-        box-shadow: none !important;
-    }
-
-    [data-testid="stBaseButton-primary"] {
-        background: #2563eb !important;
-        color: #ffffff !important;
-        border-color: #1d4ed8 !important;
-    }
-
-    [data-testid="stFileUploader"] section,
-    [data-testid="stFileUploader"] div {
-        background: #ffffff !important;
-        color: #111827 !important;
-        border-color: #94a3b8 !important;
-    }
-
-    .stTabs [data-baseweb="tab-list"] {
-        background: #ffffff !important;
-        border-bottom: 1px solid #d1d5db !important;
-    }
-
-    .stTabs [data-baseweb="tab"] {
-        color: #111827 !important;
-        background: #ffffff !important;
-    }
-
-    .stTabs [aria-selected="true"] {
-        color: #dc2626 !important;
-        border-bottom-color: #dc2626 !important;
-    }
-
-    div[data-testid="stMetric"] {
-        background: #ffffff !important;
-        border: 1px solid #d1d5db !important;
-        color: #111827 !important;
-    }
-
-    .note-box-light {
-        border-left: 3px solid #2563eb;
-        padding: 0.45rem 0.6rem;
-        background: #eff6ff;
-        border-radius: 0.35rem;
-        font-size: 0.85rem;
-        margin-bottom: 0.5rem;
-        color: #1f2937;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-    <div class="small-header">
-        <div class="small-header-title">Fiber Photometry Analysis</div>
-        <div class="small-header-subtitle">
-            Upload .ppd/.csv → inspect raw, dFF, and z-score sliding-window traces without changing the CSV.
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
+th.page_header(
+    "Fiber Photometry Analysis",
+    "pyPhotometry .ppd / .csv  \u00b7  motion correction, dF/F, z-score, lickometer",
+    mark="FP",
 )
 
 # =============================================================================
 # JONES-STYLE PROCESSING SETTINGS FOR CSV INPUTS
 # =============================================================================
 
-LOWPASS_HZ = 1.0
-FILTER_ORDER = 3
-REGRESSION_WINDOW_SEC = 60.0
-BASELINE_PERCENTILE = 10.0
+# Defaults now come from photometry_core so the .ppd route and the .csv route
+# cannot drift apart again. Previously this file used a 1 Hz low-pass, a 60 s
+# rolling regression and an F0 taken from the 405 channel, while ana.py used a
+# 10 Hz low-pass, a global fit and an F0 taken from the 465 channel. The same
+# animal therefore gave two different answers depending on which file you
+# uploaded.
+LOWPASS_HZ = pc.DEFAULTS["lowpass_hz"]          # 10.0
+FILTER_ORDER = pc.DEFAULTS["filter_order"]
+REGRESSION_WINDOW_SEC = 60.0                     # retained for legacy settings display
+BASELINE_PERCENTILE = pc.DEFAULTS["f0_percentile"]
 EXPORT_HZ_DEFAULT = 1.0
 
 PLOTLY_CONFIG = {
@@ -307,16 +62,7 @@ PLOTLY_CONFIG = {
     "modeBarButtonsToRemove": ["lasso2d", "select2d"],
 }
 
-DEFAULT_GRAPH_COLORS = {
-    "sig_raw": "#636EFA",
-    "uv_raw": "#00CC96",
-    "uv_fit": "#AB63FA",
-    "deltaF": "#FFA15A",
-    "dff": "#EF553B",
-    "raw_z": "#111111",
-    "z_smooth": "#1f77b4",
-    "range_average": "#f59e0b",
-}
+DEFAULT_GRAPH_COLORS = dict(th.TRACE_COLORS)
 
 
 def graph_color(name):
@@ -609,12 +355,35 @@ def normalize_processed_column_names(df, roi):
     return df
 
 
-def process_raw_csv_dataframe(df, roi):
+def process_raw_csv_dataframe(df, roi, settings=None):
+    """
+    Process a raw two-channel CSV through the shared, validated pipeline.
+
+    Three bugs in the previous version of this function are fixed here.
+
+    1. F0 came from the isosbestic channel:
+           f0 = percentile(uv_raw, 10);  dFF = 100 * deltaF / f0
+       F0 is baseline fluorescence of the *signal*. Taking it from the raw 405
+       channel divides by a different physical quantity on a different scale, so
+       every dF/F magnitude produced by the CSV route was wrong. dF/F is now
+       deltaF divided by a baseline derived from the 465 channel.
+
+    2. The regression was fitted on filtered traces but applied to raw ones:
+           uv_fit = slope * uv_raw + intercept;  delta_f = sig_raw - uv_fit
+       That reinjected all the high-frequency noise the filter had just removed.
+       deltaF is now computed entirely from the filtered traces.
+
+    3. The isosbestic was fitted with ordinary least squares. Real calcium
+       transients are genuine 465-only divergences, and OLS treats them as error
+       and pulls the fit toward them, subtracting away part of the real signal.
+       The default is now IRLS (Huber), per Keevers & Jean-Richard-dit-Bressel
+       (2025), with OLS still selectable.
+    """
     df = standardize_time(df)
     uv_col, sig_col = find_raw_channel_columns(df, roi)
     if uv_col is None or sig_col is None:
         raise ValueError(
-            "Could not identify raw 405/isobestic and 465/signal columns. "
+            "Could not identify raw 405/isosbestic and 465/signal columns. "
             "Use columns like time_sec,BLA_iso,BLA_sig or time_sec,BLA_uv_raw,BLA_sig_raw."
         )
 
@@ -623,49 +392,46 @@ def process_raw_csv_dataframe(df, roi):
 
     good = np.asarray(np.isfinite(df["time_sec"]) & np.isfinite(uv_raw) & np.isfinite(sig_raw))
     df = df.loc[good].reset_index(drop=True)
-    uv_raw = uv_raw[good]
-    sig_raw = sig_raw[good]
+    uv_raw, sig_raw = uv_raw[good], sig_raw[good]
 
     fs = estimate_fs(df["time_sec"].to_numpy())
-    uv_filt = lowpass(uv_raw, fs)
-    sig_filt = lowpass(sig_raw, fs)
-    uv_fit, delta_f = rolling_filtered_to_raw_fit(uv_raw, sig_raw, uv_filt, sig_filt, fs)
-
-    f0 = float(np.nanpercentile(uv_raw, BASELINE_PERCENTILE))
-    if not np.isfinite(f0) or f0 == 0:
-        raise ValueError(f"Invalid F0 from CSV: {f0}")
-
-    dff = 100.0 * delta_f / f0
-    sd = np.nanstd(dff, ddof=1)
-    z_dff = (dff - np.nanmean(dff)) / sd if sd and np.isfinite(sd) else np.full_like(dff, np.nan)
+    res = pc.process_photometry(sig_raw, uv_raw, fs, settings=settings)
 
     out = pd.DataFrame({
         "time_sec": df["time_sec"].to_numpy(),
         "elapsed_hours": df["time_sec"].to_numpy() / 3600.0,
         f"{roi}_uv_raw": uv_raw,
         f"{roi}_sig_raw": sig_raw,
-        f"{roi}_uv_filt_1Hz_lowpass": uv_filt,
-        f"{roi}_sig_filt_1Hz_lowpass": sig_filt,
-        f"{roi}_uv_fit": uv_fit,
-        f"{roi}_deltaF": delta_f,
-        f"{roi}_dFF": dff,
-        f"{roi}_z_dFF": z_dff,
+        f"{roi}_uv_filt": res["ctl_filt"],
+        f"{roi}_sig_filt": res["sig_filt"],
+        f"{roi}_uv_fit": res["ctl_fit"],
+        f"{roi}_deltaF": res["deltaF"],
+        f"{roi}_F0_trace": res["F0_trace"],
+        f"{roi}_dFF": res["dFF"],
+        f"{roi}_z_dFF": res["z_dFF"],
     })
     out["elapsed_hhmmss"] = [seconds_to_hms(x) for x in out["time_sec"]]
 
-    settings = {
+    cfg = res["settings"]
+    settings_out = {
         "input_type": "csv_raw",
         "uv_column_used": uv_col,
         "sig_column_used": sig_col,
         "sampling_rate_estimated_hz": fs,
-        "lowpass_hz": LOWPASS_HZ,
-        "filter_order": FILTER_ORDER,
-        "regression_window_sec": REGRESSION_WINDOW_SEC,
-        "baseline_method": "uv_raw_percentile_session",
-        "baseline_percentile": BASELINE_PERCENTILE,
-        "F0": f0,
+        "median_filter_sec": cfg["median_filter_sec"],
+        "lowpass_hz": cfg["lowpass_hz"],
+        "filter_order": cfg["filter_order"],
+        "fit_method": cfg["fit_method"],
+        "fit_slope": res["slope"],
+        "fit_intercept": res["intercept"],
+        "f0_method": cfg["f0_method"],
+        "F0_median": res["F0"],
+        "dff_units": cfg["dff_units"],
+        "zscore_mode": cfg["zscore_mode"],
+        "deltaF_formula": "deltaF = filtered_465 - fit(filtered_405)",
+        "dFF_formula": "dFF = deltaF / F0(465-derived)",
     }
-    return out, settings
+    return out, settings_out
 
 
 def load_processed_csv_dataframe(df, roi):
@@ -680,6 +446,68 @@ def filter_visual_window(df, start_sec, end_sec):
     if start_sec is None or end_sec is None:
         return df
     return df[(df["time_sec"] >= start_sec) & (df["time_sec"] <= end_sec)].copy()
+
+
+def apply_crop_to_results(results, roi, start_sec, end_sec, recompute_stats=True):
+    """
+    Physically crop every loaded recording and re-zero its time axis.
+
+    This is different from the "visual crop window", which only changes what is
+    drawn. Cropping here changes the data: samples outside the window are
+    dropped and the requested start becomes t = 0. Crop a 48 h recording at
+    24:00:00 and what was hour 24 is now hour 0, hour 25 is hour 1, and the
+    downloaded CSV matches what is on screen.
+
+    recompute_stats
+        After cropping, the retained window IS the recording, so its z-score
+        should describe that window. With this on, z-dF/F is recomputed from the
+        cropped dF/F. With it off, the original whole-session z-score is kept,
+        which is what you want if you are comparing a cropped segment against
+        statistics defined over the full session.
+    """
+    out = []
+    for r in results:
+        df, offset = pc.crop_and_rezero(r["df"], start_sec, end_sec, rezero=True)
+        if df.empty:
+            continue
+        if recompute_stats and f"{roi}_dFF" in df.columns:
+            dff = pd.to_numeric(df[f"{roi}_dFF"], errors="coerce").to_numpy(float)
+            df[f"{roi}_z_dFF"] = pc.zscore(dff)
+        if "elapsed_hhmmss" in df.columns:
+            df["elapsed_hhmmss"] = [seconds_to_hms(x) for x in df["time_sec"]]
+        new = dict(r)
+        new["df"] = df
+        if r.get("digital_events"):
+            lo = float(start_sec) if start_sec is not None else -np.inf
+            hi = float(end_sec) if end_sec is not None else np.inf
+            new["digital_events"] = {
+                ch: t[(t >= lo) & (t <= hi)] - offset
+                for ch, t in r["digital_events"].items()
+            }
+        new["settings"] = dict(r.get("settings", {}))
+        new["settings"].update({
+            "cropped": True,
+            "crop_start_sec_original_timeline": start_sec,
+            "crop_end_sec_original_timeline": end_sec,
+            "time_offset_subtracted_sec": offset,
+            "zscore_recomputed_on_crop": bool(recompute_stats),
+        })
+        out.append(new)
+    return out
+
+
+def shift_events_for_crop(events, offset):
+    """Move event annotations onto the re-zeroed timeline."""
+    if not offset:
+        return events
+    shifted = []
+    for e in events or []:
+        e2 = dict(e)
+        for key in ("start_sec", "end_sec"):
+            if e2.get(key) is not None:
+                e2[key] = float(e2[key]) - float(offset)
+        shifted.append(e2)
+    return shifted
 
 
 def finite_limits(values, pad_fraction=0.06):
@@ -861,84 +689,9 @@ def add_events_to_fig(fig, events, rows, show_labels=True):
     return fig
 
 
-def finish_fig(fig, height, show_legend=True):
-    fig.update_layout(
-        height=height,
-        margin=dict(l=45, r=25, t=70, b=40),
-        hovermode="x unified",
-        dragmode="pan",  # drag pans by default; scroll-wheel zoom is disabled in PLOTLY_CONFIG
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-        showlegend=show_legend,
-    )
-    return fig
-
-
-def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=1050):
-    fig = make_subplots(
-        rows=5,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.035,
-        subplot_titles=(
-            "Raw 465 and 405 together",
-            "Correction check: 465 signal and fitted 405",
-            "Delta-F corrected signal",
-            "dFF (%)",
-            "z-scored dFF",
-        ),
-    )
-    x = df["time_sec"]
-    if f"{roi}_sig_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", line=dict(color=graph_color("sig_raw"))), row=1, col=1)
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", showlegend=False, line=dict(color=graph_color("sig_raw"))), row=2, col=1)
-    if f"{roi}_uv_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="UV Raw / 405", line=dict(color=graph_color("uv_raw"))), row=1, col=1)
-    if f"{roi}_uv_fit" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_fit"], mode="lines", name="UV Fit / fitted 405", line=dict(color=graph_color("uv_fit"))), row=2, col=1)
-    if f"{roi}_deltaF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F", line=dict(color=graph_color("deltaF"))), row=3, col=1)
-    if f"{roi}_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)", line=dict(color=graph_color("dff"))), row=4, col=1)
-    if f"{roi}_z_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_z_dFF"], mode="lines", name="z-dFF", line=dict(color=graph_color("raw_z"))), row=5, col=1)
-
-    fig.update_yaxes(title_text="Raw", row=1, col=1)
-    fig.update_yaxes(title_text="Fit", row=2, col=1)
-    fig.update_yaxes(title_text="Delta-F", row=3, col=1)
-    fig.update_yaxes(title_text="dFF (%)", row=4, col=1)
-    fig.update_yaxes(title_text="z-dFF", row=5, col=1)
-    apply_hms_xaxis(fig, df, rows=[1, 2, 3, 4, 5])
-
-    if limits:
-        apply_y_range(fig, 1, limits.get("raw"))
-        apply_y_range(fig, 2, limits.get("fit"))
-        apply_y_range(fig, 3, limits.get("deltaF"))
-        apply_y_range(fig, 4, limits.get("dFF"))
-        apply_y_range(fig, 5, limits.get("z_dFF"))
-
-    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1, 2, 3, 4, 5], show=show_exclusions)
-    add_events_to_fig(fig, events or [], rows=[1, 2, 3, 4, 5], show_labels=show_event_labels)
-    return finish_fig(fig, height=height)
-
-
-def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=650):
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.07,
-                        subplot_titles=("465 nm calcium-dependent signal", "405 nm isosbestic/control signal"))
-    x = df["time_sec"]
-    if f"{roi}_sig_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="465 raw", line=dict(color=graph_color("sig_raw"))), row=1, col=1)
-    if f"{roi}_uv_raw" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="405 raw", line=dict(color=graph_color("uv_raw"))), row=2, col=1)
-    fig.update_yaxes(title_text="465 raw", row=1, col=1)
-    fig.update_yaxes(title_text="405 raw", row=2, col=1)
-    apply_hms_xaxis(fig, df, rows=[1, 2])
-    if limits:
-        apply_y_range(fig, 1, limits.get("raw"))
-        apply_y_range(fig, 2, limits.get("raw"))
-    add_visual_exclusion_shapes(fig, exclusions or [], rows=[1, 2], show=show_exclusions)
-    add_events_to_fig(fig, events or [], rows=[1, 2], show_labels=show_event_labels)
-    return finish_fig(fig, height=height)
-
+# NOTE: finish_fig / make_overview_figure / make_raw_independent_figure were
+# previously defined twice. The shadowed first copies have been removed; the
+# live definitions are in the FIGURES section below.
 
 def make_processed_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=760):
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.055,
@@ -1839,6 +1592,114 @@ with st.sidebar:
         if use_window and end_sec <= start_sec:
             st.error("Window end time must be after start time.")
 
+    with st.expander("Crop recording and re-zero time", expanded=False):
+        st.caption(
+            "Unlike the visual crop above, this changes the data itself. "
+            "The crop start becomes 00:00:00 and downloads match the graphs."
+        )
+        crop_enabled = st.checkbox("Crop and re-zero", value=False, key="crop_enabled")
+        crop_start_hms = st.text_input(
+            "Crop start (HH:MM:SS)", value="24:00:00", key="crop_start",
+            help="Everything before this is discarded. This instant becomes 00:00:00.",
+        )
+        crop_end_hms = st.text_input(
+            "Crop end (HH:MM:SS, blank = end of recording)", value="", key="crop_end",
+        )
+        crop_start_sec, crop_start_err = parse_hms_to_seconds(crop_start_hms, 0.0, "crop start")
+        if crop_end_hms.strip():
+            crop_end_sec, crop_end_err = parse_hms_to_seconds(crop_end_hms, 0.0, "crop end")
+        else:
+            crop_end_sec, crop_end_err = None, ""
+        if crop_start_err:
+            st.error(crop_start_err)
+        if crop_end_err:
+            st.error(crop_end_err)
+        if crop_enabled and crop_end_sec is not None and crop_end_sec <= crop_start_sec:
+            st.error("Crop end must be after crop start.")
+        crop_recompute = st.checkbox(
+            "Recompute z-score on the cropped window", value=True, key="crop_recompute",
+            help="On: z-score describes the kept window. Off: keeps whole-session statistics.",
+        )
+        if crop_enabled:
+            st.success(f"{crop_start_hms} will be shown as 00:00:00.")
+
+    with st.expander("Lickometer", expanded=False):
+        lick_enabled = st.checkbox(
+            "Enable lickometer analysis", value=False, key="lick_enabled",
+            help="Opens a dedicated lickometer section below the photometry graphs.",
+        )
+        lick_source = "None"
+        lick_file = None
+        lick_digital_channel = "digital_1"
+        lick_time_unit = "s"
+        lick_cfg = dict(lk.LICK_DEFAULTS)
+        if lick_enabled:
+            lick_source = st.radio(
+                "Lick data source",
+                ["pyPhotometry digital input", "Upload lick CSV"],
+                key="lick_source",
+                help="Digital input shares the photometry clock, so no alignment is needed.",
+            )
+            if lick_source == "pyPhotometry digital input":
+                lick_digital_channel = st.selectbox(
+                    "Digital channel", ["digital_1", "digital_2"], key="lick_dig_ch"
+                )
+            else:
+                lick_file = st.file_uploader(
+                    "Lick CSV", type=["csv"], key="lick_csv",
+                    help="Either one timestamp per lick, or a time column plus a 0/1 lick-state column.",
+                )
+                lick_time_unit = st.selectbox(
+                    "Time unit in lick file", ["s", "ms", "min"], key="lick_unit"
+                )
+
+            st.markdown("**Bout detection**")
+            lick_cfg["min_inter_lick_sec"] = st.number_input(
+                "Debounce / minimum inter-lick interval (s)",
+                0.0, 1.0, float(lk.LICK_DEFAULTS["min_inter_lick_sec"]), 0.01,
+                key="lick_debounce",
+            )
+            lick_cfg["inter_bout_sec"] = st.number_input(
+                "Gap that separates bouts (s)",
+                0.1, 60.0, float(lk.LICK_DEFAULTS["inter_bout_sec"]), 0.1,
+                key="lick_ibi",
+            )
+            lick_cfg["min_licks_per_bout"] = int(st.number_input(
+                "Minimum licks per bout", 1, 100,
+                int(lk.LICK_DEFAULTS["min_licks_per_bout"]), 1, key="lick_minlicks",
+            ))
+            lick_cfg["rate_window_sec"] = st.number_input(
+                "Lick-rate window (s)", 1.0, 3600.0,
+                float(lk.LICK_DEFAULTS["rate_window_sec"]), 1.0, key="lick_ratewin",
+            )
+
+            st.markdown("**Peri-event photometry**")
+            lick_cfg["pre_sec"] = st.number_input(
+                "Seconds before bout onset", 1.0, 300.0,
+                float(lk.LICK_DEFAULTS["pre_sec"]), 1.0, key="lick_pre",
+            )
+            lick_cfg["post_sec"] = st.number_input(
+                "Seconds after bout onset", 1.0, 600.0,
+                float(lk.LICK_DEFAULTS["post_sec"]), 1.0, key="lick_post",
+            )
+            lick_cfg["baseline_start_sec"] = st.number_input(
+                "Baseline window start (s, relative to onset)",
+                -300.0, 0.0, float(lk.LICK_DEFAULTS["baseline_start_sec"]), 0.5,
+                key="lick_bl_start",
+            )
+            lick_cfg["baseline_end_sec"] = st.number_input(
+                "Baseline window end (s, relative to onset)",
+                -300.0, 0.0, float(lk.LICK_DEFAULTS["baseline_end_sec"]), 0.5,
+                key="lick_bl_end",
+            )
+            lick_norm = st.selectbox(
+                "Peri-event normalisation",
+                ["baseline_z", "baseline_sub", "none"], key="lick_norm",
+                help="baseline_z expresses each trial in SDs of its own pre-onset baseline.",
+            )
+        else:
+            lick_norm = "baseline_z"
+
     with st.expander("Hide/remove time periods visually", expanded=False):
         st.caption("These controls only affect graph display. They do not alter downloaded processed CSVs.")
         if st.button("Clear hidden time periods", use_container_width=True):
@@ -2017,10 +1878,21 @@ if run_clicked:
                             try:
                                 df = pd.read_csv(csv_path)
                                 df = load_processed_csv_dataframe(df, roi_name)[0]
+                                # Full-rate digital event times written alongside
+                                # the processed CSV, so licking keeps its true
+                                # timing even though photometry is exported at 1 Hz.
+                                digital_events = {}
+                                for ev_path in csv_path.parent.glob("event_times_digital_*.csv"):
+                                    ch = ev_path.stem.replace("event_times_", "")
+                                    try:
+                                        digital_events[ch] = pd.read_csv(ev_path)["event_time_sec"].to_numpy(float)
+                                    except Exception:
+                                        pass
                                 all_results.append({
                                     "name": csv_path.parent.name if csv_path.parent.name else csv_path.stem,
                                     "df": df,
                                     "settings": {"input_type": "ppd", "source_csv": str(csv_path)},
+                                    "digital_events": digital_events,
                                 })
                             except Exception as e:
                                 st.warning(f"Could not load PPD output CSV {csv_path.name}: {e}")
@@ -2044,6 +1916,25 @@ if run_clicked:
 # =============================================================================
 
 results = st.session_state.get("results", [])
+
+# Apply the physical crop before any figure, metric or download is produced, so
+# the graphs, the summary numbers and the exported CSV all agree.
+crop_offset_applied = 0.0
+if results and st.session_state.get("crop_enabled"):
+    _n_before = len(results)
+    results = apply_crop_to_results(
+        results, roi_name, crop_start_sec, crop_end_sec, recompute_stats=crop_recompute
+    )
+    crop_offset_applied = float(crop_start_sec or 0.0)
+    event_annotations = shift_events_for_crop(event_annotations, crop_offset_applied)
+    if not results:
+        st.error(
+            f"Crop from {crop_start_hms} removed all data from every recording. "
+            "Check that the crop start is inside the recording."
+        )
+    elif len(results) < _n_before:
+        st.warning(f"{_n_before - len(results)} recording(s) had no data inside the crop window.")
+
 
 if not results:
     st.info("Upload a `.ppd` or `.csv` file, then click **Run / refresh analysis**.")
@@ -2239,6 +2130,297 @@ else:
             )
         with tabs[6]:
             st.json(result.get("settings", {}))
+
+    # =========================================================================
+    # LICKOMETER SECTION
+    # Rendered only when enabled in the sidebar, so the photometry workflow is
+    # unchanged for anyone not recording licks.
+    # =========================================================================
+    if st.session_state.get("lick_enabled"):
+        st.divider()
+        st.markdown("## Lickometer")
+
+        lick_times_by_rec = {}
+        lick_provenance = {}
+
+        # ---- resolve lick times for each recording --------------------------
+        if lick_source == "Upload lick CSV" and lick_file is not None:
+            try:
+                lick_df_in = pd.read_csv(lick_file)
+                cols = list(lick_df_in.columns)
+                c1, c2 = st.columns(2)
+                with c1:
+                    lick_mode = st.radio(
+                        "Lick CSV layout",
+                        ["One timestamp per lick", "Time column + 0/1 state column"],
+                        key="lick_csv_mode",
+                    )
+                if lick_mode == "One timestamp per lick":
+                    with c2:
+                        tcol = st.selectbox("Lick time column", cols, key="lick_tcol")
+                    times, _ = lk.licks_from_timestamp_csv(
+                        lick_df_in, time_column=tcol, unit=lick_time_unit,
+                        min_inter_lick_sec=lick_cfg["min_inter_lick_sec"],
+                    )
+                else:
+                    with c2:
+                        tcol = st.selectbox("Time column", cols, key="lick_tcol2")
+                        scol = st.selectbox("Lick state column", cols, key="lick_scol")
+                    times = lk.licks_from_state_csv(
+                        lick_df_in, tcol, scol, unit=lick_time_unit,
+                        min_inter_lick_sec=lick_cfg["min_inter_lick_sec"],
+                    )
+                if crop_offset_applied:
+                    times = times - crop_offset_applied
+                    st.caption(
+                        f"Lick times shifted by -{seconds_to_hms(crop_offset_applied)} "
+                        "to match the cropped photometry timeline."
+                    )
+                for r in results:
+                    lick_times_by_rec[r["name"]] = times
+            except Exception as e:
+                st.error(f"Could not read the lick CSV: {e}")
+
+        elif lick_source == "pyPhotometry digital input":
+            for r in results:
+                d = r["df"]
+                times = None
+                provenance = ""
+
+                # 1. Best: exact rising-edge times captured at the acquisition
+                #    rate before the photometry was downsampled.
+                ev = (r.get("digital_events") or {}).get(lick_digital_channel)
+                if ev is not None and len(ev):
+                    times = np.asarray(ev, dtype=float)
+                    provenance = "full-rate digital timestamps"
+
+                # 2. Fallback: reconstruct from per-bin pulse counts. A 1 Hz
+                #    export cannot place licks within a bin, so they are spread
+                #    evenly across it. Counts and bout structure are preserved;
+                #    individual inter-lick intervals are approximate.
+                elif f"{lick_digital_channel}_pulse_count" in d.columns:
+                    t_arr = d["time_sec"].to_numpy(dtype=float)
+                    counts = pd.to_numeric(
+                        d[f"{lick_digital_channel}_pulse_count"], errors="coerce"
+                    ).fillna(0).to_numpy(int)
+                    dt = float(np.median(np.diff(t_arr))) if t_arr.size > 1 else 1.0
+                    rebuilt = []
+                    for t0, c in zip(t_arr, counts):
+                        if c > 0:
+                            rebuilt.append(t0 + (np.arange(c) + 0.5) * (dt / c))
+                    times = np.concatenate(rebuilt) if rebuilt else np.array([])
+                    provenance = "reconstructed from per-bin pulse counts (approximate timing)"
+
+                # 3. Last resort: rising edges of a binary column.
+                elif lick_digital_channel in d.columns:
+                    t_arr = d["time_sec"].to_numpy(dtype=float)
+                    dig = pd.to_numeric(d[lick_digital_channel], errors="coerce").fillna(0).to_numpy()
+                    rising = np.flatnonzero(np.diff((dig > 0).astype(np.int8)) == 1) + 1
+                    times = t_arr[rising]
+                    provenance = "rising edges of a downsampled binary column"
+
+                if times is None:
+                    continue
+                if lick_cfg["min_inter_lick_sec"] > 0 and times.size:
+                    keep = [times[0]]
+                    for tv in times[1:]:
+                        if tv - keep[-1] >= lick_cfg["min_inter_lick_sec"]:
+                            keep.append(tv)
+                    times = np.asarray(keep)
+                lick_times_by_rec[r["name"]] = times
+                lick_provenance[r["name"]] = provenance
+
+            if not lick_times_by_rec:
+                th.note(
+                    f"No <b>{lick_digital_channel}</b> column found in the loaded data. "
+                    "Re-run the analysis so the digital inputs are exported, or switch "
+                    "to <b>Upload lick CSV</b>.",
+                    kind="warn",
+                )
+
+        # ---- render per recording -------------------------------------------
+        for r in results:
+            times = np.asarray(lick_times_by_rec.get(r["name"], []), dtype=float)
+            d = r["df"]
+            st.markdown(f"### `{r['name']}`")
+
+            if times.size == 0:
+                st.info("No licks available for this recording.")
+                continue
+
+            duration = float(d["time_sec"].max() - d["time_sec"].min())
+            bouts = lk.detect_bouts(
+                times,
+                inter_bout_sec=lick_cfg["inter_bout_sec"],
+                min_licks_per_bout=lick_cfg["min_licks_per_bout"],
+            )
+            summary = lk.bout_summary_table(bouts, times, duration)
+
+            prov = lick_provenance.get(r["name"], "")
+            if "approximate" in prov:
+                th.note(
+                    f"Lick times {prov}. Counts and bout structure are reliable; "
+                    "individual inter-lick intervals are not. Re-run the .ppd analysis "
+                    "to get exact timestamps.",
+                    kind="warn",
+                )
+            elif "rising edges of a downsampled" in prov:
+                th.note(
+                    "Lick times came from a downsampled binary column, so licks within "
+                    "one bin were merged and counts will be underestimated.",
+                    kind="warn",
+                )
+
+            mcols = st.columns(len(summary.columns))
+            for col, name in zip(mcols, summary.columns):
+                col.metric(name, summary.iloc[0][name])
+
+            ltabs = st.tabs(["Licking over time", "Peri-bout photometry", "Bout table"])
+
+            # -------- licking over time, aligned under dF/F -------------------
+            with ltabs[0]:
+                grid = d["time_sec"].to_numpy(dtype=float)
+                rate = lk.lick_rate_trace(times, grid, window_sec=lick_cfg["rate_window_sec"])
+                dff_col = f"{roi_name}_z_dFF" if f"{roi_name}_z_dFF" in d.columns else f"{roi_name}_dFF"
+
+                fig = make_subplots(
+                    rows=3, cols=1, shared_xaxes=True,
+                    row_heights=[0.44, 0.28, 0.28], vertical_spacing=0.05,
+                    subplot_titles=(
+                        f"{roi_name} {'z-dF/F' if dff_col.endswith('z_dFF') else 'dF/F'}",
+                        f"Lick rate ({lick_cfg['rate_window_sec']:g} s window)",
+                        "Lick raster",
+                    ),
+                )
+                if dff_col in d.columns:
+                    fig.add_trace(go.Scatter(
+                        x=grid, y=pd.to_numeric(d[dff_col], errors="coerce"),
+                        mode="lines", name=dff_col,
+                        line=dict(width=1.1, color=th.TRACE_COLORS["dff"]),
+                    ), row=1, col=1)
+                fig.add_trace(go.Scatter(
+                    x=grid, y=rate, mode="lines", name="Lick rate (Hz)",
+                    line=dict(width=1.2, color=th.TRACE_COLORS["lick_rate"]),
+                    fill="tozeroy", fillcolor="rgba(8,145,178,0.15)",
+                ), row=2, col=1)
+                fig.add_trace(go.Scatter(
+                    x=times, y=np.ones_like(times), mode="markers", name="Licks",
+                    marker=dict(symbol="line-ns-open", size=9, line=dict(width=1),
+                                color=th.TRACE_COLORS["lick"]),
+                ), row=3, col=1)
+
+                for _, b in bouts.iterrows():
+                    fig.add_vrect(
+                        x0=b.onset_sec, x1=b.offset_sec,
+                        fillcolor="rgba(245,158,11,0.14)", line_width=0, row=1, col=1,
+                    )
+
+                fig.update_yaxes(title_text="Hz", row=2, col=1)
+                fig.update_yaxes(showticklabels=False, range=[0.5, 1.5], row=3, col=1)
+                th.style_figure(fig, height=int(720 * height_mult))
+                apply_hms_xaxis(fig, d, rows=[1, 2, 3])
+                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+                st.caption("Shaded bands mark detected licking bouts.")
+
+            # -------- peri-bout photometry ------------------------------------
+            with ltabs[1]:
+                dff_col = f"{roi_name}_dFF" if f"{roi_name}_dFF" in d.columns else None
+                if dff_col is None or bouts.empty:
+                    st.info("Need dF/F and at least one detected bout.")
+                else:
+                    mat, taxis, kept = lk.peri_event_matrix(
+                        d["time_sec"].to_numpy(dtype=float),
+                        pd.to_numeric(d[dff_col], errors="coerce").to_numpy(float),
+                        bouts.onset_sec.to_numpy(float),
+                        pre_sec=lick_cfg["pre_sec"], post_sec=lick_cfg["post_sec"],
+                        baseline_start_sec=lick_cfg["baseline_start_sec"],
+                        baseline_end_sec=lick_cfg["baseline_end_sec"],
+                        normalise=lick_norm,
+                    )
+                    if mat.size == 0:
+                        st.warning(
+                            "No bout had a complete window inside the recording. "
+                            "Shorten the pre/post window."
+                        )
+                    else:
+                        dropped = len(bouts) - len(kept)
+                        if dropped:
+                            st.caption(
+                                f"{dropped} bout(s) excluded: window extended past the "
+                                "recording edge. Partial windows are never zero-padded."
+                            )
+                        unit = ("SD of baseline" if lick_norm == "baseline_z"
+                                else "dF/F" if lick_norm != "none" else "dF/F (raw)")
+                        mean = np.nanmean(mat, axis=0)
+                        sem = np.nanstd(mat, axis=0, ddof=1) / np.sqrt(mat.shape[0]) \
+                            if mat.shape[0] > 1 else np.zeros_like(mean)
+
+                        pf = make_subplots(
+                            rows=2, cols=1, shared_xaxes=True,
+                            row_heights=[0.45, 0.55], vertical_spacing=0.07,
+                            subplot_titles=(
+                                f"Mean \u00b1 SEM across {mat.shape[0]} bouts",
+                                "Per-bout heatmap",
+                            ),
+                        )
+                        pf.add_trace(go.Scatter(
+                            x=np.concatenate([taxis, taxis[::-1]]),
+                            y=np.concatenate([mean + sem, (mean - sem)[::-1]]),
+                            fill="toself", fillcolor="rgba(213,94,0,0.20)",
+                            line=dict(width=0), hoverinfo="skip", showlegend=False,
+                        ), row=1, col=1)
+                        pf.add_trace(go.Scatter(
+                            x=taxis, y=mean, mode="lines", name="Mean",
+                            line=dict(width=2, color=th.TRACE_COLORS["dff"]),
+                        ), row=1, col=1)
+                        pf.add_trace(go.Heatmap(
+                            z=mat, x=taxis, y=np.arange(1, mat.shape[0] + 1),
+                            colorscale="RdBu_r", zmid=0,
+                            colorbar=dict(title=unit, len=0.5, y=0.22),
+                        ), row=2, col=1)
+                        for rr in (1, 2):
+                            pf.add_vline(x=0, line=dict(color="#111827", width=1.4,
+                                                        dash="dash"), row=rr, col=1)
+                        pf.update_xaxes(title_text="Time from bout onset (s)", row=2, col=1)
+                        pf.update_yaxes(title_text=unit, row=1, col=1)
+                        pf.update_yaxes(title_text="Bout", row=2, col=1)
+                        th.style_figure(pf, height=int(660 * height_mult))
+                        st.plotly_chart(pf, use_container_width=True, config=PLOTLY_CONFIG)
+
+                        bl = (taxis >= lick_cfg["baseline_start_sec"]) & (taxis <= lick_cfg["baseline_end_sec"])
+                        pk = (taxis >= 0) & (taxis <= min(10.0, lick_cfg["post_sec"]))
+                        s1, s2, s3 = st.columns(3)
+                        s1.metric("Bouts analysed", mat.shape[0])
+                        s2.metric("Mean baseline", f"{np.nanmean(mat[:, bl]):.3f}")
+                        s3.metric("Mean 0-10 s post-onset", f"{np.nanmean(mat[:, pk]):.3f}")
+
+                        out_df = pd.DataFrame(mat.T, columns=[f"bout_{i+1}" for i in range(mat.shape[0])])
+                        out_df.insert(0, "time_from_onset_sec", taxis)
+                        st.download_button(
+                            "Download peri-bout matrix (CSV)",
+                            out_df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"{safe_name(r['name'])}_peri_bout.csv",
+                            mime="text/csv",
+                        )
+
+            # -------- bout table ----------------------------------------------
+            with ltabs[2]:
+                show = bouts.copy()
+                for c in ("onset_sec", "offset_sec"):
+                    show[c.replace("_sec", "_hms")] = [seconds_to_hms(v) for v in show[c]]
+                st.dataframe(show.round(3), use_container_width=True, height=340)
+                st.download_button(
+                    "Download bout table (CSV)",
+                    show.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{safe_name(r['name'])}_lick_bouts.csv",
+                    mime="text/csv",
+                )
+                st.download_button(
+                    "Download lick times (CSV)",
+                    pd.DataFrame({"lick_time_sec": times}).to_csv(index=False).encode("utf-8"),
+                    file_name=f"{safe_name(r['name'])}_lick_times.csv",
+                    mime="text/csv",
+                )
 
     st.divider()
     st.download_button(
