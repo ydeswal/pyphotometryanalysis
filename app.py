@@ -16,6 +16,41 @@ from plotly.subplots import make_subplots
 # Shared, validated maths + UI modules.
 import photometry_core as pc
 import lickometer as lk
+
+# --------------------------------------------------------------------------
+# lickometer.py must be at least this version, or the lick features below
+# silently do not exist. These two files are updated together; deploying one
+# without the other is an easy mistake and produces a confusing error a long
+# way from its cause.
+# --------------------------------------------------------------------------
+LICKOMETER_REQUIRED = "2.0"
+
+
+def _lickometer_status():
+    """Returns (ok, message). Message is None when the module is current."""
+    have = getattr(lk, "__version__", None)
+    missing = [n for n in ("load_licks_csv", "plot_licks", "plot_licks_with_signal")
+               if not hasattr(lk, n)]
+    if have is None or missing:
+        return False, (
+            "**`lickometer.py` on the server is out of date.**\n\n"
+            "`app.py` has been updated but `lickometer.py` has not, so the "
+            "lick-reading functions it calls "
+            f"({', '.join('`' + m + '`' for m in missing) or '`load_licks_csv`'}) "
+            "do not exist yet.\n\n"
+            "Upload the new **`lickometer.py`** to the repository alongside "
+            "`app.py` and let the app redeploy. Both files change together. "
+            "If you committed it already, check that no old `lickometer.pyc` or "
+            "`__pycache__/` folder was committed on top of it."
+        )
+    if tuple(int(x) for x in str(have).split(".")[:2]) < \
+            tuple(int(x) for x in LICKOMETER_REQUIRED.split(".")[:2]):
+        return False, (
+            f"**`lickometer.py` is version {have}, but this `app.py` needs "
+            f"{LICKOMETER_REQUIRED} or newer.** Upload the matching "
+            "`lickometer.py` and let the app redeploy."
+        )
+    return True, None
 import theme as th
 
 # =============================================================================
@@ -1685,6 +1720,9 @@ with st.sidebar:
             st.success(f"{crop_start_hms} will be shown as 00:00:00.")
 
     with st.expander("Lickometer", expanded=False):
+        _sb_ok, _sb_msg = _lickometer_status()
+        if not _sb_ok:
+            st.warning("lickometer.py is out of date - see the Lickometer section.")
         lick_enabled = st.checkbox(
             "Enable lickometer analysis", value=False, key="lick_enabled",
             help="Opens a dedicated lickometer section below the photometry graphs.",
@@ -2042,6 +2080,10 @@ def standalone_lick_section(file_obj, cfg):
     """
     st.divider()
     st.markdown("## Lickometer")
+    ok, msg = _lickometer_status()
+    if not ok:
+        st.error(msg)
+        return
     try:
         load = lk.load_licks_csv(file_obj,
                                  min_inter_lick_sec=cfg["min_inter_lick_sec"])
@@ -2316,11 +2358,15 @@ else:
         st.divider()
         st.markdown("## Lickometer")
 
+        _lk_ok, _lk_msg = _lickometer_status()
+        if not _lk_ok:
+            st.error(_lk_msg)
+
         lick_times_by_rec = {}
         lick_provenance = {}
 
         # ---- resolve lick times for each recording --------------------------
-        if lick_source == "Upload lick CSV" and lick_file is not None:
+        if lick_source == "Upload lick CSV" and lick_file is not None and _lk_ok:
             try:
                 load = lk.load_licks_csv(
                     lick_file, min_inter_lick_sec=lick_cfg["min_inter_lick_sec"]

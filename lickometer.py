@@ -52,7 +52,14 @@ import pandas as pd
 
 from photometry_core import zscore
 
+# Bumped whenever app.py starts relying on something new in here. app.py checks
+# it on startup, because the alternative is what actually happened in the field:
+# app.py was updated, lickometer.py was not, and the only clue was a bare
+# AttributeError buried in the Lickometer section.
+__version__ = "2.0"
+
 __all__ = [
+    "__version__",
     "LICK_DEFAULTS",
     "LickLoad",
     "load_licks_csv",
