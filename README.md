@@ -208,6 +208,62 @@ Validated end-to-end against a synthetic 3 h recording with 750 licks in 25
 bouts: **750/750 licks recovered, 25 bouts, 30.0 licks/bout, 7.15 Hz within-bout
 rate**, peri-bout baseline 0.000 → **+5.00 SD** post-onset.
 
+### 7b. Lick CSVs: any layout, auto-detected (new)
+
+`lickometer.load_licks_csv()` works out the layout itself. It reads:
+
+| Layout | Example |
+|---|---|
+| LIQ HD raw export | `record_type,pc_clock,elapsed_s,device_ms,channel,...` |
+| One timestamp per lick | `lick_time` in s, ms, min, or clock times |
+| Time + 0/1 state column(s) | one column per bottle |
+| Time + per-bin lick counts | hourly or per-minute totals |
+
+Multi-bottle files are split automatically, by a `channel`/`bottle` column or by
+one state column per bottle. Files with an index column, extra metadata columns,
+or unsorted rows are handled.
+
+**Why this needed more than a column picker.** A file can offer several time
+columns that disagree, and choosing wrongly does not raise an error — it
+silently produces a nonsense recording. The LIQ HD export that prompted this
+contains both `pc_clock` and `elapsed_s`, and `elapsed_s` is corrupt: across the
+recording the clock advances 23.4 h while `elapsed_s` advances 82,343 h. Read
+with `elapsed_s` the file becomes a 9-year recording at essentially zero licks
+per hour.
+
+So candidate time columns are cross-checked against each other. A wall clock is
+trusted over a free-running counter, because a counter can drift, wrap or be
+reset by firmware and a clock cannot, and the disagreement is reported in the UI
+rather than resolved silently. Metadata columns (`peak`, `dc`, `duration_ms`,
+`split`) are excluded outright so they can never be mistaken for a time axis.
+
+Units are inferred from whether the resulting **duration** is physically
+plausible, not from the typical gap between licks. Gap-based inference fails on
+a sensor that double-counts contacts: gaps of a few ms read as a file in minutes,
+and every timestamp gets multiplied by sixty.
+
+Times stay absolute. Re-basing to the first lick would shift the whole raster by
+however long the animal took to start drinking, quietly misaligning it against
+the photometry. Only a wall-clock column is re-based, to the first timestamp,
+since its epoch carries no meaning.
+
+Two sanity checks run on load and surface as warnings: an implausibly low
+licks-per-hour (usually the wrong time column), and a median inter-lick interval
+faster than a mouse can lick (usually a sensor double-counting).
+
+**Plotting.** `plot_licks`, `plot_licks_with_signal` and `plot_peri_event` build
+the figures, so the same picture can be made from a script. Two details matter at
+24 h scale: the raster is decimated above ~40k ticks (the rate trace below always
+uses every lick, so nothing quantitative is lost), and bouts are shaded with one
+NaN-separated filled trace rather than one layout shape each — 1,035 `add_vrect`
+calls took minutes and left the browser crawling; the single trace draws in
+0.13 s.
+
+**Lick-only analysis.** The lickometer section used to live inside the
+per-recording layout, so uploading a lick CSV with no `.ppd` or `.csv` beside it
+produced an empty page. A lick file alone now gets its own section with the
+raster, per-bottle summary, bouts and CSV downloads.
+
 ### 8. Appearance
 
 The red-on-black multiselect chips came from three stacked `<style>` blocks
@@ -243,6 +299,10 @@ Covers `.ppd` reading in both frame layouts, demonstration of the old reader's
 failure mode, crop/re-zero arithmetic, low-cutoff filter stability, median filter
 speed and edge behaviour, IRLS vs OLS slope recovery, all three z-score modes,
 and a full pipeline run. All tests pass.
+
+`python test_lick.py` covers lick CSV auto-detection: the real LIQ HD file, all
+four layouts, unit inference, multi-bottle splitting, debounce, malformed files,
+backward compatibility with the previous API, and the plotting helpers.
 
 **Testing was against synthetic files with known ground truth, not real
 recordings.** Before trusting any published number, re-run one file you know well

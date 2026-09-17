@@ -1708,11 +1708,14 @@ with st.sidebar:
             else:
                 lick_file = st.file_uploader(
                     "Lick CSV", type=["csv"], key="lick_csv",
-                    help="Either one timestamp per lick, or a time column plus a 0/1 lick-state column.",
+                    help=(
+                        "The layout is detected automatically: LIQ HD raw exports, "
+                        "one timestamp per lick, a time column plus 0/1 state "
+                        "columns, or per-bin lick counts. Multi-bottle files are "
+                        "split per bottle."
+                    ),
                 )
-                lick_time_unit = st.selectbox(
-                    "Time unit in lick file", ["s", "ms", "min"], key="lick_unit"
-                )
+                lick_time_unit = "auto"
 
             st.markdown("**Bout detection**")
             lick_cfg["min_inter_lick_sec"] = st.number_input(
@@ -2028,8 +2031,89 @@ if results and st.session_state.get("crop_enabled"):
         st.warning(f"{_n_before - len(results)} recording(s) had no data inside the crop window.")
 
 
+def standalone_lick_section(file_obj, cfg):
+    """
+    Lick analysis with no photometry loaded.
+
+    The lickometer section proper lives inside the per-recording layout, so
+    without a .ppd or .csv it never rendered and a lick file alone produced an
+    empty page. Licks are worth looking at on their own - a LIQ HD export is a
+    complete 24 h drinking record whether or not there is fibre data beside it.
+    """
+    st.divider()
+    st.markdown("## Lickometer")
+    try:
+        load = lk.load_licks_csv(file_obj,
+                                 min_inter_lick_sec=cfg["min_inter_lick_sec"])
+    except Exception as e:
+        st.error(f"Could not read the lick CSV: {e}")
+        return
+
+    st.caption(
+        f"Detected **{load.fmt}** · time from `{load.time_column}` · "
+        f"{load.n_licks:,} licks across {len(load.sources)} bottle(s) · "
+        f"{load.duration_sec/3600:.2f} h"
+        + (f" · started {load.start_clock}" if load.start_clock is not None else "")
+    )
+    for w in load.warnings:
+        th.note(w, kind="warn")
+    if load.notes:
+        with st.expander("How this file was read"):
+            for n_ in load.notes:
+                st.write("- " + n_)
+
+    names = list(load.sources)
+    picked = st.multiselect("Bottles", names, default=names,
+                            key="solo_lick_bottles") if len(names) > 1 else names
+    if not picked:
+        st.info("Select at least one bottle.")
+        return
+
+    sources = {n_: load.sources[n_] for n_ in picked}
+    pooled = np.sort(np.concatenate(list(sources.values())))
+
+    st.plotly_chart(
+        lk.plot_licks(sources, duration_sec=load.duration_sec,
+                      rate_window_sec=cfg["rate_window_sec"],
+                      title="Licks over the whole recording"),
+        use_container_width=True,
+    )
+
+    # Per bottle, because pooling bottles hides a sipper that stopped working.
+    rows = []
+    for n_, t_ in sources.items():
+        b_ = lk.detect_bouts(t_, cfg["inter_bout_sec"], cfg["min_licks_per_bout"])
+        srow = lk.bout_summary_table(b_, t_, load.duration_sec).iloc[0].to_dict()
+        srow = {"Bottle": n_, **srow}
+        rows.append(srow)
+    st.markdown("**Per bottle**")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    bouts = lk.detect_bouts(pooled, cfg["inter_bout_sec"],
+                            cfg["min_licks_per_bout"])
+    with st.expander(f"Bouts ({len(bouts)})"):
+        st.dataframe(bouts, use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "Download bouts CSV", bouts.to_csv(index=False).encode(),
+            file_name="lick_bouts.csv", mime="text/csv", key="solo_dl_bouts")
+    with c2:
+        lt = pd.DataFrame({
+            "bottle": np.concatenate([[n_] * len(t_) for n_, t_ in sources.items()]),
+            "lick_time_sec": np.concatenate(list(sources.values())),
+        }).sort_values("lick_time_sec")
+        st.download_button(
+            "Download lick times CSV", lt.to_csv(index=False).encode(),
+            file_name="lick_times.csv", mime="text/csv", key="solo_dl_times")
+
+
 if not results:
     st.info("Upload a `.ppd` or `.csv` file, then click **Run / refresh analysis**.")
+    if (st.session_state.get("lick_enabled")
+            and lick_source == "Upload lick CSV" and lick_file is not None):
+        standalone_lick_section(lick_file, lick_cfg)
 else:
     auto = get_auto_limits(results, roi_name)
     manual_limits = {
@@ -2238,30 +2322,72 @@ else:
         # ---- resolve lick times for each recording --------------------------
         if lick_source == "Upload lick CSV" and lick_file is not None:
             try:
-                lick_df_in = pd.read_csv(lick_file)
-                cols = list(lick_df_in.columns)
-                c1, c2 = st.columns(2)
-                with c1:
-                    lick_mode = st.radio(
-                        "Lick CSV layout",
-                        ["One timestamp per lick", "Time column + 0/1 state column"],
-                        key="lick_csv_mode",
-                    )
-                if lick_mode == "One timestamp per lick":
-                    with c2:
-                        tcol = st.selectbox("Lick time column", cols, key="lick_tcol")
-                    times, _ = lk.licks_from_timestamp_csv(
-                        lick_df_in, time_column=tcol, unit=lick_time_unit,
-                        min_inter_lick_sec=lick_cfg["min_inter_lick_sec"],
+                load = lk.load_licks_csv(
+                    lick_file, min_inter_lick_sec=lick_cfg["min_inter_lick_sec"]
+                )
+
+                st.caption(
+                    f"Detected **{load.fmt}** · time from `{load.time_column}` · "
+                    f"{load.n_licks:,} licks across {len(load.sources)} "
+                    f"bottle(s) · {load.duration_sec/3600:.2f} h"
+                )
+                for w in load.warnings:
+                    th.note(w, kind="warn")
+                if load.notes:
+                    with st.expander("How this file was read"):
+                        for n_ in load.notes:
+                            st.write("- " + n_)
+
+                # Let the reader be overruled. Auto-detection is right on every
+                # file tested here, but it is inference, and the person who
+                # recorded the data knows things the file does not say.
+                with st.expander("Override the automatic reading"):
+                    raw_df = pd.read_csv(lick_file) if not hasattr(lick_file, "seek") \
+                        else (lick_file.seek(0), pd.read_csv(lick_file))[1]
+                    cols = ["(auto)"] + list(raw_df.columns)
+                    oc1, oc2 = st.columns(2)
+                    with oc1:
+                        force_t = st.selectbox("Time column", cols, key="lick_force_t")
+                    with oc2:
+                        force_ch = st.selectbox("Bottle / channel column", cols,
+                                                key="lick_force_ch")
+                    if force_t != "(auto)" or force_ch != "(auto)":
+                        load = lk.load_licks_csv(
+                            raw_df,
+                            time_column=None if force_t == "(auto)" else force_t,
+                            channel_column=None if force_ch == "(auto)" else force_ch,
+                            min_inter_lick_sec=lick_cfg["min_inter_lick_sec"],
+                        )
+                        st.caption(f"Re-read: {load.n_licks:,} licks, "
+                                   f"{load.duration_sec/3600:.2f} h")
+
+                # A multi-bottle file needs one bottle chosen for peri-event
+                # alignment against the photometry, which is single-channel.
+                names = list(load.sources)
+                if len(names) > 1:
+                    picked = st.multiselect(
+                        "Bottles to analyse", names, default=names,
+                        key="lick_bottles",
+                        help="Pooled together for bout detection and alignment.",
                     )
                 else:
-                    with c2:
-                        tcol = st.selectbox("Time column", cols, key="lick_tcol2")
-                        scol = st.selectbox("Lick state column", cols, key="lick_scol")
-                    times = lk.licks_from_state_csv(
-                        lick_df_in, tcol, scol, unit=lick_time_unit,
-                        min_inter_lick_sec=lick_cfg["min_inter_lick_sec"],
-                    )
+                    picked = names
+
+                times = (np.sort(np.concatenate(
+                    [load.sources[n_] for n_ in picked])) if picked
+                    else np.array([], dtype=float))
+
+                # Standalone view: licks are worth seeing even with no photometry.
+                st.plotly_chart(
+                    lk.plot_licks(
+                        {n_: load.sources[n_] for n_ in picked},
+                        duration_sec=load.duration_sec,
+                        rate_window_sec=lick_cfg["rate_window_sec"],
+                        title="Licks over the whole recording",
+                    ),
+                    use_container_width=True,
+                )
+
                 if crop_offset_applied:
                     times = times - crop_offset_applied
                     st.caption(
@@ -2270,6 +2396,8 @@ else:
                     )
                 for r in results:
                     lick_times_by_rec[r["name"]] = times
+                    lick_provenance[r["name"]] = (
+                        f"{load.fmt}, time from '{load.time_column}'")
             except Exception as e:
                 st.error(f"Could not read the lick CSV: {e}")
 
