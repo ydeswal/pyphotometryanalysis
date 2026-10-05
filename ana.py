@@ -85,14 +85,17 @@ COLUMN_MAP = {
 }
 
 # Lowell/Douglass-style defaults used here.
-LOWPASS_HZ = 10.0
-FILTER_ORDER = 3
+LOWPASS_HZ = 10.0               # Douglass et al. 2025: 10 Hz cutoff
+FILTER_ORDER = 2                # pyPhotometry reference implementation: butter(2, ...)
 REGRESSION_WINDOW_SEC = 60.0
 BASELINE_PERCENTILE = 10.0  # retained only for backward compatibility; Lowell F0 does not use this
 
 # Lowell/Douglass paper method settings.
-MEDIAN_FILTER_SEC = 1.0          # paper says median-filtered; kernel was not specified in the PDF
-FIT_METHOD = "irls"              # "irls" (robust, recommended) or "ols"
+MEDIAN_FILTER_SEC = 0.0          # 0 = use MEDIAN_KERNEL_SAMPLES instead
+MEDIAN_KERNEL_SAMPLES = 5        # paper: "median-filtered" (kernel unstated); pyPhotometry uses samples
+FIT_METHOD = "ols"               # paper: "linear best fit" (OLS). "irls" optional.
+PIPELINE = "douglass2025"        # or "pyphotometry"
+NEGATIVE_SLOPE_POLICY = "zero"   # clamp physically impossible negative 405 slopes
 
 # Rate used for the analysis stage, after the 10 Hz low-pass. Sampling faster
 # than about 2.5x the low-pass cutoff stores no extra information, so dropping
@@ -103,7 +106,8 @@ F0_LOWPASS_HZ = 0.001           # F0 = 0.001 Hz low-pass filtered 465 nm signal
 LONG_TERM_SMOOTH_SEC = 30 * 60  # 30-minute running average for long-term traces
 
 # Plot/export settings.
-EXPORT_HZ = 1.0              # graphs and main CSV are downsampled to 1 Hz
+EXPORT_HZ = 1.0              # default for long recordings; see choose_export_hz()
+MAX_EXPORT_ROWS = 150_000    # "auto" export keeps the graph CSV below this size
 STACKED_CHUNK_SEC = 600.0    # Plot C chunk length in seconds
 
 # Padding added around y-axis limits. Example: 0.05 = 5% padding.
@@ -284,37 +288,40 @@ def zscore(values: np.ndarray):
     return (values - mean) / sd
 
 
-def process_photometry(uv_raw, sig_raw, fs, consume_inputs=False):
-    """
-    Lowell-style processing, delegated to photometry_core.
+USER_SETTINGS = {}   # filled from --settings-json
+REQUESTED_EXPORT_HZ = "auto"
+MAKE_STATIC_PLOTS = True
 
-    Pipeline: median filter -> 10 Hz low-pass on both channels -> fit the
-    filtered 405 onto the filtered 465 -> deltaF -> F0 as a very slow low-pass of
-    the 465 channel -> dF/F -> session z-score, plus 30-min running means for
-    the long-timescale figures.
 
-    Two changes from the old in-file implementation:
-      * the 405 fit defaults to IRLS rather than OLS, so real calcium transients
-        are down-weighted instead of being partly fitted away;
-      * the 0.001 Hz F0 filter is computed on a decimated series, which is both
-        numerically stable and far faster than designing a Butterworth that
-        close to DC at the full sampling rate.
-    """
+def current_settings():
     settings = {
+        "pipeline": PIPELINE,
         "median_filter_sec": MEDIAN_FILTER_SEC,
+        "median_kernel_samples": MEDIAN_KERNEL_SAMPLES,
         "lowpass_hz": LOWPASS_HZ,
         "filter_order": FILTER_ORDER,
         "fit_method": FIT_METHOD,
+        "negative_slope_policy": NEGATIVE_SLOPE_POLICY,
         "f0_method": "lowpass",
         "f0_lowpass_hz": F0_LOWPASS_HZ,
         "dff_units": "ratio",
         "zscore_mode": "session",
+        "long_term_smooth_sec": LONG_TERM_SMOOTH_SEC,
     }
+    settings.update({k: v for k, v in USER_SETTINGS.items() if v is not None})
+    return settings
+
+
+def process_photometry(uv_raw, sig_raw, fs, consume_inputs=False):
+    """
+    Douglass et al. (2025) processing, delegated to photometry_core.
+
+    median filter -> 10 Hz low-pass (both channels) -> OLS fit of filtered 405
+    onto filtered 465 -> dF = 465 - fitted 405 -> F0 = 0.001 Hz low-pass of
+    465 -> dF/F0 -> session z-score -> 30-min running means.
+    """
+    settings = current_settings()
     if consume_inputs:
-        # Hand the arrays over through a list and pop them in the call, so this
-        # frame keeps no reference to them. Inside process_photometry the
-        # reference count is then 1 and each channel can actually be freed
-        # after filtering.
         payload = [sig_raw, uv_raw]
         del sig_raw, uv_raw
         res = pc.process_photometry(payload.pop(0), payload.pop(0), fs,
@@ -325,6 +332,8 @@ def process_photometry(uv_raw, sig_raw, fs, consume_inputs=False):
                                     analysis_hz=ANALYSIS_HZ, consume=False)
 
     dff, z_dff = res["dFF"], res["z_dFF"]
+    t = np.arange(len(dff), dtype=float) / res["fs"]
+    win = float(settings.get("long_term_smooth_sec", LONG_TERM_SMOOTH_SEC))
     return {
         "uv_med": res["ctl_med"],
         "sig_med": res["sig_med"],
@@ -337,14 +346,32 @@ def process_photometry(uv_raw, sig_raw, fs, consume_inputs=False):
         "dFF": dff,
         "dFF_percent": 100.0 * dff,
         "z_dFF": z_dff,
-        # Note: res["fs"] is the post-decimation rate, not the acquisition rate.
         "fs": res["fs"],
         "decimation_factor": res["decimation_factor"],
-        "dFF_30min_mean": rolling_mean_trace(dff, res["fs"], LONG_TERM_SMOOTH_SEC, center=True),
-        "z_dFF_30min_mean": rolling_mean_trace(z_dff, res["fs"], LONG_TERM_SMOOTH_SEC, center=True),
+        "dFF_30min_mean": pc.rolling_mean_by_time(t, dff, win, centered=True),
+        "z_dFF_30min_mean": pc.rolling_mean_by_time(t, z_dff, win, centered=True),
         "slope": res["slope"],
         "intercept": res["intercept"],
+        "fit_info": res["fit_info"],
+        "pipeline_used": res["pipeline_used"],
+        "warnings": res["warnings"],
+        "notes": res["notes"],
+        "settings": res["settings"],
     }
+
+
+def choose_export_hz(duration_sec, fs_analysis, requested="auto"):
+    """
+    Rate of the graph/CSV export. "auto" keeps full resolution for short
+    recordings (a 3-minute file exported at 1 Hz has only 180 points, which
+    hides everything faster than a second) and falls back to 1 Hz for long ones.
+    """
+    if requested not in (None, "auto"):
+        return min(float(requested), fs_analysis)
+    for hz in (fs_analysis, 10.0, 5.0, 2.0, 1.0):
+        if hz <= fs_analysis and duration_sec * hz <= MAX_EXPORT_ROWS:
+            return float(hz)
+    return 1.0
 
 
 def make_dataframe(time_sec, uv_raw, sig_raw, processed, roi):
@@ -859,12 +886,17 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
     header, fs, data = read_ppd(ppd_path)
     uv_raw, sig_raw = extract_channels(data)
     n_acquired = len(sig_raw)
+    clipping = {k: data[k] for k in ("analog_1_clipping_fraction", "analog_2_clipping_fraction") if k in data}
+    fs_analysis_expected = fs
+    if ANALYSIS_HZ and fs > ANALYSIS_HZ:
+        fs_analysis_expected = fs / max(1, int(np.floor(fs / max(ANALYSIS_HZ, 2.5 * LOWPASS_HZ))))
+    export_hz = choose_export_hz(n_acquired / fs, fs_analysis_expected, REQUESTED_EXPORT_HZ)
 
     # Bin the raw channels down to the export rate BEFORE they are handed to
     # the analysis, because the analysis frees them to save memory. These small
     # arrays (~173k samples at 48 h, versus 22.5M) are what the CSV's *_raw
     # columns are built from.
-    step_full = max(int(round(fs / EXPORT_HZ)), 1)
+    step_full = max(int(round(fs / export_hz)), 1)
     cut_full = (n_acquired // step_full) * step_full
 
     def _bin_full(arr):
@@ -921,7 +953,7 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
             df_full[ch] = col
 
     # Build the export frame directly from decimated arrays.
-    step = max(int(round(fs_analysis / EXPORT_HZ)), 1)
+    step = max(int(round(fs_analysis / export_hz)), 1)
     cut = (n_analysis // step) * step
 
     def _bin(arr):
@@ -944,6 +976,8 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
         f"{roi}_sig_raw": sig_raw_export[:n_rows],
         f"{roi}_uv_filt_10Hz_lowpass": _b(processed["uv_filt"]),
         f"{roi}_sig_filt_10Hz_lowpass": _b(processed["sig_filt"]),
+        f"{roi}_sig_filt": _b(processed["sig_filt"]),
+        f"{roi}_uv_filt": _b(processed["uv_filt"]),
         f"{roi}_uv_fit": _b(processed["uv_fit"]),
         f"{roi}_deltaF": _b(processed["deltaF"]),
         f"{roi}_F0_0p001Hz": _b(processed["F0_trace"]),
@@ -960,8 +994,8 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
         edges = np.asarray(arr, dtype=float)
         counts, _ = np.histogram(
             edges,
-            bins=np.append(time_plot - 0.5 / EXPORT_HZ,
-                           time_plot[-1] + 0.5 / EXPORT_HZ),
+            bins=np.append(time_plot - 0.5 / export_hz,
+                           time_plot[-1] + 0.5 / export_hz),
         ) if len(time_plot) > 1 else (np.zeros(len(time_plot), int), None)
         df_plot[f"{ch}_pulse_count"] = counts.astype(int)
         df_plot[ch] = (counts > 0).astype(int)
@@ -980,6 +1014,8 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
         "df_full": df_full,
         "df_plot": df_plot,
         "digital_events": digital_events,
+        "export_hz": export_hz,
+        "clipping": clipping,
     }
 
 
@@ -992,29 +1028,62 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
     fs = recording["fs"]
     processed = recording["processed"]
 
-    df_plot.to_csv(outdir / f"processed_jones_style_downsampled_{EXPORT_HZ:g}Hz.csv", index=False)
+    df_plot.to_csv(outdir / f"processed_jones_style_downsampled_{recording['export_hz']:g}Hz.csv", index=False)
     if save_full and df_full is not None:
         df_full.to_csv(outdir / f"processed_full_{recording['fs_analysis']:g}Hz.csv", index=False)
 
+    cfg = processed["settings"]
+    finfo = processed["fit_info"]
+    warn_list = list(processed["warnings"])
+    for k, frac in (recording.get("clipping") or {}).items():
+        if frac > 0:
+            warn_list.append(f"{k.replace('_clipping_fraction', '')}: {100 * frac:.2f}% of samples "
+                             "were at the ADC ceiling (clipping). Lower the LED current.")
     settings = {
+        "input_type": "ppd",
         "input_file": str(ppd_path),
         "subject_ID": header.get("subject_ID", ""),
+        "acquisition_mode": header.get("mode", ""),
+        "pyphotometry_version": header.get("version", ""),
         "sampling_rate_hz": fs,
         "analysis_rate_hz": recording.get("fs_analysis", fs),
+        "export_rate_hz": recording.get("export_hz"),
         "decimation_factor_after_lowpass": recording.get("decimation_factor", 1),
+        "duration_sec": recording["n_acquired_samples"] / fs,
+        "pipeline": processed["pipeline_used"],
+        "reference": ("Douglass et al. 2025 Cell Metab 37:708 (STAR Methods)"
+                      if processed["pipeline_used"] == "douglass2025"
+                      else "Akam & Walton 2019 Sci Rep 9:3521, pyPhotometry preprocess_data"),
+        "median_kernel_samples": cfg["median_kernel_samples"],
+        "median_filter_sec": cfg["median_filter_sec"],
+        "lowpass_hz": cfg["lowpass_hz"],
+        "filter_order": cfg["filter_order"],
+        "fit_method": cfg["fit_method"],
+        "negative_slope_policy": cfg["negative_slope_policy"],
+        "fit_slope_used": processed["slope"],
+        "fit_intercept_used": processed["intercept"],
+        "fit_slope_unconstrained": finfo["raw_slope"],
+        "fit_slope_clamped": finfo["slope_clamped"],
+        "fit_R2": finfo["r2"],
+        "pearson_r_405_vs_465": finfo["pearson_r_405_465"],
+        "f0_method": cfg["f0_method"],
+        "f0_lowpass_hz": cfg["f0_lowpass_hz"],
+        "F0_median_volts": processed["F0"],
+        "zscore_mode": cfg["zscore_mode"],
+        "long_term_smooth_sec": cfg["long_term_smooth_sec"],
+        "clipping_fraction": recording.get("clipping", {}),
+        "formulas": {
+            "dark_subtraction": "465 = 465_LED_on - 465_LED_off ; 405 = 405_LED_on - 405_LED_off",
+            "fitted_405": "fitted405(t) = a*405_filt(t) + b, (a,b) = least squares of 465_filt on 405_filt",
+            "deltaF": "dF(t) = 465_filt(t) - fitted405(t)",
+            "F0": "F0(t) = 0.001 Hz zero-phase low-pass of 465_filt",
+            "dFF": "dF/F0(t) = dF(t) / F0(t)   (ratio; x100 for %)",
+            "z": "z(t) = (dF/F0(t) - mean) / SD over the session",
+        },
+        "warnings": warn_list,
+        "notes": processed["notes"],
         "event_data_used": False,
         "scale_mode": scale_mode,
-        "shared_axis_limits_applied": limits is not None,
-        "lowpass_hz": LOWPASS_HZ,
-        "filter_order": FILTER_ORDER,
-        "median_filter_sec": MEDIAN_FILTER_SEC,
-        "long_term_smooth_sec": LONG_TERM_SMOOTH_SEC,
-        "motion_correction": f"{FIT_METHOD}_linear_fit_405_to_465_on_filtered_traces",
-        "baseline_method": "lowpass_filtered_465_signal_whole_session",
-        "baseline_lowpass_hz": F0_LOWPASS_HZ,
-        "F0": processed["F0"],
-        "deltaF_formula": f"{roi}_deltaF = {roi}_sig_raw - {roi}_uv_fit",
-        "dFF_formula": f"{roi}_dFF = {roi}_deltaF / F0_trace",
     }
     (outdir / "ANALYSIS_SETTINGS_NO_EVENTS_MATCHED_SCALES.json").write_text(json.dumps(settings, indent=2))
 
@@ -1025,6 +1094,9 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
                 outdir / f"event_times_{ch}.csv", index=False
             )
     (outdir / "PPD_HEADER.json").write_text(json.dumps(header, indent=2))
+
+    if not MAKE_STATIC_PLOTS:
+        return [outdir]
 
     paths = [
         plot_A(df_plot, outdir, roi, limits),
@@ -1076,11 +1148,25 @@ def parse_args():
         ),
     )
     parser.add_argument("--save-full", action="store_true", help="Also save full 20 Hz processed CSV; can be large")
+    parser.add_argument("--settings-json", default=None,
+                        help="JSON string or file with photometry_core settings overrides")
+    parser.add_argument("--export-hz", default="auto",
+                        help="'auto' (default) or a number of Hz for the graph CSV")
+    parser.add_argument("--no-static-plots", action="store_true",
+                        help="Skip the matplotlib PNGs and HTML (the web app does not use them)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    global REQUESTED_EXPORT_HZ, MAKE_STATIC_PLOTS
+    REQUESTED_EXPORT_HZ = args.export_hz
+    MAKE_STATIC_PLOTS = not args.no_static_plots
+    if args.settings_json:
+        raw = args.settings_json
+        if Path(raw).exists():
+            raw = Path(raw).read_text()
+        USER_SETTINGS.update(json.loads(raw))
 
     if args.ppd:
         ppd_paths = [find_ppd_file(Path(p)) for p in args.ppd]
@@ -1124,8 +1210,19 @@ def main():
     print(f"ZIP file: {zip_path.resolve()}")
     if limits is not None:
         print("Global axis limits saved to GLOBAL_AXIS_LIMITS_USED_FOR_ALL_RECORDINGS.json")
+    for rec in recordings:
+        p = rec["processed"]
+        print(f"[{rec['ppd_path'].name}] pipeline={p['pipeline_used']} slope={p['slope']:.4g} "
+              f"(unconstrained {p['fit_info']['raw_slope']:.4g}) R2={p['fit_info']['r2']:.3f} "
+              f"F0={p['F0']:.4g} V export={rec['export_hz']:g} Hz")
+        for w in p["warnings"]:
+            print("  WARNING:", w)
+        for w in p["notes"]:
+            print("  note:", w)
     for folder in output_folders:
         print(f"Output folder: {folder.resolve()}")
+        if not MAKE_STATIC_PLOTS:
+            continue
         print(f"  Main DF/F0 plot: {folder / f'plot_G_lowell_deltaF_DF_F0_z_{roi}.png'}")
         print(f"  Interactive HTML: {folder / f'interactive_lowell_style_no_events_{roi}.html'}")
 

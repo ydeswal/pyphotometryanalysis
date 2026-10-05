@@ -4,3 +4,4 @@ pandas>=2.0
 scipy>=1.10
 matplotlib>=3.7
 plotly>=5.18
+# Tested with: streamlit 1.65, numpy 2.4, pandas 3.0, scipy 1.17, plotly 7.1, matplotlib 3.10

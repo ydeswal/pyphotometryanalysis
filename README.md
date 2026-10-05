@@ -1,7 +1,7 @@
 # pyPhotometry Analysis (Sweeney Lab)
 
 Streamlit app for analysing pyPhotometry `.ppd` and `.csv` fiber photometry
-recordings: motion correction, dF/F, z-scoring, long-timescale visualisation,
+recordings: motion correction, dF/F0, z-scoring, long-timescale visualisation,
 and lickometer analysis.
 
 Run locally:
@@ -11,7 +11,40 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+**Every formula is explained in [`METHODS_EXPLAINED.md`](METHODS_EXPLAINED.md)**,
+which is also shown inside the app in the **Methods & math** tab.
+
 ---
+
+## October 2026 update: calculations now follow Douglass et al. 2025
+
+Default pipeline = STAR Methods of Douglass et al. (2025) *Cell Metabolism*
+37:708-722, with unstated details taken from pyPhotometry (Akam & Walton 2019),
+which the paper cites.
+
+| Fix | Before | After |
+|---|---|---|
+| Negative 405 slope | Accepted. On M16 the slope was -17.8, which subtracted the real signal and amplified 405 noise | Constrained to >= 0 with a warning (toggle in sidebar) |
+| F0 edge handling | 0.001 Hz filter held the first sample (F0 = 1.47 V on M16) | Mirror padding; F0 = 1.79 V (correct) |
+| F0 decimation | Point sampling (aliasing) | Block averaging |
+| 405 fit | IRLS default | OLS ("linear best fit", as in the paper); IRLS optional |
+| Median / filter order | 1 s / order 3 | 5 samples / order 2 (pyPhotometry) |
+| dF/F label | Ratio shown as "%" | True percent |
+| Time axis | Hours only | s / min / h automatically |
+| Export rate | Always 1 Hz | Auto: full rate for short files |
+| Diagnostics | None | Slope, R^2, F0, warnings above every recording |
+
+New sidebar section **Processing method (formulas)** exposes every setting,
+plus an alternative pyPhotometry pipeline (double-exponential bleaching
+correction). `.ppd` runs from the app skip the unused matplotlib PNGs.
+
+`python test_core.py` runs 18 test groups, including OLS = scipy linregress,
+the negative-slope guard, F0 edges, filter equivalence, and a check on the M16
+recording if it is present.
+
+---
+
+## Earlier changes (kept for reference)
 
 ## File layout
 
@@ -24,6 +57,7 @@ streamlit run app.py
 | `theme.py` | Styling and Plotly defaults |
 | `.streamlit/config.toml` | Base theme |
 | `test_core.py` | Validation suite (`python test_core.py`) |
+| `METHODS_EXPLAINED.md` | Full math + plain-language explanation (shown in app) |
 
 ---
 

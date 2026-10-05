@@ -147,8 +147,8 @@ transients = np.zeros(n)
 for s in range(500, n - 500, 1500):          # real calcium events, control-independent
     transients[s:s + 300] += 0.25 * np.exp(-np.arange(300) / 80.0)
 signal = 2.0 + true_slope * motion + transients
-_, s_ols, _ = pc.fit_control_to_signal(control, signal, method="ols")
-_, s_irls, _ = pc.fit_control_to_signal(control, signal, method="irls")
+_, s_ols, _, _ = pc.fit_control_to_signal(control, signal, method="ols")
+_, s_irls, _, _ = pc.fit_control_to_signal(control, signal, method="irls")
 print(f"    true slope {true_slope:.4f} | OLS {s_ols:.4f} | IRLS {s_irls:.4f}")
 check("IRLS closer to true slope than OLS",
       abs(s_irls - true_slope) < abs(s_ols - true_slope),
@@ -177,6 +177,84 @@ check("transient detected in z", np.nanmax(res["z_dFF"][5000:5500]) > 2.0,
       f"peak z={np.nanmax(res['z_dFF'][5000:5500]):.2f}")
 check("F0 from signal not control", abs(res["F0"] - np.nanpercentile(sg, 10)) < 0.15,
       f"F0={res['F0']:.3f} vs signal p10={np.nanpercentile(sg,10):.3f}")
+
+print("\n=== 11. OLS matches scipy.stats.linregress (the paper's 'linear best fit') ===")
+from scipy.stats import linregress
+lr = linregress(control, signal)
+_, s_o, i_o, info = pc.fit_control_to_signal(control, signal, method="ols")
+check("slope identical to linregress", abs(s_o - lr.slope) < 1e-9, f"{s_o:.6f} vs {lr.slope:.6f}")
+check("intercept identical", abs(i_o - lr.intercept) < 1e-9)
+check("R^2 identical", abs(info["r2"] - lr.rvalue**2) < 1e-9, f"{info['r2']:.4f}")
+
+print("\n=== 12. negative-slope guard ===")
+n = 4000; tt = np.arange(n) / 20.0
+real = np.where(tt > 90, 0.8, 0.0)                    # big real 465 increase
+ctl_n = 0.73 - 0.03 * real / 0.8 + 0.003 * rng.normal(size=n)   # 405 dips slightly
+sig_n = 1.46 + real + 0.005 * rng.normal(size=n)
+_, sl, ic, inf = pc.fit_control_to_signal(ctl_n, sig_n, negative_slope_policy="allow")
+check("unconstrained fit is negative and large", sl < -5, f"slope={sl:.2f}")
+fit_z, sl0, ic0, inf0 = pc.fit_control_to_signal(ctl_n, sig_n, negative_slope_policy="zero")
+check("clamped slope = 0", sl0 == 0.0 and inf0["slope_clamped"])
+check("clamped intercept = mean(465)", abs(ic0 - sig_n.mean()) < 1e-12)
+dF_allow = sig_n - (sl * ctl_n + ic); dF_zero = sig_n - fit_z
+step_allow = dF_allow[tt > 100].mean() - dF_allow[tt < 80].mean()
+step_zero = dF_zero[tt > 100].mean() - dF_zero[tt < 80].mean()
+check("negative slope erases most of the real step", abs(step_allow) < 0.2, f"{step_allow:.3f}")
+check("clamped fit preserves the real step", abs(step_zero - 0.8) < 0.02, f"{step_zero:.3f}")
+
+print("\n=== 13. F0 edge behaviour on a short recording ===")
+f0s = pc.compute_f0(sig_n, 20.0)
+check("F0 not pinned to first sample", abs(f0s[0] - sig_n[:20].mean()) > 0.2, f"F0[0]={f0s[0]:.3f}")
+check("F0 ~ session mean when record < 1/cutoff", np.max(np.abs(f0s - sig_n.mean())) < 0.05,
+      f"max dev={np.max(np.abs(f0s - sig_n.mean())):.4f}")
+
+print("\n=== 14. low-pass at Nyquist is the identity ===")
+x = rng.normal(size=1000)
+check("10 Hz low-pass at 20 Hz returns input", np.array_equal(pc.lowpass(x, 20.0, 10.0), x))
+
+print("\n=== 15. blocked filtering equals one-shot filtering ===")
+old_block = pc._FILTER_BLOCK
+y = np.cumsum(rng.normal(size=60000)).astype(np.float64)
+one = pc.lowpass(y, 130.0, 2.0)
+pc._FILTER_BLOCK = 15000
+blk = pc.lowpass(y, 130.0, 2.0)
+pc._FILTER_BLOCK = old_block
+check("block result matches", np.max(np.abs(one - blk)) < 1e-6 * np.ptp(y),
+      f"max diff={np.max(np.abs(one - blk)):.2e}")
+
+print("\n=== 16. dF/F definition ===")
+r16 = pc.process_photometry(sg, ctl, fs, {"median_kernel_samples": 0})
+check("dFF == deltaF / F0_trace", np.allclose(r16["dFF"], r16["deltaF"] / r16["F0_trace"], equal_nan=True))
+check("deltaF == sig_filt - ctl_fit", np.allclose(r16["deltaF"], r16["sig_filt"] - r16["ctl_fit"]))
+zz = r16["z_dFF"]
+check("z = (dFF-mean)/SD", np.allclose(zz, (r16["dFF"] - np.nanmean(r16["dFF"])) / np.nanstd(r16["dFF"], ddof=1)))
+
+print("\n=== 17. pyPhotometry pipeline recovers bleaching + motion ===")
+n = int(40 * 60 * 20); fs17 = 20.0; t17 = np.arange(n) / fs17
+bleach_s = 1.0 + 0.4 * np.exp(-t17 / 900)
+bleach_c = 0.6 + 0.1 * np.exp(-t17 / 1200)
+mot = 0.02 * np.sin(2 * np.pi * 0.05 * t17)
+ev = np.zeros(n); ev[(t17 % 127) < 5] = 0.05
+sig17 = bleach_s * (1 + ev) + 0.5 * mot + 0.002 * rng.normal(size=n)
+ctl17 = bleach_c + mot + 0.002 * rng.normal(size=n)
+r17 = pc.process_photometry(sig17, ctl17, fs17, {"pipeline": "pyphotometry"})
+check("pyphotometry pipeline ran", r17["pipeline_used"] == "pyphotometry")
+check("motion slope recovered (~0.5)", abs(r17["slope"] - 0.5) < 0.05, f"{r17['slope']:.3f}")
+on = r17["dFF"][(t17 % 127) < 5].mean() - r17["dFF"][(t17 % 127) > 20].mean()
+check("event dF/F recovered (~5%)", abs(on - 0.05) < 0.01, f"{100*on:.2f}%")
+
+print("\n=== 18. the uploaded M16 recording (if present) ===")
+import os
+P = "/mnt/user-data/uploads/M16_KEREM-2026-10-02-114706.ppd"
+if os.path.exists(P):
+    d = pc.read_ppd(P)
+    r18 = pc.process_photometry(d["analog_1"], d["analog_2"], d["sampling_rate"])
+    check("negative slope detected and clamped", r18["fit_info"]["slope_clamped"],
+          f"raw slope={r18['fit_info']['raw_slope']:.2f}")
+    check("F0 ~ session mean (1.79 V)", abs(r18["F0"] - float(np.mean(d["analog_1"]))) < 0.03,
+          f"F0={r18['F0']:.3f}")
+else:
+    print("  (skipped)")
 
 print("\n" + "="*60)
 print(f"RESULT: {'ALL TESTS PASSED' if not fails else str(len(fails)) + ' FAILURES: ' + ', '.join(fails)}")

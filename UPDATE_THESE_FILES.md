@@ -1,39 +1,32 @@
-# Two files must be uploaded together
+# Which files to upload to GitHub
 
-The error
-
-    module 'lickometer' has no attribute 'load_licks_csv'
-
-means `app.py` was updated on the server but `lickometer.py` was not. The new
-`app.py` calls functions that only exist in the new `lickometer.py`.
-
-## Upload both
+Upload ALL of these (they depend on each other):
 
     app.py
-    lickometer.py        <-  this is the one that was missed
+    ana.py
+    photometry_core.py        <- all the maths
+    METHODS_EXPLAINED.md      <- shown in the "Methods & math" tab
+    lickometer.py             (unchanged, included for completeness)
+    theme.py                  (unchanged)
+    requirements.txt
+    README.md
+    test_core.py
+    test_lick.py              (unchanged)
+    .gitignore
+    .streamlit/config.toml    (unchanged)
 
-Nothing else has to change for the lickometer fix. `photometry_core.py`,
-`ana.py`, `theme.py` and `requirements.txt` are included in this zip unchanged
-from your last deploy, so copying the whole folder is also safe.
+`.streamlit` starts with a dot, so it is hidden on Mac/Windows. A visible copy
+is included as `dot_streamlit/config.toml`. On GitHub's web uploader, create
+it with **Add file -> Create new file**, type `.streamlit/config.toml` as the
+name, and paste the contents.
+
+Do NOT upload `__pycache__/`, `.DS_Store`, or `.ppd` data files.
 
 ## Check it worked
 
-The Lickometer section should show a grey caption like
+Upload the M16 .ppd. Above the graphs you should see:
 
-    Detected LIQ HD raw export - time from pc_clock - 17,929 licks across 1 bottle(s) - 23.44 h
+    Pipeline: Douglass 2025 | 405->465 slope a: 0 (raw -16.9) | Fit R^2: 0.000 | F0: 1.793 V
 
-If instead you see a red box saying `lickometer.py` on the server is out of
-date, the upload did not take. Two things to check:
-
-1. On GitHub, open `lickometer.py` and search the page for `load_licks_csv`.
-   If it is not there, the file did not upload.
-2. Make sure no `__pycache__/` folder or `lickometer.pyc` was committed. A
-   stale compiled file can shadow the source. Delete it from the repo if present
-   and add `__pycache__/` to `.gitignore`.
-
-## Version pinning
-
-`lickometer.py` now carries `__version__ = "2.0"` and `app.py` checks it at
-startup. If the two ever drift apart again you get a plain message naming the
-file to update, instead of an AttributeError from somewhere in the middle of the
-page.
+plus two orange warnings (negative slope, short recording), the x-axis in
+seconds, and a "Methods & math" tab.

@@ -163,63 +163,66 @@ def time_label_from_seconds(seconds):
     return seconds_to_hms(seconds)
 
 
+def time_axis_unit(span_sec):
+    """Pick seconds, minutes or hours so a 3-minute file is not drawn on an hour axis."""
+    if span_sec <= 3 * 60:
+        return "seconds", 1.0
+    if span_sec <= 3 * 3600:
+        return "minutes", 60.0
+    return "hours", 3600.0
+
+
 def make_time_ticks(min_sec, max_sec, n=None):
     """
-    Return clean hour-based x-axis ticks.
+    Clean tick positions (in seconds, the internal x unit) and labels in the
+    unit that suits the recording length. Hover still shows HH:MM:SS.
 
-    The graph x-axis uses seconds internally so hover can still show HH:MM:SS,
-    but the visible tick labels are simple elapsed hours: 0, 1, 2, 3, ...
+    The previous version always ticked every hour; on a recording shorter than
+    an hour no tick fell inside the data, so the axis read "Time (hours)" with
+    no numbers on it.
     """
-    interval = 3600.0  # 1 hour
     min_sec = float(min_sec) if np.isfinite(min_sec) else 0.0
-    max_sec = float(max_sec) if np.isfinite(max_sec) else max(min_sec + interval, interval)
+    max_sec = float(max_sec) if np.isfinite(max_sec) else min_sec + 1.0
     if max_sec <= min_sec:
-        max_sec = min_sec + interval
-
-    start_tick = max(0.0, np.floor(min_sec / interval) * interval)
-    end_tick = np.ceil(max_sec / interval) * interval
-    ticks = np.arange(start_tick, end_tick + interval * 0.5, interval, dtype=float)
-
-    if ticks.size < 2 and (max_sec - min_sec) <= interval:
-        ticks = np.arange(0.0, max(interval, max_sec) + 1800.0, 1800.0, dtype=float)
-        labels = [f"{t / 3600:g}" for t in ticks]
-    else:
-        labels = [str(int(round(t / 3600.0))) for t in ticks]
-
-    return ticks.tolist(), labels
+        max_sec = min_sec + 1.0
+    unit, scale = time_axis_unit(max_sec - min_sec)
+    span_u = (max_sec - min_sec) / scale
+    raw_step = span_u / 8.0
+    mag = 10 ** np.floor(np.log10(raw_step)) if raw_step > 0 else 1.0
+    nice = [1, 2, 2.5, 5, 10]
+    if unit == "hours":
+        nice = [1, 2, 3, 4, 6, 12, 24]
+        mag = 1.0 if raw_step >= 1 else mag
+    step_u = next((m * mag for m in nice if m * mag >= raw_step), nice[-1] * mag)
+    start_u = np.floor(min_sec / scale / step_u) * step_u
+    ticks_u = np.arange(start_u, max_sec / scale + step_u * 0.5, step_u)
+    ticks = (ticks_u * scale).tolist()
+    labels = [f"{v:g}" for v in np.round(ticks_u, 6)]
+    return ticks, labels
 
 
 def apply_hms_xaxis(fig, df, rows=None):
-    """Show clean elapsed-hour x-axis marks while keeping HH:MM:SS hover."""
+    """Elapsed-time x axis in s / min / h depending on length; HH:MM:SS on hover."""
     if "time_sec" not in df.columns or df.empty:
         return fig
     min_sec = float(np.nanmin(df["time_sec"]))
     max_sec = float(np.nanmax(df["time_sec"]))
     tickvals, ticktext = make_time_ticks(min_sec, max_sec)
+    unit, _ = time_axis_unit(max_sec - min_sec)
+    title = f"Time ({unit})"
 
     if rows is None:
-        fig.update_xaxes(
-            title_text="Time (hours)",
-            tickmode="array",
-            tickvals=tickvals,
-            ticktext=ticktext,
-            tickangle=0,
-            automargin=True,
-        )
+        fig.update_xaxes(title_text=title, tickmode="array", tickvals=tickvals,
+                         ticktext=ticktext, tickangle=0, automargin=True)
     else:
         bottom_row = max(rows)
         for row in rows:
             show_labels = row == bottom_row
             fig.update_xaxes(
-                title_text="Time (hours)" if show_labels else "",
-                tickmode="array",
-                tickvals=tickvals,
-                ticktext=ticktext,
-                showticklabels=show_labels,
-                tickangle=0,
-                automargin=True,
-                row=row,
-                col=1,
+                title_text=title if show_labels else "",
+                tickmode="array", tickvals=tickvals, ticktext=ticktext,
+                showticklabels=show_labels, tickangle=0, automargin=True,
+                row=row, col=1,
             )
     return fig
 
@@ -372,6 +375,29 @@ def find_raw_channel_columns(df, roi):
     return None, None
 
 
+def dff_percent_column(df, roi):
+    """
+    Name of the dF/F0 column in PERCENT.
+
+    The pipeline stores {roi}_dFF as a ratio (0.05 = 5 %), exactly as the
+    paper defines dF/F0. The old graphs labelled that ratio "dFF (%)", so a 5 %
+    change was printed as "0.05 %". A percent column is now added and the
+    graphs use it.
+    """
+    pc_col = f"{roi}_dFF_percent"
+    if pc_col not in df.columns and f"{roi}_dFF" in df.columns:
+        df[pc_col] = 100.0 * pd.to_numeric(df[f"{roi}_dFF"], errors="coerce")
+    return pc_col
+
+
+def filtered_signal_column(df, roi):
+    """The 465 trace the 405 was actually fitted to (filtered), falling back to raw."""
+    for c in (f"{roi}_sig_filt", f"{roi}_sig_filt_10Hz_lowpass", f"{roi}_sig_raw"):
+        if c in df.columns:
+            return c
+    return None
+
+
 def processed_columns_exist(df, roi):
     candidates = [f"{roi}_deltaF", f"{roi}_dFF", f"{roi}_z_dFF", f"{roi}_dff", f"{roi}_z_dff"]
     return any(c in df.columns for c in candidates)
@@ -387,6 +413,7 @@ def normalize_processed_column_names(df, roi):
         y = pd.to_numeric(df[f"{roi}_dFF"], errors="coerce")
         sd = y.std(ddof=1)
         df[f"{roi}_z_dFF"] = (y - y.mean()) / sd if sd and np.isfinite(sd) else np.nan
+    dff_percent_column(df, roi)
     return df
 
 
@@ -443,28 +470,40 @@ def process_raw_csv_dataframe(df, roi, settings=None):
         f"{roi}_deltaF": res["deltaF"],
         f"{roi}_F0_trace": res["F0_trace"],
         f"{roi}_dFF": res["dFF"],
+        f"{roi}_dFF_percent": 100.0 * res["dFF"],
         f"{roi}_z_dFF": res["z_dFF"],
+        f"{roi}_z_dFF_30min_mean": pc.rolling_mean_by_time(
+            df["time_sec"].to_numpy(), res["z_dFF"], res["settings"]["long_term_smooth_sec"]),
     })
     out["elapsed_hhmmss"] = [seconds_to_hms(x) for x in out["time_sec"]]
 
     cfg = res["settings"]
+    finfo = res["fit_info"]
     settings_out = {
         "input_type": "csv_raw",
         "uv_column_used": uv_col,
         "sig_column_used": sig_col,
-        "sampling_rate_estimated_hz": fs,
+        "sampling_rate_hz": fs,
+        "duration_sec": res["duration_sec"],
+        "pipeline": res["pipeline_used"],
+        "median_kernel_samples": cfg["median_kernel_samples"],
         "median_filter_sec": cfg["median_filter_sec"],
         "lowpass_hz": cfg["lowpass_hz"],
         "filter_order": cfg["filter_order"],
         "fit_method": cfg["fit_method"],
-        "fit_slope": res["slope"],
-        "fit_intercept": res["intercept"],
+        "negative_slope_policy": cfg["negative_slope_policy"],
+        "fit_slope_used": res["slope"],
+        "fit_intercept_used": res["intercept"],
+        "fit_slope_unconstrained": finfo["raw_slope"],
+        "fit_slope_clamped": finfo["slope_clamped"],
+        "fit_R2": finfo["r2"],
+        "pearson_r_405_vs_465": finfo["pearson_r_405_465"],
         "f0_method": cfg["f0_method"],
-        "F0_median": res["F0"],
-        "dff_units": cfg["dff_units"],
+        "f0_lowpass_hz": cfg["f0_lowpass_hz"],
+        "F0_median_volts": res["F0"],
         "zscore_mode": cfg["zscore_mode"],
-        "deltaF_formula": "deltaF = filtered_465 - fit(filtered_405)",
-        "dFF_formula": "dFF = deltaF / F0(465-derived)",
+        "warnings": res["warnings"],
+        "notes": res["notes"],
     }
     return out, settings_out
 
@@ -569,9 +608,12 @@ def get_auto_limits(results, roi):
 
     return {
         "raw": finite_limits(np.concatenate([collect(f"{roi}_uv_raw"), collect(f"{roi}_sig_raw")])),
-        "fit": finite_limits(np.concatenate([collect(f"{roi}_sig_raw"), collect(f"{roi}_uv_fit")])),
+        "fit": finite_limits(np.concatenate([
+            collect(f"{roi}_sig_filt") if any(f"{roi}_sig_filt" in r["df"] for r in results)
+            else collect(f"{roi}_sig_raw"),
+            collect(f"{roi}_uv_fit")])),
         "deltaF": finite_limits(collect(f"{roi}_deltaF")),
-        "dFF": finite_limits(collect(f"{roi}_dFF")),
+        "dFF": finite_limits(collect(f"{roi}_dFF_percent")),
         "z_dFF": finite_limits(collect(f"{roi}_z_dFF")),
     }
 
@@ -601,6 +643,8 @@ def signal_columns(df, roi):
         f"{roi}_uv_fit",
         f"{roi}_deltaF",
         f"{roi}_dFF",
+        f"{roi}_dFF_percent",
+        f"{roi}_sig_filt",
         f"{roi}_z_dFF",
         f"{roi}_dff",
         f"{roi}_z_dff",
@@ -783,7 +827,7 @@ def make_processed_figure(df, roi, limits=None, events=None, exclusions=None, sh
     if f"{roi}_deltaF" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F", line=dict(color=graph_color("deltaF"))), row=1, col=1)
     if f"{roi}_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)", line=dict(color=graph_color("dff"))), row=2, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[dff_percent_column(df, roi)], mode="lines", name="dF/F0 (%)", line=dict(color=graph_color("dff"))), row=2, col=1)
     if f"{roi}_z_dFF" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_z_dFF"], mode="lines", name="z-dFF", line=dict(color=graph_color("raw_z"))), row=3, col=1)
     fig.update_yaxes(title_text="Delta-F", row=1, col=1)
@@ -805,7 +849,7 @@ def make_dual_delta_dff_figure(df, roi, limits=None, events=None, exclusions=Non
     if f"{roi}_deltaF" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_deltaF"], mode="lines", name="Delta-F", line=dict(color=graph_color("deltaF"))), secondary_y=False)
     if f"{roi}_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)", line=dict(color=graph_color("dff"))), secondary_y=True)
+        fig.add_trace(go.Scatter(x=x, y=df[dff_percent_column(df, roi)], mode="lines", name="dF/F0 (%)", line=dict(color=graph_color("dff"))), secondary_y=True)
     apply_hms_xaxis(fig, df)
     fig.update_yaxes(title_text="Delta-F", secondary_y=False)
     fig.update_yaxes(title_text="dFF (%)", secondary_y=True)
@@ -855,7 +899,7 @@ def make_zip_from_results(results, roi):
                 f"{name}/README.txt",
                 "Visual crop/zoom settings from the webpage are not applied to processed_output.csv.\n"
                 "The CSV remains the full processed data for the upload.\n\n"
-                f"Main dFF column: {roi}_dFF\n"
+                f"Main dF/F0 column: {roi}_dFF (ratio; {roi}_dFF_percent is x100)\n"
                 f"Delta-F column: {roi}_deltaF\n"
                 f"z-dFF column: {roi}_z_dFF\n",
             )
@@ -953,14 +997,17 @@ def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, sho
         vertical_spacing=0.095,
         subplot_titles=(
             "Raw 465 and 405 together",
-            "Correction check: 465 signal and fitted 405",
-            "Delta-F corrected signal",
+            "Correction check: filtered 465 and fitted 405 (a·405 + b)",
+            "Delta-F = 465 - fitted 405 (volts)",
         ),
     )
     x = df["time_sec"]
     if f"{roi}_sig_raw" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", line=dict(color=graph_color("sig_raw"))), row=1, col=1)
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_sig_raw"], mode="lines", name="Sig Raw / 465", showlegend=False, line=dict(color=graph_color("sig_raw"))), row=2, col=1)
+    fcol = filtered_signal_column(df, roi)
+    if fcol is not None:
+        # The fit is made against the FILTERED 465, so that is what it is checked against.
+        fig.add_trace(go.Scatter(x=x, y=df[fcol], mode="lines", name="465 (filtered, fitted target)", showlegend=False, line=dict(color=graph_color("sig_raw"))), row=2, col=1)
     if f"{roi}_uv_raw" in df.columns:
         fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_uv_raw"], mode="lines", name="UV Raw / 405", line=dict(color=graph_color("uv_raw"))), row=1, col=1)
     if f"{roi}_uv_fit" in df.columns:
@@ -970,7 +1017,9 @@ def make_overview_figure(df, roi, limits=None, events=None, exclusions=None, sho
 
     fig.update_yaxes(title_text="Raw", row=1, col=1)
     fig.update_yaxes(title_text="Fit", row=2, col=1)
-    fig.update_yaxes(title_text="Delta-F", row=3, col=1)
+    fig.update_yaxes(title_text="Delta-F (V)", row=3, col=1)
+    fig.update_yaxes(title_text="Raw (V)", row=1, col=1)
+    fig.update_yaxes(title_text="Fit (V)", row=2, col=1)
     apply_hms_xaxis(fig, df, rows=[1, 2, 3])
 
     if limits:
@@ -1009,11 +1058,11 @@ def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=No
 
 def make_main_dff_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=620):
     """The only dFF graph in the app."""
-    fig = make_subplots(rows=1, cols=1, subplot_titles=("Main dFF (%)",))
+    fig = make_subplots(rows=1, cols=1, subplot_titles=("dF/F0 = (465 - fitted 405) / F0",))
     x = df["time_sec"]
     if f"{roi}_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[f"{roi}_dFF"], mode="lines", name="dFF (%)", line=dict(color=graph_color("dff"))), row=1, col=1)
-    fig.update_yaxes(title_text="dFF (%)", row=1, col=1)
+        fig.add_trace(go.Scatter(x=x, y=df[dff_percent_column(df, roi)], mode="lines", name="dF/F0 (%)", line=dict(color=graph_color("dff"))), row=1, col=1)
+    fig.update_yaxes(title_text="dF/F0 (%)", row=1, col=1)
     apply_hms_xaxis(fig, df, rows=[1])
     if limits:
         apply_y_range(fig, 1, limits.get("dFF"))
@@ -1610,6 +1659,40 @@ def render_zscore_range_controls(base_key):
     }
 
 
+def render_diagnostics(settings):
+    """Fit quality, F0 and every warning the pipeline raised, above the graphs."""
+    if not settings or "fit_slope_used" not in settings:
+        return
+    c = st.columns(5)
+    c[0].metric("Pipeline", "Douglass 2025" if settings.get("pipeline") == "douglass2025" else "pyPhotometry")
+    slope_txt = f"{settings['fit_slope_used']:.3g}"
+    if settings.get("fit_slope_clamped"):
+        slope_txt += f" (raw {settings['fit_slope_unconstrained']:.3g})"
+    c[1].metric("405→465 slope a", slope_txt)
+    r2 = settings.get("fit_R2")
+    c[2].metric("Fit R²", "n/a" if r2 is None or not np.isfinite(r2) else f"{r2:.3f}")
+    c[3].metric("F0 (median)", f"{settings.get('F0_median_volts', float('nan')):.4g} V")
+    dur = settings.get("duration_sec")
+    c[4].metric("Duration", seconds_to_hms(dur) if dur else "n/a")
+    for w in settings.get("warnings", []) or []:
+        th.note(w, kind="warn")
+    notes = settings.get("notes", []) or []
+    if notes:
+        with st.expander("Processing notes"):
+            for n_ in notes:
+                st.write("- " + n_)
+
+
+METHODS_DOC = Path(__file__).with_name("METHODS_EXPLAINED.md")
+
+
+def render_methods_doc(key):
+    if METHODS_DOC.exists():
+        st.markdown(METHODS_DOC.read_text(encoding="utf-8"))
+    else:
+        st.info("METHODS_EXPLAINED.md was not found next to app.py.")
+
+
 # =============================================================================
 # SIDEBAR CONTROLS
 # =============================================================================
@@ -1646,6 +1729,57 @@ with st.sidebar:
         roi_name = st.text_input("ROI name", value="BLA")
         scale_mode = st.selectbox("Auto y-axis scaling", ["full", "robust", "none"], index=0)
         save_full = st.checkbox("Save full 20 Hz processed CSV for PPD runs", value=False)
+
+    with st.expander("Processing method (formulas)", expanded=False):
+        st.caption(
+            "Defaults reproduce Douglass et al. 2025 Cell Metabolism (STAR Methods). "
+            "See the **Methods & math** tab for every formula."
+        )
+        pipeline_label = st.selectbox(
+            "Pipeline",
+            ["Douglass et al. 2025 (paper, default)", "pyPhotometry / Akam & Walton (bleaching-corrected)"],
+            index=0,
+            help=("Paper: dF/F0 = (465 - fitted 405) / F0, F0 = 0.001 Hz low-pass of 465. "
+                  "pyPhotometry: double-exponential bleaching fit removed first, then the same "
+                  "405 regression, dF/F = corrected / bleaching curve."),
+        )
+        fit_label = st.selectbox(
+            "405 → 465 fit",
+            ["OLS linear best fit (paper)", "IRLS robust fit (Huber)"],
+            index=0,
+            help="The paper uses an ordinary least-squares 'linear best fit'.",
+        )
+        slope_guard = st.checkbox(
+            "Reject negative 405 slopes (recommended)", value=True,
+            help=("Motion moves 405 and 465 the same way, so a real artefact fit has a "
+                  "positive slope. A negative slope means the fit is eating real signal; "
+                  "when this is on, the slope is set to 0 and a warning is shown."),
+        )
+        med_k = st.number_input(
+            "Median filter kernel (samples, 0 = off)", 0, 101, int(pc.DEFAULTS["median_kernel_samples"]), 2,
+            help="Paper: 'median-filtered' (size not stated). pyPhotometry convention: 5 samples.",
+        )
+        lp_hz = st.number_input("Low-pass cutoff (Hz)", 0.1, 100.0, float(pc.DEFAULTS["lowpass_hz"]), 0.5,
+                                help="Paper: 10 Hz. At 20 Hz sampling this is the Nyquist limit, i.e. no-op.")
+        f0_hz = st.number_input("F0 low-pass cutoff (Hz)", 0.0001, 0.1, float(pc.DEFAULTS["f0_lowpass_hz"]),
+                                0.0005, format="%.4f", help="Paper: 0.001 Hz (period ≈ 16.7 min).")
+        smooth_min = st.number_input("Long-term running average (min)", 1.0, 240.0, 30.0, 1.0,
+                                     help="Paper: 30-minute running average.")
+        export_choice = st.selectbox(
+            "Graph/CSV time resolution for .ppd",
+            ["auto", "20", "10", "5", "1"], index=0,
+            help="auto = full rate for short files, 1 Hz for multi-day files.",
+        )
+    PROC_SETTINGS = {
+        "pipeline": "pyphotometry" if pipeline_label.startswith("pyPhotometry") else "douglass2025",
+        "fit_method": "irls" if fit_label.startswith("IRLS") else "ols",
+        "negative_slope_policy": "zero" if slope_guard else "allow",
+        "median_kernel_samples": int(med_k),
+        "median_filter_sec": 0.0,
+        "lowpass_hz": float(lp_hz),
+        "f0_lowpass_hz": float(f0_hz),
+        "long_term_smooth_sec": float(smooth_min) * 60.0,
+    }
 
     with st.expander("Graph display", expanded=False):
         graph_size = st.selectbox("Graph size", ["Normal", "Large", "Maximized"], index=0)
@@ -1995,6 +2129,11 @@ if run_clicked:
                     ]
                     if save_full:
                         command.append("--save-full")
+                    command += [
+                        "--settings-json", json.dumps(PROC_SETTINGS),
+                        "--export-hz", export_choice,
+                        "--no-static-plots",   # the app only reads the CSV
+                    ]
                     result = subprocess.run(command, capture_output=True, text=True)
 
                     if result.returncode != 0:
@@ -2021,10 +2160,17 @@ if run_clicked:
                                         digital_events[ch] = pd.read_csv(ev_path)["event_time_sec"].to_numpy(float)
                                     except Exception:
                                         pass
+                                run_settings = {"input_type": "ppd"}
+                                sj = csv_path.parent / "ANALYSIS_SETTINGS_NO_EVENTS_MATCHED_SCALES.json"
+                                if sj.exists():
+                                    try:
+                                        run_settings = json.loads(sj.read_text())
+                                    except Exception:
+                                        pass
                                 all_results.append({
                                     "name": csv_path.parent.name if csv_path.parent.name else csv_path.stem,
                                     "df": df,
-                                    "settings": {"input_type": "ppd", "source_csv": str(csv_path)},
+                                    "settings": run_settings,
                                     "digital_events": digital_events,
                                 })
                             except Exception as e:
@@ -2037,7 +2183,7 @@ if run_clicked:
                         if processed_columns_exist(df_in, roi_name):
                             df_out, settings = load_processed_csv_dataframe(df_in, roi_name)
                         else:
-                            df_out, settings = process_raw_csv_dataframe(df_in, roi_name)
+                            df_out, settings = process_raw_csv_dataframe(df_in, roi_name, settings=PROC_SETTINGS)
                         all_results.append({"name": csv_path.stem, "df": df_out, "settings": settings})
                     except Exception as e:
                         st.error(f"CSV analysis failed for {csv_path.name}")
@@ -2209,6 +2355,7 @@ else:
             continue
 
         st.markdown(f"## Recording {idx}: `{result['name']}`")
+        render_diagnostics(result.get("settings", {}))
 
         def render_chart(kind):
             events_for_this_graph = filter_events_for_context(
@@ -2325,7 +2472,7 @@ else:
                 )
             continue
 
-        tabs = st.tabs(["Overview", "Raw channels", "Main dFF", "Z-score sliding mean", "Z-score range analysis", "Data preview", "Settings"])
+        tabs = st.tabs(["Overview", "Raw channels", "Main dFF", "Z-score sliding mean", "Z-score range analysis", "Data preview", "Settings", "Methods & math"])
 
         with tabs[0]:
             render_chart("Overview")
@@ -2348,6 +2495,8 @@ else:
             )
         with tabs[6]:
             st.json(result.get("settings", {}))
+        with tabs[7]:
+            render_methods_doc(f"methods_{idx}")
 
     # =========================================================================
     # LICKOMETER SECTION

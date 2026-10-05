@@ -12,15 +12,20 @@ through here.
 
 Reference methods
 -----------------
-* pyPhotometry .ppd binary layout follows the official spec:
-  https://pyphotometry.readthedocs.io/en/latest/user-guide/importing-data/
-* Isosbestic fitting / dF/F recommendations follow Keevers & Jean-Richard-dit-Bressel
-  (2025) Neurophotonics 12:025003 - low-pass filter, IRLS (robust) regression of the
-  405 control onto the 465 signal, then dF/F rather than bare dF.
-* Long-timescale (multi-hour / multi-day) F0 and 30-min running means follow the
-  Lowell-lab style used for slow homeostatic signals.
-* Baseline-window z-scoring (mean/SD taken from a defined baseline epoch rather
-  than the whole session) is the standard for event-locked analysis.
+* pyPhotometry .ppd binary layout follows the official spec and the official
+  importer (pyPhotometry tools/data_import.py, Akam & Walton 2019 Sci Rep 9:3521).
+* Default pipeline ("douglass2025") follows the STAR Methods of
+  Douglass AM ... Lowell BB (2025) Cell Metabolism 37:708-722,
+  doi:10.1016/j.cmet.2024.11.009:
+    - median filter, then 10 Hz low-pass;
+    - motion correction = linear best fit of 405 onto 465, subtracted from 465;
+    - dF/F0 = (465 - fitted 405) / F0, F0 = 0.001 Hz low-pass of 465 (whole session);
+    - 30-minute running average for long-term traces; session z-scores.
+  Details the paper does not state (median kernel, filter order) are taken
+  from the pyPhotometry reference implementation the paper cites (ref. 30).
+* Alternative pipeline ("pyphotometry") reproduces pyPhotometry's
+  preprocess_data: double-exponential bleaching correction, regression on the
+  bleach-corrected traces, dF/F = motion-corrected signal / exponential fit.
 """
 
 from __future__ import annotations
@@ -58,18 +63,31 @@ __all__ = [
 # =============================================================================
 
 DEFAULTS = {
-    "median_filter_sec": 0.0,      # 0 disables; a short median filter kills sharp artefacts
-    "lowpass_hz": 10.0,            # photometry trace low-pass
-    "filter_order": 3,
-    "fit_method": "irls",          # "irls" (robust, recommended) or "ols"
-    "irls_tuning": 1.345,          # Huber tuning constant
+    # Which published pipeline to run.
+    #   "douglass2025" : Douglass et al. 2025 Cell Metab (default)
+    #   "pyphotometry" : Akam & Walton pyPhotometry preprocess_data
+    "pipeline": "douglass2025",
+    # Median filter. The paper says "median-filtered" without a kernel size;
+    # pyPhotometry specifies the kernel in SAMPLES, so that is the default here.
+    "median_kernel_samples": 5,
+    "median_filter_sec": 0.0,      # if > 0, overrides the sample kernel
+    "lowpass_hz": 10.0,            # paper: 10 Hz cutoff
+    "filter_order": 2,             # pyPhotometry uses butter(2, ...)
+    "fit_method": "ols",           # paper: "linear best fit" (= OLS / linregress)
+    "irls_tuning": 1.345,          # only used when fit_method == "irls"
+    # A motion artefact moves 405 and 465 in the SAME direction, so the slope of
+    # 465-on-405 must be positive. A negative slope means the fit is tracking
+    # biology (or 405 is not truly isosbestic), not motion.
+    #   "zero"  : clamp the slope to 0 (no motion subtraction) and warn
+    #   "allow" : keep whatever the regression returns (paper-literal)
+    "negative_slope_policy": "zero",
     "f0_method": "lowpass",        # "lowpass" | "rolling_percentile" | "percentile" | "median"
-    "f0_lowpass_hz": 0.001,        # Lowell-style very slow baseline
+    "f0_lowpass_hz": 0.001,        # paper: F0 = 0.001 Hz low-pass of 465
     "f0_percentile": 10.0,
-    "f0_window_sec": 1800.0,       # window for rolling_percentile
-    "dff_units": "ratio",          # "ratio" or "percent"
-    "zscore_mode": "session",      # "session" | "baseline" | "robust"
-    "long_term_smooth_sec": 1800.0,
+    "f0_window_sec": 1800.0,
+    "dff_units": "ratio",          # internal unit; the app displays x100 (%)
+    "zscore_mode": "session",      # paper: session z-score
+    "long_term_smooth_sec": 1800.0,  # paper: 30-min running average
     "keep_intermediates": False,
 }
 
@@ -210,6 +228,11 @@ def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
             on, off = on[:n], off[:n]
             on *= vpd[ch]
             off *= vpd[ch]
+            # Same clipping rule as the official pyPhotometry importer.
+            adc_max = float(header.get("ADC_max_value", 32768))
+            clip_thr = 0.98 * adc_max * vpd[ch]
+            out[f"analog_{ch + 1}_clipping_fraction"] = float(
+                np.mean(np.maximum(on, off) > clip_thr)) if n else 0.0
             if keep_components:
                 out[f"analog_{ch + 1}_raw_LED_on"] = on.copy()
                 out[f"analog_{ch + 1}_raw_baseline"] = off.copy()
@@ -254,24 +277,24 @@ def digital_pulse_times(digital: np.ndarray, fs: float) -> np.ndarray:
 # FILTERS
 # =============================================================================
 
-def median_filter_trace(values: np.ndarray, fs: float, window_sec: float) -> np.ndarray:
+def median_filter_trace(values: np.ndarray, fs: float, window_sec: float = 0.0,
+                        kernel_samples: int = 0) -> np.ndarray:
     """
     Median filter with edge reflection.
 
-    Uses scipy.ndimage.median_filter rather than scipy.signal.medfilt. medfilt is
-    O(n*k) and zero-pads the edges: on a 48 h recording at 130 Hz with a 1 s
-    kernel that is ~3e9 operations and it corrupts the first and last half-kernel
-    of the trace. ndimage uses a proper rolling histogram and reflects the edges.
+    kernel_samples : odd kernel width in samples (pyPhotometry convention).
+    window_sec     : alternative width in seconds; used instead when > 0.
+
+    Uses scipy.ndimage.median_filter (rolling histogram, reflected edges)
+    rather than scipy.signal.medfilt, which is O(n*k) and zero-pads the ends.
     """
-    # Preserve the input dtype. Casting float32 to float64 here doubled memory
-    # on every long recording for no numerical benefit: a 15-bit ADC value fits
-    # comfortably in float32's 24-bit mantissa.
     values = np.asarray(values)
     if not np.issubdtype(values.dtype, np.floating):
         values = values.astype(np.float32)
-    if window_sec is None or window_sec <= 0:
-        return values.copy()
-    k = int(round(float(window_sec) * float(fs)))
+    if window_sec is not None and window_sec > 0:
+        k = int(round(float(window_sec) * float(fs)))
+    else:
+        k = int(kernel_samples or 0)
     if k < 3:
         return values.copy()
     if k % 2 == 0:
@@ -281,15 +304,47 @@ def median_filter_trace(values: np.ndarray, fs: float, window_sec: float) -> np.
     return _nd_median_filter(values, size=k, mode="reflect")
 
 
-def lowpass(values, fs, cutoff_hz, order=3):
-    """
-    Zero-phase Butterworth low-pass.
+def _block_mean(values, step):
+    """Average non-overlapping blocks of `step` samples (an anti-alias filter).
 
-    For very low cutoffs (e.g. the 0.001 Hz baseline filter) a Butterworth
-    designed at the full sampling rate sits pathologically close to the unit
-    circle and loses precision. Below a normalised cutoff of 1e-3 we decimate,
-    filter on the decimated series, then interpolate back. This is both far more
-    numerically stable and dramatically faster.
+    Returns (block_means, block_centre_indices)."""
+    values = np.asarray(values)
+    n = (values.size // step) * step
+    head = values[:n].astype(np.float64).reshape(-1, step).mean(axis=1)
+    centres = np.arange(head.size, dtype=float) * step + (step - 1) / 2.0
+    if n < values.size:
+        head = np.append(head, float(np.mean(values[n:])))
+        centres = np.append(centres, n + (values.size - n - 1) / 2.0)
+    return head, centres
+
+
+def lowpass(values, fs, cutoff_hz, order=2):
+    """
+    Zero-phase Butterworth low-pass (forward + backward pass, as scipy filtfilt).
+
+    Edge handling
+    -------------
+    A zero-phase filter needs data beyond each end of the trace. scipy's default
+    pads only 3*(2*order) samples. For the 0.001 Hz F0 filter that is a fraction
+    of a second against a ~16-minute time constant, so the filter just holds the
+    value the trace STARTS at: on a short recording "F0" became the first sample
+    rather than a baseline. Here the trace is mirror-padded by three filter
+    periods (3/cutoff seconds), so the output converges to what an ideal
+    low-pass returns: the slow component, which for a recording shorter than
+    the filter period is the session mean.
+
+    Very low cutoffs
+    ----------------
+    Below a normalised cutoff of 1e-3 the trace is block-averaged down to ~20x
+    the cutoff, filtered, and interpolated back. Block averaging is itself a
+    low-pass filter, so, unlike the previous point-sampling (values[::step]),
+    fast fluctuations are not aliased into the baseline.
+
+    Cutoff at or above Nyquist
+    --------------------------
+    A signal sampled at fs contains nothing above fs/2, so the filter would be
+    the identity; the trace is returned unchanged. At 20 Hz sampling the
+    paper's 10 Hz low-pass is exactly this case.
     """
     values = np.asarray(values)
     if not np.issubdtype(values.dtype, np.floating):
@@ -300,59 +355,47 @@ def lowpass(values, fs, cutoff_hz, order=3):
         return values.copy()
 
     nyquist = fs / 2.0
-    cutoff = min(float(cutoff_hz), nyquist * 0.99)
+    if float(cutoff_hz) >= 0.99 * nyquist:
+        return values.copy()
+    cutoff = float(cutoff_hz)
     wn = cutoff / nyquist
 
     if wn < 1e-3:
         target_fs = max(cutoff * 20.0, 1e-6)
         step = max(int(np.floor(fs / target_fs)), 1)
-        if step > 1 and values.size // step >= 12:
-            idx = np.arange(0, values.size, step)
-            small = values[idx]
-            small_fs = fs / step
-            filt_small = lowpass(small, small_fs, cutoff, order=order)
-            return np.interp(
-                np.arange(values.size, dtype=float), idx.astype(float), filt_small
-            )
+        # Keep enough blocks for the filter to operate on; a short recording
+        # would otherwise collapse to a handful of points that are returned
+        # unfiltered.
+        step = min(step, max(1, values.size // 64))
+        if step > 1:
+            small, centres = _block_mean(values, step)
+            filt_small = lowpass(small, fs / step, cutoff, order=order)
+            return np.interp(np.arange(values.size, dtype=float), centres,
+                             filt_small).astype(in_dtype, copy=False)
 
     sos = butter(order, cutoff, btype="lowpass", fs=fs, output="sos")
-    padlen = 3 * (2 * order)
-    if values.size <= padlen:
-        warnings.warn("Trace too short for zero-phase filtering; returning unfiltered.")
-        return values.copy()
+    pad = int(np.ceil(3.0 * fs / cutoff))
+    pad = max(pad, 3 * (2 * order) + 1)
 
     # Long traces are filtered in overlapping blocks so peak memory does not
-    # scale with recording length. sosfiltfilt promotes its input to float64 and
-    # allocates several working copies; on a 48 h recording at 130 Hz that is
-    # over a gigabyte for a single channel, which is what made multi-day files
-    # crash. Each block is filtered with a generous margin on both sides and
-    # only the interior is kept, so the result is identical to filtering the
-    # whole array at once.
+    # scale with recording length. Each block keeps a margin on both sides and
+    # only its interior is used, so the result equals filtering in one go.
     if values.size > _FILTER_BLOCK:
-        margin = max(int(round(20.0 * fs / max(cutoff, 1e-9))), 10 * padlen)
-        margin = min(margin, values.size // 2)
+        margin = min(max(pad, int(round(20.0 * fs / cutoff))), values.size // 2)
+        padded = np.pad(values, margin, mode="symmetric")
         out = np.empty_like(values)
-        step = _FILTER_BLOCK
-        for start in range(0, values.size, step):
-            stop = min(start + step, values.size)
-            lo = max(0, start - margin)
-            hi = min(values.size, stop + margin)
-            try:
-                seg = sosfiltfilt(sos, values[lo:hi])
-            except ValueError:
-                seg = values[lo:hi].astype(np.float64)
-            out[start:stop] = seg[start - lo: stop - lo].astype(in_dtype, copy=False)
+        for start in range(0, values.size, _FILTER_BLOCK):
+            stop = min(start + _FILTER_BLOCK, values.size)
+            seg = sosfiltfilt(sos, padded[start: stop + 2 * margin].astype(np.float64),
+                              padtype=None)
+            out[start:stop] = seg[margin: margin + (stop - start)].astype(in_dtype, copy=False)
             del seg
         return out
 
-    try:
-        # sosfiltfilt promotes to float64 and makes several working copies. On a
-        # 48 h trace that is over a gigabyte per channel, so the result is cast
-        # straight back down.
-        return sosfiltfilt(sos, values).astype(in_dtype, copy=False)
-    except ValueError:
-        warnings.warn("Low-pass filter failed; returning unfiltered trace.")
-        return values.copy()
+    pad = min(pad, 5_000_000)
+    padded = np.pad(values.astype(np.float64), pad, mode="symmetric")
+    filt = sosfiltfilt(sos, padded, padtype=None)
+    return filt[pad: pad + values.size].astype(in_dtype, copy=False)
 
 
 # =============================================================================
@@ -397,11 +440,32 @@ def _irls_fit(x, y, tuning=1.345, max_iter=50, tol=1e-8):
     return float(beta[0]), float(beta[1])
 
 
-def fit_control_to_signal(control, signal, method="irls", tuning=1.345):
+def fit_control_to_signal(control, signal, method="ols", tuning=1.345,
+                          negative_slope_policy="zero"):
     """
-    Scale the 405 control onto the 465 signal.
+    Scale the 405 control onto the 465 signal:
 
-    Returns (fitted_control, slope, intercept). fitted = slope*control + intercept.
+        fitted_405(t) = a * 405(t) + b
+        (a, b) = argmin  sum_t [ 465(t) - a*405(t) - b ]^2      (OLS)
+
+    Closed form:  a = cov(405, 465) / var(405),   b = mean(465) - a*mean(405).
+
+    Returns (fitted_control, slope, intercept, info). info holds the
+    unconstrained slope, R^2 of the fit, the 405-465 Pearson r, and whether the
+    slope was clamped.
+
+    Why a negative slope is clamped
+    -------------------------------
+    The 405 channel exists because movement, fibre bending and haemodynamics
+    change the light collected at BOTH wavelengths in the same direction. Shared
+    artefacts can only produce a POSITIVE slope. A negative slope appears when
+    465 contains a large real change and 405 drifts slightly the other way,
+    which happens because GCaMP fluorescence excited at 405 nm still falls a
+    little as calcium rises (the true isosbestic point is a few nm higher). The
+    regression then multiplies the small, noisy 405 trace by a large negative
+    number to "explain" the real signal, and subtracting it deletes the biology
+    and injects amplified 405 noise. Policy "zero" applies the constraint
+    a >= 0; the constrained least-squares solution is then a = 0, b = mean(465).
     """
     control = np.asarray(control, dtype=float)
     signal = np.asarray(signal, dtype=float)
@@ -410,12 +474,25 @@ def fit_control_to_signal(control, signal, method="irls", tuning=1.345):
         raise ValueError("Not enough finite samples to fit 405 onto 465.")
 
     x, y = control[good], signal[good]
-    if method == "ols":
-        slope, intercept = _ols_fit(x, y)
-    else:
+    if method == "irls":
         slope, intercept = _irls_fit(x, y, tuning=tuning)
+    else:
+        slope, intercept = _ols_fit(x, y)
 
-    return slope * control + intercept, slope, intercept
+    raw_slope, raw_intercept = slope, intercept
+    clamped = False
+    if slope < 0 and negative_slope_policy == "zero":
+        slope, intercept = 0.0, float(np.mean(y))
+        clamped = True
+
+    fitted = slope * control + intercept
+    resid = y - (slope * x + intercept)
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - float(np.sum(resid ** 2)) / ss_tot if ss_tot > 0 else float("nan")
+    r_xy = float(np.corrcoef(x, y)[0, 1]) if x.std() > 0 and y.std() > 0 else float("nan")
+    info = {"raw_slope": float(raw_slope), "raw_intercept": float(raw_intercept),
+            "slope_clamped": clamped, "r2": r2, "pearson_r_405_465": r_xy}
+    return fitted, float(slope), float(intercept), info
 
 
 # =============================================================================
@@ -598,41 +675,77 @@ def decimate_after_lowpass(values, factor):
     return values[:n].reshape(-1, factor).mean(axis=1)
 
 
+def _double_exponential(t, const, amp_fast, amp_slow, tau_fast, tau_slow):
+    return const + amp_slow * np.exp(-t / tau_slow) + amp_fast * np.exp(-t / tau_fast)
+
+
+def fit_double_exponential(values, fs):
+    """
+    pyPhotometry photobleaching model
+
+        B(t) = c + A_fast * exp(-t/tau_fast) + A_slow * exp(-t/tau_slow)
+
+    fitted on a 1 Hz block-averaged copy with the same start values and bounds
+    as pyPhotometry tools/data_import.py (_fit_exponential). Returns the curve
+    at full rate, or None if the fit does not converge.
+    """
+    from scipy.optimize import curve_fit
+    values = np.asarray(values, dtype=float)
+    step = max(int(round(fs)), 1)
+    small, centres = _block_mean(values, step)
+    t_small = centres / fs
+    max_sig = float(np.max(values))
+    if not np.isfinite(max_sig) or max_sig <= 0 or small.size < 6:
+        return None
+    p0 = [max_sig / 2, max_sig / 4, max_sig / 4, 300, 3000]
+    bounds = ([0, 0, 0, 60, 600], [max_sig, max_sig, max_sig, 600, 36000])
+    try:
+        params, _ = curve_fit(_double_exponential, t_small, small, p0=p0,
+                              bounds=bounds, maxfev=10000)
+    except Exception:
+        return None
+    return _double_exponential(np.arange(values.size) / fs, *params)
+
+
 def process_photometry(signal_raw, control_raw, fs, settings=None,
                        baseline_mask=None, analysis_hz=None, consume=False):
     """
-    Run the full corrected pipeline on one recording.
+    Run the full pipeline on one recording.
 
-    signal_raw  : 465 nm / biosensor channel (dark-subtracted volts)
-    control_raw : 405 nm / isosbestic channel (dark-subtracted volts)
+    signal_raw  : 465 nm channel (LED-on minus LED-off, volts)
+    control_raw : 405 nm channel (LED-on minus LED-off, volts)
 
-    Order of operations:
-      1. median filter (optional) to remove sharp artefacts
-      2. low-pass filter both channels at the same cutoff
-      3. fit the filtered control onto the filtered signal (IRLS by default)
-      4. deltaF = filtered signal - fitted control      [both filtered]
-      5. F0 from the SIGNAL channel
-      6. dF/F = deltaF / F0
-      7. z-score of dF/F (session, baseline-window, or robust)
+    pipeline = "douglass2025" (default; Douglass et al. 2025 STAR Methods)
+      1. median filter both channels
+      2. 10 Hz zero-phase low-pass both channels
+      3. fitted405 = a*405 + b, (a, b) by least squares of 465 on 405
+      4. dF   = 465 - fitted405
+      5. F0   = 0.001 Hz low-pass of 465 over the whole session
+      6. dF/F0 = dF / F0
+      7. z    = (dF/F0 - mean) / SD over the session
+
+    pipeline = "pyphotometry" (Akam & Walton preprocess_data)
+      1-2 as above
+      3. B465, B405 = double-exponential bleaching fits
+      4. 465bc = 465 - B465 ; 405bc = 405 - B405
+      5. motion = a*405bc + b  (least squares of 465bc on 405bc)
+      6. dF = 465bc - motion ; F0 = B465 ; dF/F0 = dF / F0
+      7. z as above
     """
     cfg = dict(DEFAULTS)
     if settings:
-        cfg.update(settings)
+        cfg.update({k: v for k, v in settings.items() if v is not None})
 
     signal_raw = np.asarray(signal_raw)
     control_raw = np.asarray(control_raw)
-
     keep = cfg.get("keep_intermediates", False)
+    warnings_out = []
+    notes_out = []
+    fs_in = float(fs)
 
-    # Channels are taken through median + low-pass ONE AT A TIME, and each
-    # intermediate is released as soon as it has been consumed. Doing both
-    # channels stage by stage meant six full-rate arrays were alive at once;
-    # at 48 h and 130 Hz that is 540 MB of signal before any working copies.
-    #
-    # When consume=True the caller has promised it holds no other reference to
-    # the input arrays, so they can be freed here too.
     def _prep(raw):
-        med = median_filter_trace(raw, fs, cfg["median_filter_sec"])
+        med = median_filter_trace(raw, fs, cfg["median_filter_sec"],
+                                  cfg.get("median_kernel_samples", 0))
         filt = lowpass(med, fs, cfg["lowpass_hz"], cfg["filter_order"])
         return (med, filt) if keep else (None, filt)
 
@@ -645,32 +758,73 @@ def process_photometry(signal_raw, control_raw, fs, settings=None,
         del control_raw
         control_raw = None
 
+    if cfg["lowpass_hz"] >= 0.99 * fs_in / 2.0:
+        notes_out.append(
+            f"The {cfg['lowpass_hz']:g} Hz low-pass is at or above the Nyquist frequency "
+            f"({fs_in / 2:g} Hz) for {fs_in:g} Hz sampling, so it has nothing to remove "
+            "and was skipped. This is expected at 20 Hz and matches the paper.")
+
     # Optional decimation, applied only after low-pass filtering.
     decim = 1
     if analysis_hz and analysis_hz > 0 and fs > analysis_hz:
-        nyquist_needed = 2.5 * cfg["lowpass_hz"]
-        target = max(float(analysis_hz), nyquist_needed)
+        target = max(float(analysis_hz), 2.5 * cfg["lowpass_hz"])
         decim = int(max(1, np.floor(fs / target)))
         if decim > 1:
             sig_filt = decimate_after_lowpass(sig_filt, decim)
             ctl_filt = decimate_after_lowpass(ctl_filt, decim)
             fs = fs / decim
 
-    # Step 4: BOTH sides filtered. The old CSV path fitted on filtered traces but
-    # then subtracted from the RAW traces, reinjecting all the high-frequency
-    # noise it had just removed and making dF/F far noisier than intended.
-    ctl_fit, slope, intercept = fit_control_to_signal(
-        ctl_filt, sig_filt, method=cfg["fit_method"], tuning=cfg["irls_tuning"]
-    )
-    delta_f = sig_filt - ctl_fit
+    duration = sig_filt.size / float(fs)
+    pipeline = cfg.get("pipeline", "douglass2025")
+    sig_exp = ctl_exp = None
 
-    f0 = compute_f0(
-        sig_filt, fs,
-        method=cfg["f0_method"],
-        lowpass_hz=cfg["f0_lowpass_hz"],
-        percentile=cfg["f0_percentile"],
-        window_sec=cfg["f0_window_sec"],
-    )
+    if pipeline == "pyphotometry":
+        sig_exp = fit_double_exponential(sig_filt, fs)
+        ctl_exp = fit_double_exponential(ctl_filt, fs)
+        if sig_exp is None or ctl_exp is None:
+            warnings_out.append(
+                "Double-exponential bleaching fit did not converge; fell back to the "
+                "Douglass 2025 pipeline for this recording.")
+            pipeline = "douglass2025"
+
+    if pipeline == "pyphotometry":
+        sig_bc = sig_filt - sig_exp
+        ctl_bc = ctl_filt - ctl_exp
+        motion, slope, intercept, finfo = fit_control_to_signal(
+            ctl_bc, sig_bc, method=cfg["fit_method"], tuning=cfg["irls_tuning"],
+            negative_slope_policy=cfg["negative_slope_policy"])
+        delta_f = sig_bc - motion
+        f0 = sig_exp
+        ctl_fit = sig_exp + motion      # 465-scale model, for the correction plot
+    else:
+        ctl_fit, slope, intercept, finfo = fit_control_to_signal(
+            ctl_filt, sig_filt, method=cfg["fit_method"], tuning=cfg["irls_tuning"],
+            negative_slope_policy=cfg["negative_slope_policy"])
+        delta_f = sig_filt - ctl_fit
+        f0 = compute_f0(
+            sig_filt, fs,
+            method=cfg["f0_method"],
+            lowpass_hz=cfg["f0_lowpass_hz"],
+            percentile=cfg["f0_percentile"],
+            window_sec=cfg["f0_window_sec"],
+        )
+        if cfg["f0_method"] == "lowpass" and duration < 1.0 / cfg["f0_lowpass_hz"]:
+            warnings_out.append(
+                f"Recording is {duration / 60:.1f} min long, shorter than one period of the "
+                f"{cfg['f0_lowpass_hz']:g} Hz F0 filter ({1 / cfg['f0_lowpass_hz'] / 60:.1f} min). "
+                "F0 is therefore essentially the session mean of the 465 signal. The paper's "
+                "F0 was designed for multi-hour to multi-day recordings.")
+
+    if finfo["slope_clamped"]:
+        warnings_out.append(
+            f"The 405-to-465 fit gave a NEGATIVE slope ({finfo['raw_slope']:.3g}). A motion "
+            "artefact cannot do that, so the slope was set to 0 and nothing but a constant "
+            "was subtracted. This usually means 465 contains a large real change that 405 "
+            "does not share. Inspect the raw traces for movement artefacts by eye.")
+    elif np.isfinite(finfo["r2"]) and finfo["r2"] < 0.05:
+        warnings_out.append(
+            f"405 explains only {100 * finfo['r2']:.1f}% of the 465 variance, so motion "
+            "correction removed very little. That is fine if the animal moved little.")
 
     dff = delta_f / f0
     if cfg["dff_units"] == "percent":
@@ -690,5 +844,10 @@ def process_photometry(signal_raw, control_raw, fs, settings=None,
         "F0_trace": f0, "F0": float(np.nanmedian(f0)),
         "dFF": dff, "z_dFF": z,
         "slope": slope, "intercept": intercept,
+        "fit_info": finfo,
+        "pipeline_used": pipeline,
+        "duration_sec": duration,
+        "warnings": warnings_out,
+        "notes": notes_out,
         "settings": cfg,
     }
