@@ -79,6 +79,52 @@ official importer.
 Subtracting that is like weighing an empty cup first, so you only count the
 water.
 
+### Files with PC timestamps
+
+The modified acquisition program writes an 8-byte PC timestamp (a float64,
+seconds since 1970 UTC) after each sample's four words, so a sample is
+16 bytes, not 8. The header declares this (`"pc_timestamps": true`,
+`"bytes_per_sample": 16`). The app reads it from the header. A reader that
+does not know about it takes each timestamp for two extra samples, which
+doubles the duration and turns the trace into a sawtooth.
+
+### The time axis and the clock
+
+Sample $k$ is placed at
+
+$$t_k = \frac{k}{f_s}, \qquad \text{clock}_k = T_0 + t_k$$
+
+where $T_0$ is the PC clock time of the first sample.
+
+$T_0$ comes from the per-sample timestamps. A timestamp is when the PC
+*received* a sample (acquisition time plus a USB delay that is never
+negative). So the recording is cut into 30-second blocks, and the
+5th-percentile of $\text{stamp}_k - k/f_s$ in each block is taken as the
+lower envelope. A straight line through those blocks gives $T_0$ (its
+intercept) and the drift between the two clocks (its slope).
+
+Why $k/f_s$ and not the stamps themselves: the stamps come from the Windows
+performance counter, anchored once at the start, and they can run at a
+slightly different rate from the Windows wall clock. In m10 they gained 2.38 s
+in 24 h (27.6 ppm). pyPhotometry writes `end_time` from the wall clock when
+the file closes. $k/f_s$ puts the last sample 0.30 s before it (the time
+taken to stop); the stamps put it 2.08 s after it, which cannot happen. So the
+board's sample clock, anchored to the wall clock at the start, is the better
+match for other devices that log wall-clock time (FED3 `PC_Timestamp`, LIQ HD
+`pc_clock`). The sidebar can switch to the stamps
+($t_k$ = fitted stamp − $T_0$).
+
+**Lost samples.** If samples are lost, the PC sees time pass that the sample
+counter does not. The block lower envelope then steps up and stays up. Steps
+over 0.2 s are located to the exact sample, and the time axis jumps by the
+step. A step *down* can only be the PC clock being set back, so it is ignored.
+
+**In plain words.** The photometry box counts its own ticks very evenly, 20 per
+second. The PC writes down when each tick arrived, but its handwriting is a
+little shaky and its watch runs slightly fast. So we read the PC's note for
+the *first* tick to know when the recording started, then count ticks from
+there. We also check the PC's notes to make sure no ticks went missing.
+
 ---
 
 ## Step 1. Median filter

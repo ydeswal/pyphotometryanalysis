@@ -16,6 +16,74 @@ which is also shown inside the app in the **Methods & math** tab.
 
 ---
 
+## 15 October 2026: PC-timestamped `.ppd` files
+
+**Symptom.** A recording made with the modified acquisition program that
+writes PC timestamps showed **twice its real duration** (47:51:36 for a
+23:55:48 file), a sawtooth instead of a trace, a negative 405 slope with
+R² = 0.000, and about 2% "clipping".
+
+**Cause.** That program stores each sample as the usual 4 data words
+(8 bytes) **followed by an 8-byte PC timestamp**, 16 bytes in all; the
+header says so (`"pc_timestamps": true, "bytes_per_sample": 16`). Every
+standard reader assumes 8 bytes, including this app's previous version and the
+official pyPhotometry importer. It took each timestamp for two more samples of
+light. Nothing in the file was damaged.
+
+**Fix.** `photometry_core.read_ppd` reads the layout from the header, and
+detects it from the data if an unlabelled file turns up. It also recovers
+files whose last sample was cut off mid-write. On `m10_fasted-2026-10-14`:
+
+| | Before | After |
+|---|---|---|
+| Duration | 47:51:36 | **23:55:48** |
+| 405→465 slope | −0.738, clamped to 0 | **+2.66** |
+| Fit R² | 0.000 | **0.892** |
+| Clipping | 2.09% | **0%** |
+| Start time | none | **2026-10-14 10:23:00.423** (UTC−5) |
+
+**Wall-clock time is kept.** Every processed CSV now has `clock_unix` and
+`clock_time` columns. Hovering any trace shows its clock time, and a line under
+the summary cards gives the start and end. Files without PC timestamps get
+`clock_time` from the header `date_time`. A lick CSV with clock timestamps
+(e.g. LIQ HD `pc_clock`) is now **shifted onto the photometry clock**. Before,
+it was laid over the photometry as if both had started at the same instant.
+
+**Which clock?** Each PC timestamp is the moment the PC *received* a sample
+(jitter about 3 ms). The stamps come from the Windows performance counter,
+anchored to the wall clock once at the start. On m10 they gained **2.38 s over
+the day** relative to the board's sample counter. pyPhotometry writes
+`end_time` from the Windows wall clock when the file closes. That time is
+**0.30 s after** the last sample on the sample clock, but **2.08 s before** the
+last PC stamp, which is impossible unless the stamps drifted. So by default:
+
+- **Time axis = board sample clock, anchored to the PC clock at the first
+  sample.** This matches the wall clock that FED3 `PC_Timestamp` and LIQ HD
+  `pc_clock` use.
+- The PC stamps are used for the start time, to **detect lost samples** (a
+  forward jump in PC time that the sample counter does not show; the time axis
+  then includes the gap), and for the cross-check above. All of it is reported
+  under *Processing notes*.
+- *Processing method → Time axis* switches to following the stamps instead.
+
+**Recovering files for other software.** `python3 convert_ppd.py file.ppd`
+writes `file_standard.ppd` (a standard 8-byte file that any reader opens
+correctly, checked against the official pyPhotometry importer), plus
+`file_pc_timestamps.csv.gz` (every raw stamp) and `file_clock_report.json`. The
+standard file keeps the PC start time in its header, so this app still shows
+clock times for it. The original file is never modified.
+`python3 check_ppd.py file.ppd` reports the layout, the clock checks and a
+verdict for any file.
+
+Also fixed: a file truncated mid-frame used to "fall back" to the other frame
+layout whenever that divided the data, which silently misread it. The declared
+layout is now kept and only the incomplete frame is dropped.
+
+`test_core.py` sections 19–23 cover all of this, including the real m10 file
+when it is in the folder.
+
+---
+
 ## October 2026 update: calculations now follow Douglass et al. 2025
 
 Default pipeline = STAR Methods of Douglass et al. (2025) *Cell Metabolism*
@@ -52,7 +120,9 @@ recording if it is present.
 |---|---|
 | `app.py` | Streamlit interface |
 | `ana.py` | Batch `.ppd` command-line pipeline (called by `app.py`) |
-| `photometry_core.py` | **All maths.** Single source of truth |
+| `photometry_core.py` | **All maths.** Single source of truth, including `.ppd` reading and the clock model |
+| `convert_ppd.py` | PC-timestamped `.ppd` → standard `.ppd` + timestamps (for other software) |
+| `check_ppd.py` | Diagnose any `.ppd`: layout, clock, duration, verdict |
 | `lickometer.py` | Lick ingestion, bout detection, peri-event alignment |
 | `theme.py` | Styling and Plotly defaults |
 | `.streamlit/config.toml` | Base theme |

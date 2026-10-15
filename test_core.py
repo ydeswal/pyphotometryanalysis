@@ -256,6 +256,169 @@ if os.path.exists(P):
 else:
     print("  (skipped)")
 
+print("\n=== 19. PC-timestamped .ppd (16 bytes per sample) ===")
+
+
+def write_ppd_pc(path, n, fs=20.0, declare=True, drift_ppm=27.6, jitter=0.003,
+                 gap_at=None, gap_sec=0.0, step_back_at=None, tail_bytes=0,
+                 start_unix=1_791_991_380.4, dig1=None, end_time=None, utc_off=-18000):
+    """Pulsed v1.1 frames, each followed by a float64 PC 'arrival' timestamp."""
+    tt = np.arange(n) / fs
+    on1 = 0.9 + 0.05 * np.sin(2 * np.pi * 0.01 * tt); off1 = 0.02 + 0 * tt
+    on2 = 0.6 + 0.04 * np.sin(2 * np.pi * 0.01 * tt); off2 = 0.01 + 0 * tt
+    to_u16 = lambda v, d: ((np.round(v / VPD).astype(np.int64) << 1) | d).astype("<u2")
+    words = np.empty((n, 4), "<u2")
+    words[:, 0] = to_u16(on1, dig1 if dig1 is not None else 0)
+    words[:, 1] = to_u16(off1, 0); words[:, 2] = to_u16(on2, 0); words[:, 3] = to_u16(off2, 0)
+    pc_t = start_unix + tt * (1 + drift_ppm * 1e-6) + np.abs(rng.normal(0, jitter, n))
+    if gap_at is not None:
+        pc_t[gap_at:] += gap_sec
+    if step_back_at is not None:
+        pc_t[step_back_at:] -= 1.5
+    rec = np.empty(n, dtype=[("w", "<u2", (4,)), ("t", "<f8")])
+    rec["w"] = words; rec["t"] = pc_t
+    hdr = {"subject_ID": "pc", "date_time": "2026-10-14T10:23:00.385", "mode": "2EX_1EM_pulsed",
+           "sampling_rate": fs, "version": "1.1", "volts_per_division": [VPD, VPD],
+           "n_analog_signals": 2, "n_digital_signals": 2, "ADC_max_value": 32768}
+    if end_time:
+        hdr["end_time"] = end_time
+    if declare:
+        hdr.update({"pc_timestamps": True, "words_per_sample": 4, "bytes_per_sample": 16,
+                    "pc_clock": {"format": "unix_epoch_seconds_float64",
+                                 "anchor_unix_s": start_unix, "utc_offset_s": utc_off}})
+    hb = json.dumps(hdr).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<H", len(hb))); f.write(hb); f.write(rec.tobytes())
+        f.write(b"\x00" * tail_bytes)
+    return on1 - off1, on2 - off2, pc_t
+
+
+n19 = 20 * 3600 * 2          # 2 h at 20 Hz
+lick19 = (rng.random(n19) < 0.01).astype(np.uint8)
+s1, s2, pct = write_ppd_pc("t_pc.ppd", n19, dig1=lick19)
+d = pc.read_ppd("t_pc.ppd", with_time=True)
+c = d["clock"]
+check("sample count not doubled", d["n_samples"] == n19, f"{d['n_samples']} vs {n19}")
+check("duration correct (2 h, not 4 h)", abs(d["duration_sec"] - 7200) < 0.1, f"{d['duration_sec']:.1f}")
+check("analog_1 recovered", approx(d["analog_1"], s1, 1e-4))
+check("analog_2 recovered", approx(d["analog_2"], s2, 1e-4))
+check("digital recovered", np.array_equal(d["digital_1"], lick19))
+check("no fake clipping", d["analog_1_clipping_fraction"] == 0.0)
+check("start time = first acquisition, within 5 ms", abs(c["start_unix"] - 1_791_991_380.4) < 0.005,
+      f"{(c['start_unix'] - 1_791_991_380.4) * 1e3:.2f} ms")
+check("drift measured (27.6 ppm)", abs(c["pc_drift_ppm"] - 27.6) < 1.0, f"{c['pc_drift_ppm']:.2f}")
+check("default time axis is the sample clock", np.allclose(d["time_sec"], np.arange(n19) / 20.0))
+check("no gaps reported", c["gaps"] == [])
+cols = pc.clock_columns(c, d["time_sec"][[0, -1]])
+check("clock_time in local time (UTC-5)", cols["clock_time"][0].startswith("2026-10-14 10:23:00"),
+      cols["clock_time"][0])
+dp = pc.read_ppd("t_pc.ppd", with_time=True, clock_source="pc")
+check("pc time axis follows the stamps (jitter removed)",
+      np.max(np.abs(dp["time_sec"] + dp["clock"]["start_unix"] - pct)) < 0.03,
+      f"max dev {np.max(np.abs(dp['time_sec'] + dp['clock']['start_unix'] - pct)) * 1e3:.1f} ms")
+
+write_ppd_pc("t_pc_undeclared.ppd", n19, declare=False)
+du = pc.read_ppd("t_pc_undeclared.ppd")
+check("undeclared timestamps detected from the data", du["clock"]["has_pc_timestamps"]
+      and du["n_samples"] == n19, du.get("layout_note", ""))
+
+write_ppd_pc("t_pc_trunc.ppd", 4000, tail_bytes=11)
+dt_ = pc.read_ppd("t_pc_trunc.ppd")
+check("interrupted file: partial last sample dropped, rest recovered",
+      dt_["n_samples"] == 4000 and any("incomplete" in w for w in dt_["clock"]["warnings"]))
+
+s1g, _, _ = write_ppd_pc("t_pc_gap.ppd", n19, gap_at=50_000, gap_sec=12.0)
+dg = pc.read_ppd("t_pc_gap.ppd", with_time=True)
+g = dg["clock"]["gaps"]
+check("lost samples detected", len(g) == 1 and abs(g[0]["gap_sec"] - 12.0) < 0.05,
+      str(g))
+check("gap located to the sample", len(g) == 1 and abs(g[0]["at_sample"] - 50_000) <= 1,
+      str(g[0]["at_sample"]) if g else "")
+check("time axis jumps over the gap",
+      abs(dg["time_sec"][50_000] - dg["time_sec"][49_999] - (0.05 + 12.0)) < 0.06,
+      f"{dg['time_sec'][50_000] - dg['time_sec'][49_999]:.3f} s")
+ev = pc.digital_pulse_times(np.r_[np.zeros(60_000, np.uint8), 1, np.zeros(9, np.uint8)], 20.0,
+                            clock=dg["clock"])
+check("digital event after a gap gets the gap-corrected time",
+      abs(ev[0] - (60_000 / 20.0 + 12.0)) < 0.06, f"{ev}")
+
+write_ppd_pc("t_pc_back.ppd", n19, step_back_at=60_000)
+db = pc.read_ppd("t_pc_back.ppd", with_time=True)
+check("PC clock set back: not treated as lost samples", db["clock"]["gaps"] == []
+      and np.allclose(db["time_sec"], np.arange(n19) / 20.0))
+
+# 10:23:00.4 local + 2 h = 12:23:00.35 last sample on the sample clock; stamps
+# drifting 300 ppm put it 2.2 s later, i.e. after the wall-clock end_time.
+write_ppd_pc("t_pc_end.ppd", n19, end_time="2026-10-14T12:23:00.700",
+             start_unix=1_791_991_380.4, drift_ppm=300)
+de = pc.read_ppd("t_pc_end.ppd")
+chk = de["clock"]["end_time_check"]
+check("end_time cross-check agrees with the sample clock",
+      chk is not None and 0 < chk["end_minus_last_sample_sec"] < 1, str(chk))
+dep = pc.read_ppd("t_pc_end.ppd", clock_source="pc")
+check("end_time cross-check flags drifted PC stamps",
+      any("end_time" in w for w in dep["clock"]["warnings"]))
+
+print("\n=== 20. standard files unaffected; truncated standard file not misread ===")
+write_ppd("t_new_trunc.ppd", "2EX_1EM_pulsed", "1.1.1", N, g_on, g_off, i_on, i_off, dig1=lick)
+with open("t_new_trunc.ppd", "ab") as f:
+    f.write(b"\x10\x00\x20\x00")            # half a frame: 2 words of 4
+d20 = pc.read_ppd("t_new_trunc.ppd")
+check("layout kept (no fall-back to 2 words/frame)",
+      d20["frame_layout"] == "pulsed_v1.1_led_on_off" and d20["n_samples"] == N,
+      f"{d20['frame_layout']} n={d20['n_samples']}")
+check("data intact", approx(d20["analog_1"], g_on - g_off, 1e-4))
+d20b = pc.read_ppd("t_new.ppd")
+check("standard file: no PC timestamps, start from header",
+      not d20b["clock"]["has_pc_timestamps"] and d20b["clock"]["start_local"].startswith("2026-01-01"))
+
+print("\n=== 21. convert_ppd round trip ===")
+import convert_ppd, io, contextlib
+with contextlib.redirect_stdout(io.StringIO()):
+    outp = convert_ppd.convert("t_pc_gap.ppd", outdir="t_conv")
+dc = pc.read_ppd(outp, with_time=True)
+check("converted file is standard size (8 bytes/sample)",
+      os.path.getsize(outp) < os.path.getsize("t_pc_gap.ppd") * 0.55)
+check("converted data identical", approx(dc["analog_1"], s1g, 1e-4))
+check("converted file keeps start time", abs(dc["clock"]["start_unix"] - dg["clock"]["start_unix"]) < 1e-6)
+check("converted file keeps the gap", np.allclose(dc["time_sec"], dg["time_sec"]))
+ts = pd.read_csv("t_conv/t_pc_gap_pc_timestamps.csv.gz")
+check("timestamps sidecar complete", len(ts) == n19 and list(ts.columns) == ["sample", "pc_unix"])
+
+print("\n=== 22. app: lick-file clock alignment helper ===")
+import ast
+src = open("app.py").read()
+fn = next(nd for nd in ast.parse(src).body
+          if isinstance(nd, ast.FunctionDef) and nd.name == "_clock_offset_sec")
+ns = {"pd": pd}
+exec(compile(ast.Module([fn], []), "app.py", "exec"), ns)
+off = ns["_clock_offset_sec"](pd.Timestamp("2026-10-14 11:00:00"),
+                              {"start_clock_local": "2026-10-14T10:23:00.423", "utc_offset_s": -18000})
+check("naive local clocks", abs(off - (36 * 60 + 59.577)) < 1e-6, f"{off}")
+off = ns["_clock_offset_sec"](pd.Timestamp("2026-10-14 16:00:00", tz="UTC"),
+                              {"start_clock_local": "2026-10-14T10:23:00.423", "utc_offset_s": -18000})
+check("UTC lick clock converted to the recording's offset", abs(off - (36 * 60 + 59.577)) < 1e-6,
+      f"{off}")
+check("no start clock -> no alignment",
+      ns["_clock_offset_sec"](pd.Timestamp("2026-10-14 11:00"), {}) is None)
+
+print("\n=== 23. a real PC-timestamped recording (if present) ===")
+import glob
+cands = glob.glob("m10_fasted*.ppd") + glob.glob("/mnt/user-data/uploads/*m10_fasted*.ppd")
+if cands:
+    d = pc.read_ppd(cands[0])
+    r23 = pc.process_photometry(d["analog_1"], d["analog_2"], d["sampling_rate"])
+    check("23.93 h, not 47.86 h", abs(d["duration_sec"] / 3600 - 23.93) < 0.01,
+          f"{d['duration_sec'] / 3600:.3f} h")
+    check("no clipping (the 2.09% was timestamp bytes)", d["analog_1_clipping_fraction"] == 0.0)
+    check("positive 405 slope, good fit", r23["slope"] > 0 and r23["fit_info"]["r2"] > 0.8,
+          f"slope={r23['slope']:.3f} R2={r23['fit_info']['r2']:.3f}")
+    check("no lost samples", d["clock"]["gaps"] == [])
+    check("end_time 0-1 s after last sample",
+          0 < d["clock"]["end_time_check"]["end_minus_last_sample_sec"] < 1)
+else:
+    print("  (skipped)")
+
 print("\n" + "="*60)
 print(f"RESULT: {'ALL TESTS PASSED' if not fails else str(len(fails)) + ' FAILURES: ' + ', '.join(fails)}")
 sys.exit(1 if fails else 0)

@@ -167,7 +167,9 @@ def read_ppd(ppd_path: Path):
     Returns (header, sampling_rate, signals_dict) - note the third element is now
     a dict of named signals rather than an anonymous voltage matrix.
     """
-    data = pc.read_ppd(ppd_path)
+    # PC-timestamped files (16 bytes per sample) are recognised here too; the
+    # time model and wall-clock start are in data["clock"].
+    data = pc.read_ppd(ppd_path, clock_source=USER_SETTINGS.get("clock_source", "sample"))
     return data["header"], data["sampling_rate"], data
 
 
@@ -884,13 +886,14 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
     given, and that path warns about its size.
     """
     header, fs, data = read_ppd(ppd_path)
+    clock = data["clock"]
     uv_raw, sig_raw = extract_channels(data)
     n_acquired = len(sig_raw)
     clipping = {k: data[k] for k in ("analog_1_clipping_fraction", "analog_2_clipping_fraction") if k in data}
     fs_analysis_expected = fs
     if ANALYSIS_HZ and fs > ANALYSIS_HZ:
         fs_analysis_expected = fs / max(1, int(np.floor(fs / max(ANALYSIS_HZ, 2.5 * LOWPASS_HZ))))
-    export_hz = choose_export_hz(n_acquired / fs, fs_analysis_expected, REQUESTED_EXPORT_HZ)
+    export_hz = choose_export_hz(clock["duration_sec"], fs_analysis_expected, REQUESTED_EXPORT_HZ)
 
     # Bin the raw channels down to the export rate BEFORE they are handed to
     # the analysis, because the analysis frees them to save memory. These small
@@ -919,12 +922,16 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
     digital_events = {}
     for ch in ("digital_1", "digital_2"):
         if ch in data:
-            digital_events[ch] = pc.digital_pulse_times(data[ch], fs)
+            digital_events[ch] = pc.digital_pulse_times(data[ch], fs, clock=clock)
             data[ch] = None          # edge times extracted; drop the raw channel
 
     n_analysis = len(processed["dFF"])
-    time_analysis = np.arange(n_analysis, dtype=np.float64) / fs_analysis
+    # Analysis sample j is the block of acquisition samples starting at j*decim.
+    # The clock model maps sample index to elapsed seconds; for a file without
+    # gaps this is exactly j*decim/fs, as before.
+    time_analysis = pc.ppd_time_axis(clock, n_analysis, step=decim)
 
+    data_layout_note = data.get("layout_note", "")
     data.clear()
 
     df_full = None
@@ -946,11 +953,15 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
             roi,
         )
         for ch, arr in digital_events.items():
-            col = np.zeros(n_analysis, dtype=int)
-            idx = (np.asarray(arr) * fs_analysis).astype(int)
-            idx = idx[(idx >= 0) & (idx < n_analysis)]
+            col = np.zeros(n_min, dtype=int)
+            # Position by time, not by index*rate, so gaps are respected.
+            idx = np.searchsorted(time_analysis[:n_min], np.asarray(arr), side="right") - 1
+            idx = idx[(idx >= 0) & (idx < n_min)]
             col[idx] = 1
             df_full[ch] = col
+        for name, values in reversed(list(
+                pc.clock_columns(clock, df_full["time_sec"].to_numpy()).items())):
+            df_full.insert(2, name, values)
 
     # Build the export frame directly from decimated arrays.
     step = max(int(round(fs_analysis / export_hz)), 1)
@@ -1002,6 +1013,10 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
 
     # Only now, on ~173k rows rather than ~22M, is the HH:MM:SS column built.
     df_plot["elapsed_hhmmss"] = [seconds_to_hms(x) for x in df_plot["time_sec"]]
+    # Wall-clock time of every row (from the PC clock when the file carries
+    # per-sample PC timestamps, otherwise from the header start time).
+    for name, values in reversed(list(pc.clock_columns(clock, time_plot).items())):
+        df_plot.insert(2, name, values)
 
     return {
         "ppd_path": ppd_path,
@@ -1016,6 +1031,8 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
         "digital_events": digital_events,
         "export_hz": export_hz,
         "clipping": clipping,
+        "clock": clock,
+        "layout_note": data_layout_note,
     }
 
 
@@ -1034,7 +1051,10 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
 
     cfg = processed["settings"]
     finfo = processed["fit_info"]
-    warn_list = list(processed["warnings"])
+    clock = recording.get("clock") or {}
+    # Clock warnings first: if the time axis is suspect, nothing else is
+    # worth reading until that is understood.
+    warn_list = list(clock.get("warnings", [])) + list(processed["warnings"])
     for k, frac in (recording.get("clipping") or {}).items():
         if frac > 0:
             warn_list.append(f"{k.replace('_clipping_fraction', '')}: {100 * frac:.2f}% of samples "
@@ -1049,7 +1069,17 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
         "analysis_rate_hz": recording.get("fs_analysis", fs),
         "export_rate_hz": recording.get("export_hz"),
         "decimation_factor_after_lowpass": recording.get("decimation_factor", 1),
-        "duration_sec": recording["n_acquired_samples"] / fs,
+        "duration_sec": clock.get("duration_sec", recording["n_acquired_samples"] / fs),
+        "n_samples": recording["n_acquired_samples"],
+        "file_layout": recording.get("layout_note", ""),
+        "pc_timestamps": bool(clock.get("has_pc_timestamps")),
+        "time_axis": clock.get("source", "sample"),
+        "start_clock_local": clock.get("start_local"),
+        "start_clock_unix": clock.get("start_unix"),
+        "utc_offset_s": clock.get("utc_offset_s"),
+        "clock_check": {k: clock.get(k) for k in (
+            "pc_drift_ppm", "pc_drift_sec", "pc_jitter_ms", "gaps", "end_time_check",
+            "segments")},
         "pipeline": processed["pipeline_used"],
         "reference": ("Douglass et al. 2025 Cell Metab 37:708 (STAR Methods)"
                       if processed["pipeline_used"] == "douglass2025"
@@ -1081,7 +1111,8 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
             "z": "z(t) = (dF/F0(t) - mean) / SD over the session",
         },
         "warnings": warn_list,
-        "notes": processed["notes"],
+        "notes": ([recording["layout_note"]] if recording.get("layout_note") else [])
+                 + list(clock.get("notes", [])) + list(processed["notes"]),
         "event_data_used": False,
         "scale_mode": scale_mode,
     }
@@ -1212,9 +1243,18 @@ def main():
         print("Global axis limits saved to GLOBAL_AXIS_LIMITS_USED_FOR_ALL_RECORDINGS.json")
     for rec in recordings:
         p = rec["processed"]
+        ck = rec.get("clock") or {}
         print(f"[{rec['ppd_path'].name}] pipeline={p['pipeline_used']} slope={p['slope']:.4g} "
               f"(unconstrained {p['fit_info']['raw_slope']:.4g}) R2={p['fit_info']['r2']:.3f} "
-              f"F0={p['F0']:.4g} V export={rec['export_hz']:g} Hz")
+              f"F0={p['F0']:.4g} V export={rec['export_hz']:g} Hz "
+              f"duration={seconds_to_hms(ck.get('duration_sec', 0))} "
+              f"start={ck.get('start_local')} time_axis={ck.get('source')}")
+        if rec.get("layout_note"):
+            print("  file:", rec["layout_note"])
+        for w in ck.get("warnings", []):
+            print("  WARNING:", w)
+        for w in ck.get("notes", []):
+            print("  clock:", w)
         for w in p["warnings"]:
             print("  WARNING:", w)
         for w in p["notes"]:

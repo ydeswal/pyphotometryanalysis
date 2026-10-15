@@ -45,6 +45,10 @@ _FILTER_BLOCK = 2_000_000
 
 __all__ = [
     "read_ppd",
+    "ppd_time_axis",
+    "samples_to_seconds",
+    "clock_columns",
+    "digital_pulse_times",
     "decimate_after_lowpass",
     "median_filter_trace",
     "lowpass",
@@ -115,11 +119,9 @@ def _parse_version(version_string) -> tuple:
 
 
 def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
-             with_time=False) -> dict:
+             with_time=False, clock_source="sample") -> dict:
     """
     Read a pyPhotometry .ppd file into named signals.
-
-    THIS IS THE MOST IMPORTANT CORRECTION IN THIS PROJECT.
 
     The .ppd data block is a flat stream of little-endian uint16. In each 2-byte
     word the top 15 bits are an analog sample and the bottom bit is a digital
@@ -138,29 +140,39 @@ def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
         word 0 : analog channel 1 (already baseline-subtracted on-board)
         word 1 : analog channel 2
       -> analog_1 = w0, analog_2 = w1
-      -> digital_1 = LSB of w0, digital_2 = LSB of w1
 
-    The previous code always reshaped to 4 columns, because it computed
-    `n_analog_signals + n_digital_signals` = 2 + 2 = 4. That happens to be right
-    for new-format pulsed files but is silently, badly wrong for continuous-mode
-    or pre-v1.1 files: it interleaves two consecutive timepoints and then
-    subtracts 405 from 465 twice, so "signal" and "isosbestic" become the same
-    quantity and every downstream number is meaningless.
+    PC-timestamped files (a modified acquisition program; header carries
+    "pc_timestamps": true and "bytes_per_sample"): each sample is the frame
+    above FOLLOWED BY an 8-byte float64 PC timestamp (Unix seconds), so a
+    sample is 16 bytes instead of 8. A reader that does not know this takes
+    every timestamp for two extra frames of analog data: the duration doubles
+    and every third and fourth "frame" is the bytes of a float, which plot as a
+    sawtooth and wreck the 405 fit. See _pc_layout() and build_clock_model().
 
-    Returns a dict with analog_1, analog_2, digital_1, digital_2, time_sec,
-    sampling_rate, header, frame_layout, plus the raw LED-on/LED-off components
-    when the file is new-format pulsed.
+    clock_source
+        "sample" (default): elapsed time comes from the board's sample counter
+                  (k / fs), anchored to the PC clock at sample 0. The per-sample
+                  PC timestamps are used to find the start time, to detect lost
+                  samples, and to cross-check the clock, but not to stretch the
+                  time axis. See build_clock_model() for why.
+        "pc"    : elapsed time follows the per-sample PC timestamps (jitter
+                  removed by a piecewise-linear fit).
+
+    Returns a dict with analog_1, analog_2, digital_1, digital_2, sampling_rate,
+    header, frame_layout, a "clock" dict (start time, time model, checks), and
+    time_sec when with_time=True.
     """
     ppd_path = Path(ppd_path)
     dtype = np.dtype(dtype)
     with open(ppd_path, "rb") as f:
         header_size = int.from_bytes(f.read(2), "little")
         header = json.loads(f.read(header_size).decode("utf-8"))
-        raw = np.frombuffer(f.read(), dtype="<u2")
+        buf = f.read()
 
     fs = float(header["sampling_rate"])
     mode = str(header.get("mode", "")).strip()
     version = _parse_version(header.get("version", "0.0.0"))
+    read_warnings = []
 
     n_analog = _header_int(
         header, "n_analog_channels", "n_analog_signals", default=2
@@ -174,32 +186,53 @@ def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
     while len(vpd) < n_analog:
         vpd.append(vpd[-1])
 
-    # Do NOT convert the whole stream at once. For a 48 h recording the data
-    # block is 90 million uint16 words; `(raw >> 1).astype(np.float64)` would
-    # allocate a single 719 MB array before a single channel is extracted.
-    # Channels are sliced out of the uint16 buffer first and converted
-    # individually, in float32 - a 15-bit ADC value needs 15 bits of mantissa
-    # and float32 has 24, so nothing is lost.
+    # Do NOT convert the whole stream at once: channels are sliced out of the
+    # uint16 buffer and converted individually, in float32 (15-bit ADC values
+    # fit in float32's 24-bit mantissa, so nothing is lost).
 
     # ---- decide the frame layout -------------------------------------------
     is_pulsed = "pulsed" in mode.lower()
     new_format = version >= (1, 1)
     words_per_frame = 2 * n_analog if (is_pulsed and new_format) else n_analog
 
-    # Fall back gracefully if the declared layout does not divide the data.
-    if raw.size % words_per_frame != 0:
-        alt = n_analog if words_per_frame != n_analog else 2 * n_analog
-        if raw.size % alt == 0:
-            warnings.warn(
-                f"{ppd_path.name}: data length {raw.size} is not divisible by the "
-                f"expected {words_per_frame} words/frame; falling back to {alt}."
-            )
-            words_per_frame = alt
-        else:
-            raise ValueError(
-                f"{ppd_path.name}: data length {raw.size} is divisible by neither "
-                f"{words_per_frame} nor {alt} words per frame."
-            )
+    pc_layout = _pc_layout(header, buf, words_per_frame, fs)
+    pc_t = None
+    if pc_layout is not None:
+        bps, wps, how = pc_layout
+        if wps != words_per_frame:
+            read_warnings.append(
+                f"The header says {wps} words per sample but mode '{mode}' / version "
+                f"{header.get('version')} implies {words_per_frame}. Using {wps}.")
+            words_per_frame = wps
+        n_samples_file = len(buf) // bps
+        if len(buf) % bps:
+            read_warnings.append(
+                f"The file ends with {len(buf) % bps} bytes of an incomplete sample "
+                "(acquisition was probably interrupted mid-write). They were dropped; "
+                "every complete sample was recovered.")
+        rec = np.frombuffer(buf, dtype=np.dtype({
+            "names": ["w", "t"], "formats": [("<u2", (wps,)), "<f8"],
+            "offsets": [0, 2 * wps], "itemsize": bps}), count=n_samples_file)
+        frames = rec["w"]                 # (n, wps) strided view, no copy
+        pc_t = rec["t"]                   # (n,) strided view, no copy
+        layout_note = (f"PC-timestamped samples: {bps} bytes each = {wps} data "
+                       f"words + an 8-byte PC timestamp ({how}).")
+    else:
+        if len(buf) % 2:
+            buf = buf[:-1]
+        raw = np.frombuffer(buf, dtype="<u2")
+        n_samples_file = raw.size // words_per_frame
+        if raw.size % words_per_frame:
+            # Previously this "fell back" to the other layout whenever it
+            # divided the data. That turns a file truncated mid-frame into a
+            # silently misread one, so the declared layout is now kept and only
+            # the incomplete last frame is dropped.
+            read_warnings.append(
+                f"The data block holds {raw.size} words, not a whole number of "
+                f"{words_per_frame}-word frames; the incomplete last frame was dropped "
+                "(acquisition was probably interrupted mid-write).")
+        frames = raw[: n_samples_file * words_per_frame].reshape(-1, words_per_frame)
+        layout_note = f"{words_per_frame} data words per sample, no PC timestamps."
 
     out = {
         "header": header,
@@ -209,67 +242,503 @@ def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
         "subject_ID": header.get("subject_ID", ""),
         "n_analog_channels": n_analog,
         "volts_per_division": vpd,
+        "layout_note": layout_note,
     }
 
-    def _analog(offset):
-        """Slice one interleaved stream and convert just that slice."""
-        return (raw[offset::words_per_frame] >> 1).astype(dtype)
+    def _analog(col):
+        return (frames[:, col] >> 1).astype(dtype)
 
-    def _digital(offset):
-        return (raw[offset::words_per_frame] & 1).astype(np.uint8)
+    def _digital(col):
+        return (frames[:, col] & 1).astype(np.uint8)
 
+    adc_max = float(header.get("ADC_max_value", 32768))
     if words_per_frame == 2 * n_analog:
         # New-format pulsed: LED-on and LED-off stored separately.
         out["frame_layout"] = "pulsed_v1.1_led_on_off"
         for ch in range(n_analog):
             on = _analog(2 * ch)
             off = _analog(2 * ch + 1)
-            n = min(len(on), len(off))
-            on, off = on[:n], off[:n]
             on *= vpd[ch]
             off *= vpd[ch]
             # Same clipping rule as the official pyPhotometry importer.
-            adc_max = float(header.get("ADC_max_value", 32768))
             clip_thr = 0.98 * adc_max * vpd[ch]
             out[f"analog_{ch + 1}_clipping_fraction"] = float(
-                np.mean(np.maximum(on, off) > clip_thr)) if n else 0.0
+                np.mean(np.maximum(on, off) > clip_thr)) if on.size else 0.0
             if keep_components:
                 out[f"analog_{ch + 1}_raw_LED_on"] = on.copy()
                 out[f"analog_{ch + 1}_raw_baseline"] = off.copy()
             on -= off          # in place; avoids a third full-length array
             out[f"analog_{ch + 1}"] = on
-            out[f"digital_{ch + 1}"] = _digital(2 * ch)[:n]
+            out[f"digital_{ch + 1}"] = _digital(2 * ch)
             del off
-    else:
+    elif words_per_frame == n_analog:
         # Continuous, or pulsed written before v1.1 (already dark-subtracted).
         out["frame_layout"] = "one_word_per_channel"
         for ch in range(n_analog):
             sig = _analog(ch)
             sig *= vpd[ch]
             out[f"analog_{ch + 1}"] = sig
-            out[f"digital_{ch + 1}"] = _digital(ch)[: len(sig)]
+            out[f"digital_{ch + 1}"] = _digital(ch)
+    else:
+        raise ValueError(
+            f"{ppd_path.name}: {words_per_frame} words per sample does not match "
+            f"{n_analog} analog channels in either known layout.")
 
-    del raw
     n_samples = len(out["analog_1"])
+    clock = build_clock_model(header, fs, n_samples, pc_t, clock_source=clock_source)
+    if keep_components and pc_t is not None:
+        out["pc_time_unix"] = np.array(pc_t, dtype=np.float64)
+    del frames, pc_t, buf
 
+    clock["warnings"] = read_warnings + clock["warnings"]
+    out["clock"] = clock
     out["n_samples"] = n_samples
-    out["duration_sec"] = n_samples / fs
-    # The time axis is NOT materialised by default. At 48 h it is 180 MB of
-    # float64 - 45% of everything this function retains - and it is trivially
-    # reconstructible as arange(n)/fs. Callers that need it ask for it.
-    # float64 is required: at 48 h the values reach 172,800 and float32 would
-    # quantise them to about 0.01 s.
+    out["duration_sec"] = clock["duration_sec"]
+    # The time axis is NOT materialised by default (180 MB of float64 at 48 h,
+    # 130 Hz). Callers that need it ask for it, or use ppd_time_axis().
     if with_time:
-        out["time_sec"] = np.arange(n_samples, dtype=np.float64) / fs
+        out["time_sec"] = ppd_time_axis(clock, n_samples)
     return out
 
 
-def digital_pulse_times(digital: np.ndarray, fs: float) -> np.ndarray:
-    """Rising-edge times (seconds) of a digital channel. Used for lickometer TTL."""
+# =============================================================================
+# PC CLOCK
+# =============================================================================
+
+_UNIX_LO, _UNIX_HI = 946_684_800.0, 4_102_444_800.0     # years 2000 .. 2100
+
+
+def _ts_view(buf, wps, bps, count):
+    return np.frombuffer(buf, dtype=np.dtype({
+        "names": ["t"], "formats": ["<f8"], "offsets": [2 * wps],
+        "itemsize": bps}), count=count)["t"]
+
+
+def _plausible_timestamps(t, fs):
+    """Do these look like per-sample Unix timestamps at roughly 1/fs spacing?"""
+    t = np.asarray(t, dtype=float)
+    if t.size < 3 or not np.all(np.isfinite(t)):
+        return False
+    if t.min() < _UNIX_LO or t.max() > _UNIX_HI:
+        return False
+    d = np.diff(t)
+    if np.mean(d >= -1e-3) < 0.99:
+        return False
+    med = float(np.median(d))
+    return 0.5 / fs < med < 2.0 / fs
+
+
+def _pc_layout(header, buf, words_per_frame, fs):
+    """
+    Work out whether every sample is followed by an 8-byte PC timestamp.
+
+    Returns (bytes_per_sample, words_per_sample, how) or None for a standard
+    file. The header is trusted first ("pc_timestamps", "bytes_per_sample",
+    "words_per_sample"). If it says nothing, the data are sniffed: a standard
+    file can only be mistaken for a timestamped one if its analog words happen
+    to spell out a monotonic run of float64 Unix times ticking at 1/fs, which
+    does not happen by chance. This catches timestamped files written by an
+    earlier version of the modified acquisition code that did not label itself.
+    """
+    wps_h = header.get("words_per_sample")
+    bps_h = header.get("bytes_per_sample")
+    declared = bool(header.get("pc_timestamps")) or (
+        bps_h is not None and int(bps_h) != 2 * int(wps_h or words_per_frame))
+    if declared:
+        wps = int(wps_h or words_per_frame)
+        bps = int(bps_h or 2 * wps + 8)
+        if bps - 2 * wps != 8:
+            raise ValueError(
+                f"Header declares {bps} bytes per sample for {wps} data words; only "
+                "an 8-byte (float64) PC timestamp per sample is supported.")
+        fmt = str((header.get("pc_clock") or {}).get("format", "float64"))
+        if "float64" not in fmt and "f8" not in fmt:
+            raise ValueError(f"Unsupported PC timestamp format '{fmt}'.")
+        n = len(buf) // bps
+        if n >= 3 and not _plausible_timestamps(_ts_view(buf, wps, bps, min(n, 2000)), fs):
+            warnings.warn("Header declares PC timestamps but the first ones do not "
+                          "look like Unix seconds at the sampling rate.")
+        return bps, wps, "declared in the header"
+
+    for wps in dict.fromkeys((words_per_frame, 4, 2)):
+        bps = 2 * wps + 8
+        n = len(buf) // bps
+        if n < 3:
+            continue
+        if _plausible_timestamps(_ts_view(buf, wps, bps, min(n, 2000)), fs):
+            return bps, wps, "detected from the data; the header does not declare it"
+    return None
+
+
+def _parse_local(text):
+    """Header times are local wall-clock ISO strings, possibly with an offset."""
+    if not text:
+        return None
+    try:
+        ts = pd.Timestamp(str(text))
+    except (ValueError, TypeError):
+        return None
+    return ts.tz_localize(None) if ts.tzinfo is not None else ts
+
+
+def _block_levels(t_pc, fs, block):
+    """
+    Per block of samples: (centre index, 5th-percentile of PC time minus the
+    nominal sample time). A timestamp is the moment the PC RECEIVED the sample,
+    i.e. acquisition time plus a USB/OS delay that is never negative, so the
+    lower envelope is the best estimate of when samples were actually taken.
+    """
+    n = t_pc.size
+    t_ref = float(t_pc[0]) if np.isfinite(t_pc[0]) else float(np.nanmin(t_pc[:1000]))
+    centres, levels = [], []
+    for s in range(0, n, block):
+        e = min(n, s + block)
+        off = np.asarray(t_pc[s:e], dtype=np.float64) - t_ref - np.arange(s, e) / fs
+        off = off[np.isfinite(off)]
+        if off.size < max(5, (e - s) // 4):
+            continue
+        centres.append((s + e - 1) / 2.0)
+        levels.append(float(np.percentile(off, 5)))
+    return t_ref, np.asarray(centres), np.asarray(levels)
+
+
+def _find_steps(centres, levels, thr):
+    """Persistent jumps in the block levels: (block index, size in seconds)."""
+    steps, j, nb = [], 0, levels.size
+    d = np.diff(levels)
+    while j < nb - 1:
+        if abs(d[j]) > thr:
+            before = float(np.median(levels[max(0, j - 2): j + 1]))
+            after = float(np.median(levels[j + 1: min(nb, j + 4)]))
+            if abs(after - before) > thr:
+                steps.append((j, after - before))
+                j += 3
+                continue
+        j += 1
+    return steps
+
+
+def _refine_step(t_pc, t_ref, fs, lo, hi, before, step):
+    """Sample index where a step of `step` seconds happens inside [lo, hi)."""
+    k = np.arange(lo, hi)
+    off = np.asarray(t_pc[lo:hi], dtype=np.float64) - t_ref - k / fs
+    off = np.where(np.isfinite(off), off, np.nan)
+    half = before + step / 2.0
+    if step > 0:
+        # Arrival delays only push timestamps later, so the first sample from
+        # which every later timestamp stays above the midpoint is the jump.
+        rev_min = np.fmin.accumulate(off[::-1])[::-1]
+        idx = np.flatnonzero(rev_min > half)
+    else:
+        idx = np.flatnonzero(off < half)
+    return int(lo + (idx[0] if idx.size else (hi - lo) // 2))
+
+
+def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
+    """
+    Map sample index -> elapsed seconds and wall-clock time, and check it.
+
+    Why the default time axis is the board's sample clock, not the raw PC stamps
+    ---------------------------------------------------------------------------
+    A PC timestamp is when the PC RECEIVED a sample over USB, not when it was
+    taken: individual stamps jitter by milliseconds. More importantly, the
+    modified acquisition code derives them from the Windows performance
+    counter, anchored to the wall clock once at the start. The performance
+    counter and the Windows wall clock (the clock FED3 PC_Timestamp, LIQ HD
+    pc_clock and anything else using the system time are on) can run at
+    slightly different rates. On m10_fasted-2026-10-14 the per-sample stamps
+    gained 2.4 s on the sample counter over 23.9 h, while the header's end_time,
+    written from the wall clock when recording stopped, sits 0.3 s after the
+    sample-clock prediction and 2.1 s BEFORE the last PC stamp, which is only
+    possible if the stamps drifted. So the sample counter, anchored once to the
+    wall clock, tracks wall-clock time better than the stamps do. The stamps
+    remain essential for three things: the start time, detecting samples that
+    were lost (a step in PC time the sample counter does not show), and this
+    cross-check. clock_source="pc" follows the stamps instead.
+
+    Returns a dict:
+      source          "sample" | "pc" | "header" (no PC stamps; start from
+                      the header date_time)
+      start_unix      Unix time of sample 0 (None without PC stamps)
+      start_local     local wall-clock time of sample 0, ISO string
+      utc_offset_s    from the header, when recorded
+      segments        list of {i0, i1, t0, dt}: elapsed(i) = t0 + (i - i0) * dt
+      duration_sec, pc_drift_ppm, pc_drift_sec, gaps, end_time_check,
+      notes, warnings
+    """
+    notes, warns = [], []
+    pc_info = header.get("pc_clock") or {}
+    utc_offset = pc_info.get("utc_offset_s")
+    clock = {
+        "source": "header", "has_pc_timestamps": pc_t is not None,
+        "start_unix": None, "start_local": None, "utc_offset_s": utc_offset,
+        "segments": [{"i0": 0, "i1": int(n_samples), "t0": 0.0, "dt": 1.0 / fs}],
+        "duration_sec": n_samples / fs, "gaps": [], "pc_drift_ppm": None,
+        "pc_drift_sec": None, "pc_jitter_ms": None, "end_time_check": None,
+        "notes": notes, "warnings": warns,
+    }
+    start_hdr = _parse_local(header.get("date_time"))
+
+    if pc_t is None and header.get("first_sample_unix") is not None:
+        # A file written by convert_ppd.py: the PC timestamps were moved to a
+        # sidecar, but the PC-clock start time and any lost-sample gaps were
+        # kept in the header.
+        clock.update(source="sample", start_unix=float(header["first_sample_unix"]),
+                     start_local=header.get("first_sample_local"),
+                     utc_offset_s=header.get("utc_offset_s", utc_offset),
+                     pc_drift_ppm=header.get("pc_clock_drift_ppm"))
+        segs, total = [], 0.0
+        gaps = sorted(header.get("lost_sample_gaps") or [], key=lambda g: g["at_sample"])
+        bounds = [0] + [int(g["at_sample"]) for g in gaps] + [int(n_samples)]
+        for s in range(len(bounds) - 1):
+            if s > 0:
+                total += float(gaps[s - 1]["gap_sec"])
+            segs.append({"i0": bounds[s], "i1": bounds[s + 1],
+                         "t0": bounds[s] / fs + total, "dt": 1.0 / fs})
+        clock["segments"] = segs
+        clock["gaps"] = gaps
+        clock["duration_sec"] = segs[-1]["t0"] + (segs[-1]["i1"] - segs[-1]["i0"]) / fs
+        notes.append(
+            f"Converted from a PC-timestamped file ({header.get('converted_from_pc_timestamped_ppd')}). "
+            f"First sample at {str(clock['start_local'])[:23].replace('T', ' ')} on the PC clock"
+            + (f"; {len(gaps)} lost-sample gap(s) restored from the header." if gaps else "."))
+        _end_time_check(clock, header, start_hdr, fs, n_samples)
+        return clock
+
+    if pc_t is None or n_samples < 10:
+        if start_hdr is not None:
+            clock["start_local"] = start_hdr.isoformat()
+            notes.append(
+                f"No per-sample PC timestamps. Clock times are the header start time "
+                f"({start_hdr:%Y-%m-%d %H:%M:%S}) plus elapsed time on the sample clock.")
+        _end_time_check(clock, header, start_hdr, fs, n_samples)
+        return clock
+
+    finite = np.isfinite(pc_t)
+    if finite.mean() < 0.99 or not _plausible_timestamps(pc_t[:2000][finite[:2000]], fs):
+        warns.append("The per-sample PC timestamps are missing or implausible; they "
+                     "were ignored and the sample clock was used.")
+        clock["has_pc_timestamps"] = False
+        if start_hdr is not None:
+            clock["start_local"] = start_hdr.isoformat()
+        return clock
+
+    block = max(int(round(30.0 * fs)), 50)          # 30-second blocks
+    t_ref, centres, levels = _block_levels(pc_t, fs, block)
+    thr = max(0.2, 3.0 / fs)
+    steps = _find_steps(centres, levels, thr)
+
+    # Split into segments at persistent steps. A forward step means the PC saw
+    # time pass that the sample counter did not: samples were lost (or the PC
+    # clock was moved forward). A backward step cannot be lost samples; it is
+    # the PC clock being set back, and is ignored for the sample-clock axis.
+    bounds, gaps, ignored = [0], [], []
+    for j, size in steps:
+        lo = int(max(0, centres[j] - block))
+        hi = int(min(n_samples, centres[min(j + 1, centres.size - 1)] + block))
+        before = float(np.median(levels[max(0, j - 2): j + 1]))
+        i_step = _refine_step(pc_t, t_ref, fs, lo, hi, before, size)
+        if size > 0:
+            bounds.append(i_step)
+            gaps.append({"at_sample": i_step, "gap_sec": float(size)})
+        else:
+            ignored.append((i_step, float(size)))
+    bounds.append(int(n_samples))
+
+    # Linear fit of PC time against sample index within each segment, on the
+    # block lower envelopes (jitter-free). level(c) = a + b*c.
+    seg_fits = []
+    for s in range(len(bounds) - 1):
+        i0, i1 = bounds[s], bounds[s + 1]
+        sel = (centres >= i0) & (centres < i1)
+        if sel.sum() >= 2:
+            b, a = np.polyfit(centres[sel], levels[sel], 1)
+        elif sel.sum() == 1:
+            a, b = float(levels[sel][0]), 0.0
+        else:
+            k = np.arange(i0, min(i1, i0 + block))
+            o = np.asarray(pc_t[i0:i0 + k.size], float) - t_ref - k / fs
+            a, b = float(np.nanpercentile(o, 5)), 0.0
+        seg_fits.append((i0, i1, float(a), float(b)))
+
+    start_unix = t_ref + seg_fits[0][2]               # fitted PC time of sample 0
+    clock["start_unix"] = float(start_unix)
+    tz = None
+    if utc_offset is not None:
+        import datetime as _dt
+        tz = _dt.timezone(_dt.timedelta(seconds=float(utc_offset)))
+        clock["start_local"] = pd.Timestamp(start_unix, unit="s", tz="UTC") \
+            .tz_convert(tz).tz_localize(None).isoformat()
+    elif start_hdr is not None:
+        # No offset recorded: take it from the header's local start time.
+        off = round((start_hdr - pd.Timestamp(start_unix, unit="s")).total_seconds() / 900) * 900
+        clock["utc_offset_s"] = utc_offset = int(off)
+        clock["start_local"] = (pd.Timestamp(start_unix, unit="s")
+                                + pd.Timedelta(seconds=off)).isoformat()
+
+    # Diagnostics on the longest segment.
+    longest = max(seg_fits, key=lambda f: f[1] - f[0])
+    clock["pc_drift_ppm"] = float(longest[3] * fs * 1e6)
+    span = n_samples / fs
+    clock["pc_drift_sec"] = float(longest[3] * fs * span)
+    sl = slice(0, min(n_samples, 20 * block))
+    k = np.arange(sl.stop)
+    resid = (np.asarray(pc_t[sl], float) - t_ref - k / fs
+             - (seg_fits[0][2] + seg_fits[0][3] * k))
+    clock["pc_jitter_ms"] = float(np.nanstd(resid) * 1e3)
+
+    # Build the time model.
+    source = clock_source if clock_source in ("sample", "pc") else "sample"
+    if source == "pc" and ignored:
+        warns.append("The PC clock jumped backwards during the recording, so the "
+                     "PC-timestamp time axis would run backwards; the sample clock "
+                     "was used instead.")
+        source = "sample"
+    segs, gap_total = [], 0.0
+    for s, (i0, i1, a, b) in enumerate(seg_fits):
+        if source == "pc":
+            t0 = (i0 / fs + a + b * i0) - seg_fits[0][2]
+            dt = 1.0 / fs + b
+        else:
+            if s > 0:
+                gap_total += gaps[s - 1]["gap_sec"]
+            t0 = i0 / fs + gap_total
+            dt = 1.0 / fs
+        segs.append({"i0": int(i0), "i1": int(i1), "t0": float(t0), "dt": float(dt)})
+    clock["segments"] = segs
+    clock["source"] = source
+    last = segs[-1]
+    clock["duration_sec"] = float(last["t0"] + (last["i1"] - last["i0"]) * last["dt"])
+    for g, sg in zip(gaps, segs[1:]):
+        g["at_elapsed_sec"] = sg["t0"] - g["gap_sec"]
+    clock["gaps"] = gaps
+
+    start_txt = (pd.Timestamp(clock["start_local"]).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                 if clock["start_local"] else f"Unix {start_unix:.3f}")
+    off_txt = (f" (UTC{int(utc_offset) // 3600:+03d}:{abs(int(utc_offset)) % 3600 // 60:02d})"
+               if utc_offset is not None else "")
+    notes.append(
+        f"First sample taken at {start_txt}{off_txt} on the PC clock. "
+        f"PC timestamp jitter {clock['pc_jitter_ms']:.1f} ms (USB delivery).")
+    notes.append(
+        f"PC timestamps vs the board's sample clock: {clock['pc_drift_ppm']:+.1f} ppm, "
+        f"i.e. {clock['pc_drift_sec']:+.2f} s over the {span / 3600:.2f} h recording.")
+    notes.append(
+        "Time axis: " + ("board sample clock, anchored to the PC clock at the first "
+                         "sample (default)." if source == "sample" else
+                         "per-sample PC timestamps (piecewise-linear fit)."))
+    if not gaps and not ignored:
+        notes.append("No lost samples: the PC timestamps run continuously from the "
+                     "first sample to the last.")
+    for g in gaps:
+        warns.append(
+            f"The PC timestamps jump forward by {g['gap_sec']:.2f} s at elapsed "
+            f"{g['at_elapsed_sec'] / 3600:.3f} h (sample {g['at_sample']:,}) while the "
+            "sample counter does not, so samples were lost there (or the PC clock was "
+            "moved forward). The time axis includes the gap; filtering still treats "
+            "the data on either side as continuous.")
+    for i_step, size in ignored:
+        notes.append(f"The PC clock was set back by {-size:.2f} s near sample {i_step:,}. "
+                     "That cannot be lost samples and does not affect the time axis.")
+    if abs(clock["pc_drift_ppm"]) > 200:
+        warns.append(f"The PC timestamps and the sample clock disagree by "
+                     f"{clock['pc_drift_ppm']:.0f} ppm, far more than two crystals "
+                     "should. Check the sampling rate in the header.")
+
+    _end_time_check(clock, header, start_hdr, fs, n_samples)
+    return clock
+
+
+def _end_time_check(clock, header, start_hdr, fs, n_samples):
+    """Compare the header's end_time (wall clock at stop) with both predictions."""
+    end_hdr = _parse_local(header.get("end_time"))
+    start = _parse_local(clock.get("start_local")) or start_hdr
+    if end_hdr is None or start is None:
+        return
+    segs = clock["segments"]
+    last_elapsed = segs[-1]["t0"] + (segs[-1]["i1"] - 1 - segs[-1]["i0"]) * segs[-1]["dt"]
+    pred = start + pd.Timedelta(seconds=last_elapsed)
+    lag = (end_hdr - pred).total_seconds()
+    chk = {"end_time": end_hdr.isoformat(), "predicted_last_sample": pred.isoformat(),
+           "end_minus_last_sample_sec": float(lag)}
+    if clock.get("pc_drift_sec") is not None and clock["source"] == "sample":
+        pc_pred = pred + pd.Timedelta(seconds=clock["pc_drift_sec"])
+        chk["pc_stamp_last_sample"] = pc_pred.isoformat()
+        chk["end_minus_pc_last_sample_sec"] = float((end_hdr - pc_pred).total_seconds())
+    clock["end_time_check"] = chk
+    if -0.5 <= lag <= 10:
+        clock["notes"].append(
+            f"Cross-check: the header end_time ({end_hdr.strftime('%H:%M:%S.%f')[:-3]}) "
+            f"falls {lag:.2f} s after the last sample on this time axis, as it should.")
+        if chk.get("end_minus_pc_last_sample_sec", 0) < -0.5:
+            clock["notes"].append(
+                f"The raw PC stamps would put the last sample "
+                f"{-chk['end_minus_pc_last_sample_sec']:.2f} s AFTER end_time, which is "
+                "impossible, so they drifted from the wall clock; that is why the time "
+                "axis follows the sample clock.")
+    else:
+        msg = (f"The header end_time ({end_hdr.strftime('%H:%M:%S.%f')[:-3]}) is "
+               f"{lag:+.2f} s from the last sample on this time axis "
+               f"({pred.strftime('%H:%M:%S.%f')[:-3]}); it should be slightly after it.")
+        if clock["source"] == "pc":
+            msg += (" The per-sample PC timestamps have drifted from the wall clock. For "
+                    "aligning with other devices that log the PC wall clock (FED3 "
+                    "PC_Timestamp, LIQ HD pc_clock), use the sample-clock time axis.")
+        else:
+            msg += " Check the time axis before aligning to other devices."
+        clock["warnings"].append(msg)
+
+
+def samples_to_seconds(clock, idx):
+    """Elapsed seconds for (possibly fractional) sample indices."""
+    idx = np.asarray(idx, dtype=np.float64)
+    segs = clock["segments"]
+    if len(segs) == 1:
+        s = segs[0]
+        return s["t0"] + (idx - s["i0"]) * s["dt"]
+    starts = np.array([s["i0"] for s in segs], dtype=np.float64)
+    which = np.clip(np.searchsorted(starts, idx, side="right") - 1, 0, len(segs) - 1)
+    t0 = np.array([s["t0"] for s in segs])[which]
+    i0 = starts[which]
+    dt = np.array([s["dt"] for s in segs])[which]
+    return t0 + (idx - i0) * dt
+
+
+def ppd_time_axis(clock, n_samples, step=1):
+    """Elapsed seconds of samples 0, step, 2*step, ... (float64)."""
+    n_out = int(n_samples)
+    return samples_to_seconds(clock, np.arange(n_out, dtype=np.float64) * step)
+
+
+def clock_columns(clock, time_sec):
+    """
+    Wall-clock columns for an elapsed-time vector:
+      clock_unix  Unix seconds (only when the start is known in absolute time)
+      clock_time  local wall-clock time, 'YYYY-MM-DD HH:MM:SS.fff'
+    Returns {} when the recording carries no start time.
+    """
+    time_sec = np.asarray(time_sec, dtype=np.float64)
+    cols = {}
+    if clock.get("start_unix") is not None:
+        cols["clock_unix"] = clock["start_unix"] + time_sec
+    if clock.get("start_local"):
+        start = pd.Timestamp(clock["start_local"])
+        ts = start + pd.to_timedelta(time_sec, unit="s")
+        cols["clock_time"] = ts.strftime("%Y-%m-%d %H:%M:%S.%f").str[:-3]
+    return cols
+
+
+def digital_pulse_times(digital: np.ndarray, fs: float, clock=None) -> np.ndarray:
+    """Rising-edge times (seconds) of a digital channel. Used for lickometer TTL.
+
+    With a clock model the times follow the recording's time axis (including
+    any gaps); without one they are index / fs."""
     d = np.asarray(digital).astype(np.int8)
     if d.size < 2:
         return np.array([], dtype=float)
     rising = np.flatnonzero(np.diff(d) == 1) + 1
+    if clock is not None:
+        return samples_to_seconds(clock, rising)
     return rising.astype(float) / float(fs)
 
 

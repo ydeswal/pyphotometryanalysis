@@ -917,13 +917,24 @@ def apply_hms_hover(fig, df):
     if df is None or "elapsed_hhmmss" not in df.columns:
         return fig
     hms = df["elapsed_hhmmss"].astype(str).to_numpy()
+    # Wall-clock time (from the PC clock or the header start time) when the
+    # recording carries one, so a point on the trace can be matched to a FED3
+    # or lickometer log by its clock time.
+    clock = None
+    if "clock_time" in df.columns:
+        clock = df["clock_time"].astype(str).str.slice(5, 23).to_numpy()   # MM-DD HH:MM:SS.fff
     n = len(hms)
     for trace in fig.data:
         try:
             if hasattr(trace, "x") and trace.x is not None and len(trace.x) == n:
-                trace.customdata = hms
                 label = trace.name if trace.name else "value"
-                trace.hovertemplate = f"Time: %{{customdata}}<br>{label}: %{{y:.6g}}<extra></extra>"
+                if clock is not None:
+                    trace.customdata = np.column_stack([hms, clock])
+                    trace.hovertemplate = (f"Time: %{{customdata[0]}} (clock %{{customdata[1]}})"
+                                           f"<br>{label}: %{{y:.6g}}<extra></extra>")
+                else:
+                    trace.customdata = hms
+                    trace.hovertemplate = f"Time: %{{customdata}}<br>{label}: %{{y:.6g}}<extra></extra>"
         except Exception:
             pass
     return fig
@@ -1663,6 +1674,7 @@ def render_diagnostics(settings):
     """Fit quality, F0 and every warning the pipeline raised, above the graphs."""
     if not settings or "fit_slope_used" not in settings:
         return
+    start_local = settings.get("start_clock_local")
     c = st.columns(5)
     c[0].metric("Pipeline", "Douglass 2025" if settings.get("pipeline") == "douglass2025" else "pyPhotometry")
     slope_txt = f"{settings['fit_slope_used']:.3g}"
@@ -1674,6 +1686,31 @@ def render_diagnostics(settings):
     c[3].metric("F0 (median)", f"{settings.get('F0_median_volts', float('nan')):.4g} V")
     dur = settings.get("duration_sec")
     c[4].metric("Duration", seconds_to_hms(dur) if dur else "n/a")
+    if start_local:
+        try:
+            start0 = pd.Timestamp(start_local)
+            cropped = bool(settings.get("cropped"))
+            offset = float(settings.get("crop_start_sec_original_timeline") or 0.0) if cropped else 0.0
+            end_sec = float(dur or 0.0)
+            if cropped and settings.get("crop_end_sec_original_timeline") is not None:
+                end_sec = min(end_sec, float(settings["crop_end_sec_original_timeline"]))
+            st_ts = start0 + pd.Timedelta(seconds=offset)
+            end_ts = start0 + pd.Timedelta(seconds=end_sec)
+            src = ("PC clock (per-sample timestamps, " +
+                   ("sample-clock time axis" if settings.get("time_axis", "sample") == "sample"
+                    else "PC-timestamp time axis") + ")"
+                   if settings.get("pc_timestamps") else "header start time + sample clock")
+            gaps = (settings.get("clock_check") or {}).get("gaps") or []
+            st.caption(
+                f"🕒 **{st_ts:%a %Y-%m-%d %H:%M:%S}** → **{end_ts:%a %Y-%m-%d %H:%M:%S}** "
+                f"local time{' (cropped window)' if offset else ''} · {src}"
+                + (f" · {len(gaps)} gap(s) with lost samples" if gaps else " · no lost samples"
+                   if settings.get("pc_timestamps") else "")
+                + ". Hover any trace for its clock time; the CSV has a "
+                "`clock_time` column" + (" and `clock_unix`" if settings.get("start_clock_unix")
+                                         else "") + ".")
+        except Exception:
+            pass
     for w in settings.get("warnings", []) or []:
         th.note(w, kind="warn")
     notes = settings.get("notes", []) or []
@@ -1770,7 +1807,21 @@ with st.sidebar:
             ["auto", "20", "10", "5", "1"], index=0,
             help="auto = full rate for short files, 1 Hz for multi-day files.",
         )
+        clock_label = st.selectbox(
+            "Time axis for PC-timestamped .ppd files",
+            ["Sample clock, anchored to PC start time (recommended)",
+             "Per-sample PC timestamps"],
+            index=0,
+            help=("Both start at the PC clock time of the first sample. The sample clock "
+                  "then counts samples at the sampling rate; it matches the PC wall clock "
+                  "(what FED3 PC_Timestamp and LIQ HD pc_clock use) to within a fraction "
+                  "of a second over a day. The per-sample stamps come from the Windows "
+                  "performance counter and drifted 2.4 s/day from the wall clock on the "
+                  "first file tested. Lost samples are detected either way. Files without "
+                  "PC timestamps always use the sample clock and the header start time."),
+        )
     PROC_SETTINGS = {
+        "clock_source": "pc" if clock_label.startswith("Per-sample") else "sample",
         "pipeline": "pyphotometry" if pipeline_label.startswith("pyPhotometry") else "douglass2025",
         "fit_method": "irls" if fit_label.startswith("IRLS") else "ols",
         "negative_slope_policy": "zero" if slope_guard else "allow",
@@ -2089,9 +2140,20 @@ if run_clicked:
                         pass
                     saved_files.append(path)
 
-                # A pyPhotometry .ppd is 8 bytes per sample-frame, so file size
-                # predicts duration and therefore memory.
-                approx_hours = (total_mb * 1e6) / (8 * 130.0 * 3600) if total_mb else 0
+                # File size predicts duration and therefore memory. Read each
+                # header for its rate and sample size: a PC-timestamped .ppd is
+                # 16 bytes per sample, not 8.
+                approx_hours = 0.0
+                for p in saved_files:
+                    try:
+                        if p.suffix.lower() != ".ppd":
+                            continue
+                        with open(p, "rb") as fh:
+                            hdr = json.loads(fh.read(int.from_bytes(fh.read(2), "little")))
+                        bps = float(hdr.get("bytes_per_sample") or 8)
+                        approx_hours += p.stat().st_size / (bps * float(hdr.get("sampling_rate", 130)) * 3600)
+                    except Exception:
+                        approx_hours += p.stat().st_size / (8 * 130.0 * 3600)
                 if total_mb > 250:
                     th.note(
                         f"These files total {total_mb:.0f} MB (roughly {approx_hours:.0f} h "
@@ -2213,6 +2275,33 @@ if results and st.session_state.get("crop_enabled"):
         )
     elif len(results) < _n_before:
         st.warning(f"{_n_before - len(results)} recording(s) had no data inside the crop window.")
+
+
+def _clock_offset_sec(lick_start, rec_settings):
+    """
+    Seconds from a photometry recording's first sample to a lick file's t = 0,
+    when both carry wall-clock times; otherwise None.
+
+    Both are compared as local wall-clock times. A timezone-aware lick clock is
+    converted to the recording's UTC offset when the recording stored one.
+    """
+    rec_start = (rec_settings or {}).get("start_clock_local")
+    if lick_start is None or not rec_start:
+        return None
+    try:
+        ls = pd.Timestamp(lick_start)
+        rs = pd.Timestamp(rec_start)
+    except (ValueError, TypeError):
+        return None
+    if rs.tzinfo is not None:
+        rs = rs.tz_localize(None)
+    if ls.tzinfo is not None:
+        off = rec_settings.get("utc_offset_s")
+        if off is not None:
+            import datetime as _dt
+            ls = ls.tz_convert(_dt.timezone(_dt.timedelta(seconds=float(off))))
+        ls = ls.tz_localize(None)
+    return float((ls - rs).total_seconds())
 
 
 def standalone_lick_section(file_obj, cfg):
@@ -2589,10 +2678,39 @@ else:
                         f"Lick times shifted by -{seconds_to_hms(crop_offset_applied)} "
                         "to match the cropped photometry timeline."
                     )
+                # Put the licks on each recording's clock. A lick file with clock
+                # timestamps is read as seconds from its OWN first timestamp, and
+                # used to be laid straight over the photometry, which is only
+                # right if both started at the same instant. When the photometry
+                # also knows its start time (PC-timestamped .ppd, or the header
+                # date_time), the difference between the two starts is added.
                 for r in results:
-                    lick_times_by_rec[r["name"]] = times
+                    shift = _clock_offset_sec(load.start_clock, r.get("settings", {}))
+                    t_r = times
+                    if shift is not None and abs(shift) < 7 * 86400:
+                        t_r = times + shift
+                        st.caption(
+                            f"**{r['name']}**: lick file starts "
+                            f"{'+' if shift >= 0 else '-'}{seconds_to_hms(abs(shift))} "
+                            f"relative to the photometry start "
+                            f"({pd.Timestamp(r['settings']['start_clock_local']):%Y-%m-%d %H:%M:%S}); "
+                            "lick times were shifted onto the photometry clock.")
+                        dur_r = float(r["df"]["time_sec"].max())
+                        inside = np.mean((t_r >= 0) & (t_r <= dur_r)) if t_r.size else 1.0
+                        if inside < 0.5:
+                            th.note(
+                                f"Only {100 * inside:.0f}% of licks fall inside recording "
+                                f"<b>{r['name']}</b> after clock alignment. Check that the "
+                                "lick file and the recording are from the same session and "
+                                "that both PCs' clocks were set correctly.", kind="warn")
+                    elif shift is not None:
+                        th.note(f"The lick file and <b>{r['name']}</b> start "
+                                f"{abs(shift) / 86400:.1f} days apart, so they were not "
+                                "aligned by clock.", kind="warn")
+                    lick_times_by_rec[r["name"]] = t_r
                     lick_provenance[r["name"]] = (
-                        f"{load.fmt}, time from '{load.time_column}'")
+                        f"{load.fmt}, time from '{load.time_column}'"
+                        + (", aligned by clock" if t_r is not times else ""))
             except Exception as e:
                 st.error(f"Could not read the lick CSV: {e}")
 
