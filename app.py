@@ -52,6 +52,7 @@ def _lickometer_status():
         )
     return True, None
 import theme as th
+import graph_tools as gt
 
 # =============================================================================
 # PAGE STYLE: SMALL HEADER + WIDE GRAPH WORKSPACE
@@ -1757,12 +1758,45 @@ recording_target_options = ["All recordings"] + [
 
 with st.sidebar:
     with st.expander("Inputs", expanded=True):
-        uploaded_files = st.file_uploader(
+        # Uploaded files are written to a per-session folder on disk and the
+        # uploader is then reset. Streamlit otherwise keeps every uploaded
+        # file in server memory for as long as it sits in the widget - 360 MB
+        # for one 48 h PC-timestamped .ppd - on top of the analysis itself.
+        st.session_state.setdefault("upload_gen", 0)
+        st.session_state.setdefault("staged", {})
+        _new_files = st.file_uploader(
             "Upload .ppd or .csv file(s)",
             type=["ppd", "csv"],
             accept_multiple_files=True,
+            key=f"uploader_{st.session_state['upload_gen']}",
             help="PPD files are sent to ana.py. CSV files are either processed directly or displayed if already processed.",
         )
+        if _new_files:
+            if "stage_dir" not in st.session_state or not Path(st.session_state["stage_dir"]).exists():
+                st.session_state["stage_dir"] = tempfile.mkdtemp(prefix="pyphot_")
+            for _f in _new_files:
+                _dst = Path(st.session_state["stage_dir"]) / safe_name(_f.name)
+                with open(_dst, "wb") as _fh:
+                    _fh.write(_f.getbuffer())
+                st.session_state["staged"][_f.name] = str(_dst)
+            del _new_files, _f
+            st.session_state["upload_gen"] += 1
+            st.rerun()
+        _staged = {k: v for k, v in st.session_state["staged"].items() if Path(v).exists()}
+        st.session_state["staged"] = _staged
+        if _staged:
+            st.caption("Files ready for analysis:")
+            for _name, _path in _staged.items():
+                st.caption(f"• `{_name}` ({Path(_path).stat().st_size / 1e6:.1f} MB)")
+            if st.button("Remove these files", key="clear_staged"):
+                for _path in _staged.values():
+                    try:
+                        Path(_path).unlink()
+                    except OSError:
+                        pass
+                st.session_state["staged"] = {}
+                st.rerun()
+        uploaded_files = [Path(v) for v in _staged.values()]
         roi_name = st.text_input("ROI name", value="BLA")
         scale_mode = st.selectbox("Auto y-axis scaling", ["full", "robust", "none"], index=0)
         save_full = st.checkbox("Save full 20 Hz processed CSV for PPD runs", value=False)
@@ -1834,6 +1868,14 @@ with st.sidebar:
 
     with st.expander("Graph display", expanded=False):
         graph_size = st.selectbox("Graph size", ["Normal", "Large", "Maximized"], index=0)
+        detail_label = st.selectbox(
+            "Graph detail", list(gt.DETAIL_OPTIONS), index=list(gt.DETAIL_OPTIONS).index(gt.DEFAULT_DETAIL),
+            help=("Long recordings are thinned before they are drawn: each short stretch keeps "
+                  "its first, last, highest and lowest point, so every peak and trough you "
+                  "can see is still there. Only the drawing is thinned; calculations, peak "
+                  "values and downloads use every sample. More points = slower pages."),
+        )
+        MAX_POINTS = gt.DETAIL_OPTIONS[detail_label]
         focus_mode = st.checkbox("Maximize one graph only", value=False)
         focus_graph = st.selectbox(
             "Graph to maximize",
@@ -2126,18 +2168,10 @@ if run_clicked:
                 tmp = Path(tmp)
                 saved_files = []
                 total_mb = 0.0
-                for f in uploaded_files:
-                    path = tmp / safe_name(f.name)
-                    # Stream to disk and release the in-memory buffer straight
-                    # away. A 48 h .ppd is ~180 MB and holding several of them
-                    # in RAM on top of the analysis is enough to end the session.
-                    with open(path, "wb") as out_fh:
-                        out_fh.write(f.getbuffer())
+                for path in uploaded_files:
+                    # Already on disk (staged when uploaded), so nothing large
+                    # is held in memory here.
                     total_mb += path.stat().st_size / 1e6
-                    try:
-                        f.seek(0)
-                    except Exception:
-                        pass
                     saved_files.append(path)
 
                 # File size predicts duration and therefore memory. Read each
@@ -2349,11 +2383,12 @@ def standalone_lick_section(file_obj, cfg):
     sources = {n_: load.sources[n_] for n_ in picked}
     pooled = np.sort(np.concatenate(list(sources.values())))
 
-    st.plotly_chart(
+    gt.chart_block(
         lk.plot_licks(sources, duration_sec=load.duration_sec,
                       rate_window_sec=cfg["rate_window_sec"],
                       title="Licks over the whole recording"),
-        use_container_width=True,
+        key="solo_lick_overview", max_points=MAX_POINTS, config=PLOTLY_CONFIG,
+        x_unit_sec=3600.0 if load.duration_sec / 3600.0 > 2 else 1.0,
     )
 
     # Per bottle, because pooling bottles hides a sipper that stopped working.
@@ -2435,7 +2470,25 @@ else:
         unsafe_allow_html=True,
     )
 
-    for idx, result in enumerate(results, start=1):
+    display_mode = st.radio(
+        "Display", ["One recording at a time", "Side-by-side graphs"], horizontal=True,
+        key="display_mode",
+        help=("Side-by-side: 2-6 graphs of your choice, from any recordings, next to each "
+              "other, with peak/trough tools and the time ruler in every graph."),
+    )
+
+    def _prepare_view(_df):
+        _v = filter_visual_window(_df, start_sec, end_sec) if use_window else _df
+        return apply_visual_exclusions(_v, roi_name, visual_exclusions, mode=exclusion_mode_code)
+
+    if display_mode == "Side-by-side graphs":
+        gt.render_workspace(
+            results, roi_name, _prepare_view,
+            colors={k: graph_color(k) for k in ("dff", "z_smooth", "sig_raw")},
+            max_points=MAX_POINTS, height=int(430 * height_mult), config=PLOTLY_CONFIG,
+        )
+
+    for idx, result in enumerate(results if display_mode == "One recording at a time" else [], start=1):
         full_df = result["df"]
         view_df = filter_visual_window(full_df, start_sec, end_sec) if use_window else full_df
         view_df = apply_visual_exclusions(view_df, roi_name, visual_exclusions, mode=exclusion_mode_code)
@@ -2445,6 +2498,16 @@ else:
 
         st.markdown(f"## Recording {idx}: `{result['name']}`")
         render_diagnostics(result.get("settings", {}))
+
+        rec_clock = gt.clock_start_of(view_df, result.get("settings"))
+
+        def show(fig, kind):
+            gt.chart_block(
+                fig, key=f"rec{idx}_{safe_name(result['name'])}_{safe_name(kind)}",
+                max_points=MAX_POINTS, clock_start=rec_clock, config=PLOTLY_CONFIG,
+                peaks=kind in ("Main dFF", "Z-score sliding mean", "Z-score range analysis"),
+                peak_default_on=False,
+            )
 
         def render_chart(kind):
             events_for_this_graph = filter_events_for_context(
@@ -2517,7 +2580,7 @@ else:
                     show_average_line=zrange_cfg["show_average_line"],
                     show_range_annotations=zrange_cfg["show_range_annotations"],
                 )
-                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+                show(fig, kind)
                 if zrange_cfg["show_stats_table"] and z_stats_df is not None and not z_stats_df.empty:
                     st.dataframe(
                         z_stats_df.style.format({
@@ -2545,7 +2608,7 @@ else:
                     show_event_labels=show_event_labels,
                     height=processed_h,
                 )
-            st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+            show(fig, kind)
 
         if focus_mode:
             st.markdown(f"### Maximized view: {focus_graph}")
@@ -2555,37 +2618,37 @@ else:
                 st.dataframe(view_df.head(500), use_container_width=True, height=360)
                 st.download_button(
                     label=f"Download full processed CSV for {result['name']}",
-                    data=full_df.to_csv(index=False).encode("utf-8"),
+                    data=lambda _d=full_df: _d.to_csv(index=False).encode("utf-8"),
                     file_name=f"{safe_name(result['name'])}_processed_output.csv",
                     mime="text/csv",
                 )
             continue
 
-        tabs = st.tabs(["Overview", "Raw channels", "Main dFF", "Z-score sliding mean", "Z-score range analysis", "Data preview", "Settings", "Methods & math"])
-
-        with tabs[0]:
-            render_chart("Overview")
-        with tabs[1]:
-            render_chart("Raw channels")
-        with tabs[2]:
-            render_chart("Main dFF")
-        with tabs[3]:
-            render_chart("Z-score sliding mean")
-        with tabs[4]:
-            render_chart("Z-score range analysis")
-        with tabs[5]:
+        # One view at a time. st.tabs built and sent ALL five graphs (every
+        # point of every trace) on every rerun, even though only one is ever
+        # visible; with a day-long recording that was ~80 MB per rerun and
+        # the main reason the hosted app ran out of memory.
+        view = st.radio(
+            "View", ["Overview", "Raw channels", "Main dFF", "Z-score sliding mean",
+                     "Z-score range analysis", "Data preview", "Settings", "Methods & math"],
+            horizontal=True, key=f"view_{idx}_{safe_name(result['name'])}",
+            label_visibility="collapsed",
+        )
+        if view == "Data preview":
             st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
             st.dataframe(view_df.head(500), use_container_width=True, height=360)
             st.download_button(
                 label=f"Download full processed CSV for {result['name']}",
-                data=full_df.to_csv(index=False).encode("utf-8"),
+                data=lambda _d=full_df: _d.to_csv(index=False).encode("utf-8"),
                 file_name=f"{safe_name(result['name'])}_processed_output.csv",
                 mime="text/csv",
             )
-        with tabs[6]:
+        elif view == "Settings":
             st.json(result.get("settings", {}))
-        with tabs[7]:
+        elif view == "Methods & math":
             render_methods_doc(f"methods_{idx}")
+        else:
+            render_chart(view)
 
     # =========================================================================
     # LICKOMETER SECTION
@@ -2662,14 +2725,16 @@ else:
                     else np.array([], dtype=float))
 
                 # Standalone view: licks are worth seeing even with no photometry.
-                st.plotly_chart(
+                gt.chart_block(
                     lk.plot_licks(
                         {n_: load.sources[n_] for n_ in picked},
                         duration_sec=load.duration_sec,
                         rate_window_sec=lick_cfg["rate_window_sec"],
                         title="Licks over the whole recording",
                     ),
-                    use_container_width=True,
+                    key="lick_csv_overview", max_points=MAX_POINTS, config=PLOTLY_CONFIG,
+                    # plot_licks draws hours when the file spans more than 2 h
+                    x_unit_sec=3600.0 if load.duration_sec / 3600.0 > 2 else 1.0,
                 )
 
                 if crop_offset_applied:
@@ -2836,23 +2901,38 @@ else:
                     line=dict(width=1.2, color=th.TRACE_COLORS["lick_rate"]),
                     fill="tozeroy", fillcolor="rgba(8,145,178,0.15)",
                 ), row=2, col=1)
+                # A raster of 100k+ ticks is unreadable and slow; draw at most
+                # 40k (the rate trace above uses every lick).
+                _shown = times[::int(np.ceil(times.size / 40000))] if times.size > 40000 else times
                 fig.add_trace(go.Scatter(
-                    x=times, y=np.ones_like(times), mode="markers", name="Licks",
+                    x=_shown, y=np.ones_like(_shown), mode="markers", name="Licks",
                     marker=dict(symbol="line-ns-open", size=9, line=dict(width=1),
                                 color=th.TRACE_COLORS["lick"]),
                 ), row=3, col=1)
 
-                for _, b in bouts.iterrows():
-                    fig.add_vrect(
-                        x0=b.onset_sec, x1=b.offset_sec,
-                        fillcolor="rgba(245,158,11,0.14)", line_width=0, row=1, col=1,
-                    )
+                # All bouts as ONE filled trace of NaN-separated rectangles.
+                # One add_vrect per bout (1,000+ in a day) took minutes to
+                # build and left the browser crawling.
+                if len(bouts) and dff_col in d.columns:
+                    _yy = pd.to_numeric(d[dff_col], errors="coerce").to_numpy(float)
+                    _lo, _hi = (np.nanmin(_yy), np.nanmax(_yy)) if np.isfinite(_yy).any() else (0.0, 1.0)
+                    _on = bouts["onset_sec"].to_numpy(float)
+                    _off = bouts["offset_sec"].to_numpy(float)
+                    _bx = np.column_stack([_on, _on, _off, _off, np.full_like(_on, np.nan)]).ravel()
+                    _by = np.tile([_lo, _hi, _hi, _lo, np.nan], _on.size)
+                    fig.add_trace(go.Scatter(
+                        x=_bx, y=_by, fill="toself", fillcolor="rgba(245,158,11,0.16)",
+                        line=dict(width=0), mode="lines", hoverinfo="skip",
+                        name=f"bouts ({len(bouts)})", showlegend=False,
+                    ), row=1, col=1)
 
                 fig.update_yaxes(title_text="Hz", row=2, col=1)
                 fig.update_yaxes(showticklabels=False, range=[0.5, 1.5], row=3, col=1)
                 th.style_figure(fig, height=int(720 * height_mult))
                 apply_hms_xaxis(fig, d, rows=[1, 2, 3])
-                st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+                gt.chart_block(fig, key=f"lick_{safe_name(r['name'])}_time", max_points=MAX_POINTS,
+                               clock_start=gt.clock_start_of(d, r.get("settings")),
+                               config=PLOTLY_CONFIG, peaks=True)
                 st.caption("Shaded bands mark detected licking bouts.")
 
             # -------- peri-bout photometry ------------------------------------
@@ -2918,7 +2998,8 @@ else:
                         pf.update_yaxes(title_text=unit, row=1, col=1)
                         pf.update_yaxes(title_text="Bout", row=2, col=1)
                         th.style_figure(pf, height=int(660 * height_mult))
-                        st.plotly_chart(pf, use_container_width=True, config=PLOTLY_CONFIG)
+                        gt.chart_block(pf, key=f"lick_{safe_name(r['name'])}_peri",
+                                       max_points=MAX_POINTS, config=PLOTLY_CONFIG)
 
                         bl = (taxis >= lick_cfg["baseline_start_sec"]) & (taxis <= lick_cfg["baseline_end_sec"])
                         pk = (taxis >= 0) & (taxis <= min(10.0, lick_cfg["post_sec"]))
@@ -2958,7 +3039,7 @@ else:
     st.divider()
     st.download_button(
         label="Download all full processed outputs as ZIP",
-        data=make_zip_from_results(results, roi_name),
+        data=lambda: make_zip_from_results(results, roi_name),
         file_name="photometry_analysis_outputs.zip",
         mime="application/zip",
         use_container_width=True,

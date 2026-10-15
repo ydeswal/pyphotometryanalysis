@@ -1,35 +1,56 @@
-# Which files to upload to GitHub (15 Oct 2026 update)
+# Updating the GitHub repository (15 Oct 2026, update b)
 
-Changed or new in this update, upload these:
+## Easiest: replace the whole folder
 
-    photometry_core.py        <- reads PC-timestamped .ppd files + clock model
-    ana.py                    <- clock_time / clock_unix columns, gap-aware times
-    app.py                    <- clock on hover + summary, time-axis option,
-                                 lick CSVs aligned by clock
-    convert_ppd.py            NEW: PC-timestamped .ppd -> standard .ppd
-    check_ppd.py              <- reports layout, clock checks, verdict
-    test_core.py              <- sections 19-23
-    README.md
-    METHODS_EXPLAINED.md      <- shown in the "Methods & math" tab
-    UPDATE_THESE_FILES.md
+1. Unzip `pyphotometryanalysis_updated.zip`.
+2. In your local clone, copy every file from it over the old ones. Show
+   hidden files first (Mac: Cmd+Shift+. in Finder) so `.streamlit/` and
+   `.gitignore` come along.
+3. Delete these from the repository. They are not code, or are now replaced:
 
-Unchanged: lickometer.py, theme.py, requirements.txt, test_lick.py,
-.streamlit/config.toml.
+       pyphotometryanalysis_repo.tar.gz   (56 MB archive; re-cloned on every deploy)
+       __pycache__/   .DS_Store   dot_streamlit/   config.toml (the one at the top level)
 
-`photometry_core.py`, `ana.py` and `app.py` depend on each other, so upload
-all three together. The app runs `ana.py` in a separate process, and an old
-`photometry_core.py` makes it fail with an AttributeError.
+4. Commit and push:
 
-Do NOT upload `__pycache__/`, `.DS_Store`, or `.ppd` data files.
+       git add -A
+       git commit -m "Side-by-side graphs, peaks, time ruler; cut memory use"
+       git push
+
+## Using the GitHub website instead
+
+Upload these, all together (they depend on each other):
+
+    app.py  graph_tools.py  photometry_core.py  ana.py  requirements.txt
+    README.md  UPDATE_THESE_FILES.md  DEPLOY.md  test_graph_tools.py
+    run_local.command  run_local.bat  run_local.sh  .gitignore
+
+Then **Add file → Create new file**, name it `.streamlit/config.toml`, and
+paste in the contents of the `.streamlit/config.toml` from the zip. Delete
+the files listed in step 3 above.
+
+Unchanged: lickometer.py, theme.py, convert_ppd.py, check_ppd.py,
+test_core.py, test_lick.py, METHODS_EXPLAINED.md.
+
+Do NOT also install the "graph workspace upgrade" (install_graph_workspace.py)
+from the other proposal. Its features are included here, and its installer
+would patch app.py a second time.
+
+## After pushing
+
+Streamlit Cloud redeploys on its own. If the page still says "Oh no", open
+<https://share.streamlit.io>, then **⋮ → Reboot app** on
+pyphotometrysweeneylab. A crashed app sometimes stays down until it is
+rebooted.
 
 ## Check it worked
 
-    python3 test_core.py      # ALL TESTS PASSED
+    python test_core.py          # ALL TESTS PASSED
+    python test_graph_tools.py   # ALL TESTS PASSED
 
-Upload `m10_fasted-2026-10-14-102300.ppd`. Above the graphs you should see:
+In the app, upload `m10_fasted-2026-10-14-102300.ppd`, then check:
 
-    Pipeline: Douglass 2025 | slope a: 2.66 | Fit R^2: 0.892 | F0: 1.129 V | Duration: 23:55:48
-    Wed 2026-10-14 10:23:00 -> Thu 2026-10-15 10:18:48 local time · PC clock ...
-
-with no clipping warning. Hovering a trace shows
-`Time: hh:mm:ss (clock MM-DD hh:mm:ss.fff)`.
+- the **Display** buttons (One recording at a time / Side-by-side graphs)
+  appear above the results;
+- **Main dFF → ▲▼ Peaks** gives ceiling 20.15 % at 01:40:36 clock time;
+- removing it moves the ceiling to 13.69 % at 08:10:28.

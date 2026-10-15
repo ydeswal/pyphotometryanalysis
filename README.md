@@ -16,6 +16,101 @@ which is also shown inside the app in the **Methods & math** tab.
 
 ---
 
+## Run it on your own computer
+
+Download or clone this repository, then double-click:
+
+| | |
+|---|---|
+| **macOS** | `run_local.command` (first time: right-click → **Open** → **Open**, because macOS blocks downloaded scripts) |
+| **Windows** | `run_local.bat` |
+| **Linux** | `bash run_local.sh` |
+
+The first run creates a private Python environment in `.venv` and installs the
+packages (1–3 minutes). After that it starts in seconds. The app opens at
+<http://localhost:8501>. Keep the window open while you work, and close it to
+stop. You need Python 3.11 or 3.12 from <https://www.python.org/downloads/>.
+On a local machine there is no cloud memory cap, and uploads up to 4 GB are
+allowed.
+
+---
+
+## 15 October 2026 (b): side-by-side graphs, peaks, time ruler, memory
+
+**Why the hosted app crashed.** Streamlit Community Cloud gives an app at
+most 2.7 GB of memory, shared by everyone using it at that moment. The
+previous version:
+
+- built **all five graphs** for every recording on every click (`st.tabs`
+  renders every tab), with every sample of every trace;
+- kept every uploaded file in server memory;
+- built the full CSV and ZIP downloads on every click, even if nobody
+  pressed the download button;
+- converted the channels to 64-bit copies during analysis, and held the
+  whole raw file in RAM.
+
+| One 24 h recording (m10, 20 Hz) | Before | After |
+|---|---|---|
+| Data sent to the browser | 81 MB | **4.5 MB** |
+| Time to first graph | 78 s | **17 s** |
+| Server memory afterwards | 516 MB | **~400 MB** |
+| Analysis peak, 48 h at 130 Hz (360 MB file) | 1,526 MB | **1,005 MB** |
+
+What changed: graphs are thinned before they are drawn, which keeps each
+stretch's first, last, highest and lowest point, so every visible peak and
+trough survives. Only the view you pick is built. Uploads go straight to disk.
+Downloads are built only when clicked. The reader memory-maps the file, and the
+analysis stays in 32-bit floats (results identical to within 2×10⁻⁷).
+*Graph display → Graph detail* sets how many points are drawn.
+Calculations, peak values and downloads always use every sample.
+
+**Display: two options at the top.**
+
+1. **One recording at a time.** The same views as before (Overview, Raw
+   channels, Main dFF, Z-score sliding mean, Z-score range analysis, …),
+   chosen with a row of buttons. Only the chosen view is built.
+2. **Side-by-side graphs.** 2–6 graphs, 1–3 per row. Each graph has its own
+   recording and graph type: dF/F, z-score, z running mean, ΔF, raw 465/405,
+   filtered 465, fitted 405 or F0. Options:
+   - **Elapsed** or **Clock time** axis; clock time lines recordings up by
+     time of day.
+   - **Same time window in every graph**, a slider in hours or in clock time.
+   - **Same y-scale for the same graph type.**
+
+**▲▼ Peaks** (dF/F and z-score graphs, every side-by-side graph, the lick
+graph):
+- Marks the current **ceiling** (highest point) and **floor** (lowest point).
+- Lists the top 5/10/20 peaks and troughs as distinct events, with elapsed
+  and clock time. *Min. gap between events* stops one broad transient from
+  filling the list.
+- Tick **Remove** on any row to blank that event. It is blanked from where
+  the trace leaves its median to where it returns, capped at ± N s. The
+  ceiling or floor then moves to the next one, and the y-axis can refit to
+  what is left.
+- **Fix y floor** and **Fix y ceiling** work independently.
+- **Restore all removed** undoes every removal.
+- All of this is display-only: it never changes data, z-scores or downloads.
+
+**📏 Ruler** (every graph):
+- Turn it on, then click two points on the graph. With the default hover you
+  don't need to hit the line exactly; the click takes the time under the
+  cursor.
+- Shows both times (elapsed and wall clock), the time between them (h:m:s,
+  s, min, h), and the mean, min and max of the signal in between.
+- A third click starts a new measurement.
+- Timing resolution is the spacing of the drawn points; narrow the visual
+  crop window, or raise *Graph detail*, for finer timing.
+
+Both tools run inside `st.fragment`, so clicking a graph reruns only that
+graph, not the whole app. They use Streamlit's own Plotly click events and
+need no extra package. (`streamlit-plotly-events`, which another proposal
+used, has not been updated since 2021.)
+
+`python test_graph_tools.py` tests thinning, peak ranking, removal and time
+formatting.
+
+---
+
 ## 15 October 2026: PC-timestamped `.ppd` files
 
 **Symptom.** A recording made with the modified acquisition program that
@@ -123,6 +218,8 @@ recording if it is present.
 | `photometry_core.py` | **All maths.** Single source of truth, including `.ppd` reading and the clock model |
 | `convert_ppd.py` | PC-timestamped `.ppd` → standard `.ppd` + timestamps (for other software) |
 | `check_ppd.py` | Diagnose any `.ppd`: layout, clock, duration, verdict |
+| `graph_tools.py` | Side-by-side graphs, peaks/troughs, time ruler, graph thinning |
+| `run_local.command` / `.bat` / `.sh` | Start the app on your own computer |
 | `lickometer.py` | Lick ingestion, bout detection, peri-event alignment |
 | `theme.py` | Styling and Plotly defaults |
 | `.streamlit/config.toml` | Base theme |

@@ -181,7 +181,12 @@ def extract_channels(data):
     from the LED-on sample for each channel, exactly as the pyPhotometry spec
     prescribes. analog_1 is the 465 signal and analog_2 the 405 isosbestic.
     """
-    return np.asarray(data["analog_2"], dtype=float), np.asarray(data["analog_1"], dtype=float)
+    # Taken OUT of the dict (pop) and kept in float32. Converting to float64
+    # here doubled the memory of both channels, and leaving them in the dict
+    # kept a second reference alive for the whole analysis, so the pipeline's
+    # consume=True could never free them. The filters work in float64
+    # internally, block by block.
+    return data.pop("analog_2"), data.pop("analog_1")
 
 
 # =============================================================================
@@ -903,8 +908,9 @@ def process_one_recording(ppd_path: Path, roi: str, save_full: bool):
     cut_full = (n_acquired // step_full) * step_full
 
     def _bin_full(arr):
-        return (np.asarray(arr[:cut_full], dtype=np.float64)
-                .reshape(-1, step_full).mean(axis=1))
+        # Mean in float64 without first making a float64 copy of the whole
+        # full-rate channel (180 MB per channel at 48 h, 130 Hz).
+        return np.asarray(arr)[:cut_full].reshape(-1, step_full).mean(axis=1, dtype=np.float64)
 
     uv_raw_export = _bin_full(uv_raw)
     sig_raw_export = _bin_full(sig_raw)

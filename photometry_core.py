@@ -167,7 +167,14 @@ def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
     with open(ppd_path, "rb") as f:
         header_size = int.from_bytes(f.read(2), "little")
         header = json.loads(f.read(header_size).decode("utf-8"))
-        buf = f.read()
+    # Memory-map the data block instead of reading it into RAM. A 48 h, 130 Hz
+    # PC-timestamped file is 360 MB; read() made all of it resident for the
+    # whole analysis, while mapped pages are only touched as channels are
+    # extracted and can be dropped by the OS afterwards. Every array returned
+    # below is a copy, so nothing keeps the mapping alive.
+    data_bytes = ppd_path.stat().st_size - 2 - header_size
+    buf = (np.memmap(ppd_path, dtype=np.uint8, mode="r", offset=2 + header_size)
+           if data_bytes > 0 else np.zeros(0, np.uint8))
 
     fs = float(header["sampling_rate"])
     mode = str(header.get("mode", "")).strip()
@@ -288,7 +295,12 @@ def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
     clock = build_clock_model(header, fs, n_samples, pc_t, clock_source=clock_source)
     if keep_components and pc_t is not None:
         out["pc_time_unix"] = np.array(pc_t, dtype=np.float64)
-    del frames, pc_t, buf
+    del frames, pc_t
+    if pc_layout is not None:
+        del rec
+    else:
+        del raw
+    del buf
 
     clock["warnings"] = read_warnings + clock["warnings"]
     out["clock"] = clock
