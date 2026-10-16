@@ -1,4 +1,11 @@
-# Updating the GitHub repository (15 Oct 2026, update b)
+# Updating the GitHub repository (16 Oct 2026: FED3 feeding view)
+
+New in this update: `fed3.py`, `fed_view.py`, `test_fed3.py`. Changed:
+`app.py`, `graph_tools.py`, `README.md`, `UPDATE_THESE_FILES.md`. Upload them
+together with everything listed below if you have not applied the 15 Oct
+update yet.
+
+# Previous update (15 Oct 2026, update b)
 
 ## Easiest: replace the whole folder
 
@@ -21,8 +28,8 @@
 
 Upload these, all together (they depend on each other):
 
-    app.py  graph_tools.py  photometry_core.py  ana.py  requirements.txt
-    README.md  UPDATE_THESE_FILES.md  DEPLOY.md  test_graph_tools.py
+    app.py  graph_tools.py  fed3.py  fed_view.py  photometry_core.py  ana.py  requirements.txt
+    README.md  UPDATE_THESE_FILES.md  DEPLOY.md  test_graph_tools.py  test_fed3.py
     run_local.command  run_local.bat  run_local.sh  .gitignore
 
 Then **Add file → Create new file**, name it `.streamlit/config.toml`, and

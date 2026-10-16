@@ -420,10 +420,13 @@ def _peak_controls(fig, key, trace_k, x_unit_sec, clock_start, default_markers, 
 
 @st.fragment
 def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0,
-                peaks=False, peak_default_on=False, config=None, ruler=True, compact=False):
+                peaks=False, peak_default_on=False, config=None, ruler=True, compact=False,
+                event_counts=None):
     """
     Show one Plotly figure with an optional peaks panel and two-click time
-    ruler. Runs as a fragment: clicking the graph or changing these controls
+    ruler. event_counts: optional list of (label, times_sec, grams_each or
+    None); the ruler then also reports how many of those events fall
+    between its two points (e.g. pellets eaten). Runs as a fragment: clicking the graph or changing these controls
     reruns only this block, not the whole app.
     """
     fig = go.Figure(fig)                 # never mutate the caller's figure
@@ -500,12 +503,12 @@ def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0
                 if xv is not None and np.isfinite(xv):
                     st.session_state[f"{key}_pts"] = [xv] if len(pts) >= 2 else pts + [xv]
                     st.rerun(scope="fragment")
-        _ruler_readout(pts, clock_start, target_t, target_y, target_label)
+        _ruler_readout(pts, clock_start, target_t, target_y, target_label, event_counts)
     else:
         st.plotly_chart(fig, use_container_width=True, config=cfg, key=f"{key}_chart")
 
 
-def _ruler_readout(pts, clock_start, t, y, label):
+def _ruler_readout(pts, clock_start, t, y, label, event_counts=None):
     if not pts:
         return
     if len(pts) == 1:
@@ -527,6 +530,12 @@ def _ruler_readout(pts, clock_start, t, y, label):
         if m.any():
             extra += (f" · {label} between the points: mean {np.mean(y[m]):.4g}, "
                       f"min {np.min(y[m]):.4g}, max {np.max(y[m]):.4g} ({int(m.sum())} samples)")
+    for lab, times, grams in (event_counts or []):
+        tt = np.asarray(times, float)
+        k = int(((tt >= a) & (tt <= b)).sum())
+        st.markdown(f"**{lab.capitalize()} between the points: {k}**"
+                    + (f" ({k * grams:.2f} g)" if grams else "")
+                    + (f" · {k / (d / 3600):.1f} per hour" if d > 0 else ""))
     st.caption(extra)
 
 

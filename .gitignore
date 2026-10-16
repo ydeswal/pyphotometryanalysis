@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+# data and outputs: never commit recordings or archives
+*.ppd
+*.tar.gz
+*.zip
+jones_style_matched_scales_output/
+app.py.backup_*

@@ -53,6 +53,8 @@ def _lickometer_status():
     return True, None
 import theme as th
 import graph_tools as gt
+import fed3
+import fed_view
 
 # =============================================================================
 # PAGE STYLE: SMALL HEADER + WIDE GRAPH WORKSPACE
@@ -1797,9 +1799,46 @@ with st.sidebar:
                 st.session_state["staged"] = {}
                 st.rerun()
         uploaded_files = [Path(v) for v in _staged.values()]
+
         roi_name = st.text_input("ROI name", value="BLA")
         scale_mode = st.selectbox("Auto y-axis scaling", ["full", "robust", "none"], index=0)
         save_full = st.checkbox("Save full 20 Hz processed CSV for PPD runs", value=False)
+
+    with st.expander("FED3 feeding data", expanded=False):
+        st.caption("The zipped FED3_data folder from the FED3 controller, or its "
+                   "*_data.csv / *_pc_events.csv / session_info.json files. Animals are "
+                   "matched to recordings by their ID (m10, m11 ...).")
+        st.session_state.setdefault("fed_gen", 0)
+        st.session_state.setdefault("fed_staged", {})
+        _fed_new = st.file_uploader("FED3 files", type=["zip", "csv", "json"],
+                                    accept_multiple_files=True,
+                                    key=f"fed_uploader_{st.session_state['fed_gen']}")
+        if _fed_new:
+            if "fed_dir" not in st.session_state or not Path(st.session_state["fed_dir"]).exists():
+                st.session_state["fed_dir"] = tempfile.mkdtemp(prefix="pyphot_fed_")
+            _inbox = Path(st.session_state["fed_dir"]) / "inbox"
+            _inbox.mkdir(exist_ok=True)
+            for _f in _fed_new:
+                _dst = _inbox / safe_name(_f.name)
+                with open(_dst, "wb") as _fh:
+                    _fh.write(_f.getbuffer())
+                st.session_state["fed_staged"][_f.name] = str(_dst)
+            st.session_state.pop("fed_data", None)
+            st.session_state["fed_gen"] += 1
+            st.rerun()
+        _fed_files = {k: v for k, v in st.session_state["fed_staged"].items() if Path(v).exists()}
+        if _fed_files:
+            if "fed_data" not in st.session_state:
+                _work = Path(st.session_state["fed_dir"]) / f"read_{len(_fed_files)}"
+                st.session_state["fed_data"] = fed3.load_fed(list(_fed_files.values()), _work)
+            _fd = st.session_state["fed_data"]
+            st.caption(f"{len(_fed_files)} file(s): " + ", ".join(f"`{k}`" for k in _fed_files)
+                       + f" → {', '.join(_fd.animals) or 'no animals found'}")
+            if st.button("Remove FED3 files", key="fed_clear"):
+                st.session_state["fed_staged"] = {}
+                st.session_state.pop("fed_data", None)
+                st.rerun()
+    FED_DATA = st.session_state.get("fed_data")
 
     with st.expander("Processing method (formulas)", expanded=False):
         st.caption(
@@ -2423,6 +2462,10 @@ def standalone_lick_section(file_obj, cfg):
 
 if not results:
     st.info("Upload a `.ppd` or `.csv` file, then click **Run / refresh analysis**.")
+    if FED_DATA is not None and not FED_DATA.events.empty:
+        st.markdown("### Feeding (FED3), without photometry")
+        fed_view.render([], FED_DATA, roi_name, lambda d: d, max_points=MAX_POINTS,
+                        height_mult=1.0, config=PLOTLY_CONFIG)
     if (st.session_state.get("lick_enabled")
             and lick_source == "Upload lick CSV" and lick_file is not None):
         standalone_lick_section(lick_file, lick_cfg)
@@ -2471,7 +2514,7 @@ else:
     )
 
     display_mode = st.radio(
-        "Display", ["One recording at a time", "Side-by-side graphs"], horizontal=True,
+        "Display", ["One recording at a time", "Side-by-side graphs", "Feeding (FED3)"], horizontal=True,
         key="display_mode",
         help=("Side-by-side: 2-6 graphs of your choice, from any recordings, next to each "
               "other, with peak/trough tools and the time ruler in every graph."),
@@ -2487,6 +2530,10 @@ else:
             colors={k: graph_color(k) for k in ("dff", "z_smooth", "sig_raw")},
             max_points=MAX_POINTS, height=int(430 * height_mult), config=PLOTLY_CONFIG,
         )
+
+    if display_mode == "Feeding (FED3)":
+        fed_view.render(results, FED_DATA, roi_name, _prepare_view, max_points=MAX_POINTS,
+                        height_mult=height_mult, config=PLOTLY_CONFIG)
 
     for idx, result in enumerate(results if display_mode == "One recording at a time" else [], start=1):
         full_df = result["df"]

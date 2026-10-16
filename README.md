@@ -35,6 +35,63 @@ allowed.
 
 ---
 
+## 16 October 2026: FED3 feeding data on the photometry clock
+
+Sidebar → **FED3 feeding data**: upload the zipped `FED3_data` folder from the
+FED3 controller (or its `*_data.csv`, `*_pc_events.csv`, `session_info.json`
+files). Then **Display → Feeding (FED3)**. Recordings are matched to animals by
+the ID in their names (`m10_fasted_feds-…` → `m10`). Change the match in
+*Recording ↔ animal* if a name doesn't carry the ID.
+
+| View | What it shows |
+|---|---|
+| **Photometry above, food below** | dF/F or z on top; pellets per bin (bars) and cumulative food in grams underneath, on one clock axis |
+| **One graph: signal + eating** | every pellet as a dot ON the trace at the moment it was taken, plus eating rate (pellets/h) on a second axis |
+| **Aligned to eating** | the signal around meal onsets or every pellet: mean ± SEM, every event as a heatmap, a test against random times, a 405 control, and a per-event table (CSV) |
+| **All animals** | cumulative food of every animal together, and a summary table |
+
+Every graph has the 📏 ruler: it counts the **pellets and grams eaten between
+its two points**. The ▲▼ Peaks tool also works here.
+
+**How the data are read** (`fed3.py`):
+
+- **Event times** use each FED row's `PC_Timestamp`. That is the PC
+  wall-clock time computed on the FED at the moment of the event, the same
+  clock as the photometry `clock_time`.
+- **Intake** is counted from Pellet *events*, not `Pellet_Count`, which
+  restarts with every SD file and every session.
+- **Animals** are identified by the ID in the file name, not the FED device
+  number (three FEDs all report "FED000").
+- **Periods with no FED logging** (e.g. 13:40–19:36 on 15 Oct) are shaded
+  grey and treated as *unknown*, not as zero intake. Random comparison times
+  are only drawn from logged periods.
+- **Test sessions:** sessions whose name starts with `test` are left out by
+  default.
+- **Two FEDs with the same animal ID:** this is flagged. In `longi`, COM10 and
+  COM16 were both labelled m16; they wrote into the same files and one
+  `pc_events` line was cut off. COM10 logged no events, so m16's data are
+  intact. Fix it at source by giving every FED a distinct ID.
+
+**Aligned to eating, the numbers:**
+
+- Response − baseline is computed per event. The defaults follow Douglass et
+  al. 2025: −100…−50 s vs 0…50 s for meals, and −40…−20 s vs 0…20 s for single
+  pellets.
+- That mean is compared with the same statistic at 2,000 sets of random times
+  when the FED was logging, away from real events, giving a permutation p.
+- **405 control:** the same test on the 405 channel (drift removed, z-scored).
+  - If 405 moves the **same** way at eating, movement, chewing or blood flow
+    may explain the response.
+  - If it moves the **opposite** way (m11), interpret with care.
+- A **meal** is pellets less than 60 s apart, at least 2 pellets (both
+  adjustable).
+
+`python test_fed3.py` covers reading (counter resets, duplicate rows,
+damaged lines, zip safety, coverage) and the analysis (bins, meals, rates,
+aligned matrices, permutation test on signals with and without a response).
+
+---
+
 ## 15 October 2026 (b): side-by-side graphs, peaks, time ruler, memory
 
 **Why the hosted app crashed.** Streamlit Community Cloud gives an app at
@@ -219,6 +276,8 @@ recording if it is present.
 | `convert_ppd.py` | PC-timestamped `.ppd` → standard `.ppd` + timestamps (for other software) |
 | `check_ppd.py` | Diagnose any `.ppd`: layout, clock, duration, verdict |
 | `graph_tools.py` | Side-by-side graphs, peaks/troughs, time ruler, graph thinning |
+| `fed3.py` | Reads FED3 controller output; intake, meals, event alignment, permutation test |
+| `fed_view.py` | The "Feeding (FED3)" view |
 | `run_local.command` / `.bat` / `.sh` | Start the app on your own computer |
 | `lickometer.py` | Lick ingestion, bout detection, peri-event alignment |
 | `theme.py` | Styling and Plotly defaults |
