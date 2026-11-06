@@ -35,6 +35,26 @@ allowed.
 
 ---
 
+## 6 November 2026: raw signal and recording time in the Feeding (FED3) view
+
+- **Signal** now also offers the raw channels: **Raw 465 + 405** (both raw
+  traces, 465 on the left axis and 405 on the right), and 465 raw, 405 raw,
+  465 filtered, ΔF, fitted 405 and F0 on their own. dF/F stays the default.
+  In *One graph* the eating rate moves to a third axis when both raw channels
+  are shown. *Aligned to eating* aligns the 465 raw channel and checks 405 as
+  the control.
+- **Time axis**: *Clock + recording time* (default) labels every tick with the
+  wall-clock time and, underneath in grey, the time into the recording
+  (`time_sec`). *Clock time* or *Recording time* show only one of them.
+- **Hover** on any graph gives the clock time (0.1 s) and the time into the
+  recording for that point, at the top of the hover box.
+- A **times box** above the graphs gives when the recording started and ended
+  (clock and recording time), the part shown when a visual crop is set, and
+  each stretch of FED logging in both clocks.
+- The per-event table in *Aligned to eating* has a **recording time** column.
+
+---
+
 ## 16 October 2026: FED3 feeding data on the photometry clock
 
 Sidebar → **FED3 feeding data**: upload the zipped `FED3_data` folder from the

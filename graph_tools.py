@@ -418,15 +418,113 @@ def _peak_controls(fig, key, trace_k, x_unit_sec, clock_start, default_markers, 
 # CHART BLOCK: peaks + time ruler, rerun on its own
 # =============================================================================
 
+def hover_time_strings(x, clock_start=None, show_recording=True):
+    """
+    Two string arrays for x in seconds: wall clock 'HH:MM:SS.s' and time into
+    the recording 'HH:MM:SS.s' (hours keep counting past 24). Vectorised, so
+    it is quick even for every point of a long recording.
+    """
+    x = np.asarray(x, dtype=float)
+    ok = np.isfinite(x)
+    ms = np.where(ok, np.round(x * 1000.0), 0).astype("int64")
+    n = x.size
+
+    def _hms_part(dt64, start, stop):
+        s = np.datetime_as_string(dt64, unit="ms")          # YYYY-MM-DDTHH:MM:SS.mmm
+        if s.dtype.itemsize // 4 != 23:                       # unusual year; slow path
+            return np.array([v[start:stop] for v in s.tolist()], dtype=object)
+        return np.ascontiguousarray(s.view("U1").reshape(-1, 23)[:, start:stop]) \
+            .view(f"U{stop - start}").ravel()
+
+    clock = np.full(n, "", dtype=object)
+    if clock_start is not None:
+        c0 = pd.Timestamp(clock_start)
+        if c0.tzinfo is not None:
+            c0 = c0.tz_localize(None)
+        c0 = np.datetime64(c0.to_datetime64(), "ms")
+        clock = _hms_part(c0 + ms.astype("timedelta64[ms]"), 11, 21).astype(object)
+    rec = np.full(n, "", dtype=object)
+    if show_recording:
+        a = np.abs(ms)
+        hours = (a // 3_600_000).astype(str)
+        hours = np.char.zfill(hours, 2)
+        mmss = _hms_part(np.datetime64(0, "ms") + (a % 3_600_000).astype("timedelta64[ms]"), 14, 21)
+        rec = np.char.add(np.char.add(np.where(ms < 0, "-", ""), np.char.add(hours, ":")),
+                          mmss.astype(str)).astype(object)
+    clock[~ok] = ""
+    rec[~ok] = ""
+    return clock, rec
+
+
+def add_time_hover(fig, clock_start=None, show_recording=True):
+    """
+    Put the wall-clock time and the time into the recording at the top of
+    the hover box of every subplot: the first line or bar trace on each
+    x-axis gets them as its first hover line, and the unified hover title
+    (which would only show seconds) is blanked. Call after decimation.
+    """
+    import re
+    if clock_start is None and not show_recording:
+        return fig
+    done = set()
+    for tr in fig.data:
+        if tr.type not in ("scatter", "scattergl", "bar") or tr.x is None or tr.y is None:
+            continue
+        if tr.visible in (False, "legendonly"):
+            continue
+        if tr.type != "bar" and "lines" not in (tr.mode or "lines"):
+            continue
+        if tr.type != "bar" and tr.fill not in (None, "none"):
+            continue
+        ax = tr.xaxis or "x"
+        if ax in done:
+            continue
+        try:
+            x = np.asarray(tr.x, dtype=float)
+        except (TypeError, ValueError):
+            continue
+        if x.size == 0 or len(tr.y) != x.size:
+            continue
+        clock, rec = hover_time_strings(x, clock_start, show_recording)
+        old = tr.customdata
+        cols = [clock, rec]
+        shift = 2
+        if old is not None and not isinstance(old, str) and len(old) == x.size:
+            o = np.asarray(old, dtype=object)
+            o = o.reshape(x.size, -1)
+            cols += [o[:, j] for j in range(o.shape[1])]
+        cd = np.empty((x.size, len(cols)), dtype=object)
+        for j, c in enumerate(cols):
+            cd[:, j] = c
+        head = []
+        if clock_start is not None:
+            head.append("<b>%{customdata[0]}</b>")
+        if show_recording:
+            head.append("recording %{customdata[1]}")
+        body = tr.hovertemplate
+        if body:
+            body = re.sub(r"customdata\[(\d+)\]", lambda m: f"customdata[{int(m.group(1)) + shift}]", body)
+            body = body.replace("<extra></extra>", "")
+        else:
+            body = f"{tr.name or 'value'}: %{{y:.4g}}"
+        tr.update(customdata=cd, hovertemplate=" · ".join(head) + "<br>" + body + "<extra></extra>")
+        done.add(ax)
+    if done:
+        fig.update_xaxes(unifiedhovertitle=dict(text=" "))
+    return fig
+
+
 @st.fragment
 def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0,
                 peaks=False, peak_default_on=False, config=None, ruler=True, compact=False,
-                event_counts=None):
+                event_counts=None, time_hover=None):
     """
     Show one Plotly figure with an optional peaks panel and two-click time
     ruler. event_counts: optional list of (label, times_sec, grams_each or
     None); the ruler then also reports how many of those events fall
-    between its two points (e.g. pellets eaten). Runs as a fragment: clicking the graph or changing these controls
+    between its two points (e.g. pellets eaten). time_hover: None, or
+    "clock+recording" / "clock" to put those times at the top of the hover
+    box (x must be seconds). Runs as a fragment: clicking the graph or changing these controls
     reruns only this block, not the whole app.
     """
     fig = go.Figure(fig)                 # never mutate the caller's figure
@@ -476,6 +574,8 @@ def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0
                           fillcolor="rgba(15,118,110,0.08)", line_width=0, layer="below")
 
     lighten_figure(fig, max_points)
+    if time_hover and x_unit_sec == 1.0:
+        add_time_hover(fig, clock_start, show_recording="recording" in str(time_hover))
     cfg = dict(config or _CONFIG)
     if ruler_on:
         # Plotly only reports clicks on MARKERS, never on a bare line. Give

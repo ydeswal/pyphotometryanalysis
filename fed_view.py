@@ -17,6 +17,9 @@ shared PC clock.
   4. All animals                    cumulative intake of every animal together,
                                     plus a summary table
 
+The signal can be dF/F, z-score, or a raw channel (465 and 405 together on
+their own axes, or one at a time). The time axis shows the wall clock and the
+time into the recording together, and the hover box gives both for any point.
 All graphs carry the time ruler (which also counts pellets between its two
 points) and the peaks/troughs tool.
 """
@@ -37,11 +40,30 @@ _MEAL = "rgba(180,83,9,0.13)"
 _GAP = "rgba(148,163,184,0.22)"
 _CUM = "#7c3aed"
 _SIG = "#0072B2"
+_UV = "#009E73"
+
+RAW_BOTH = "Raw 465 + 405"
+TIME_AXES = ["Clock + recording time", "Clock time", "Recording time"]
+
+
+def signal_kinds(df, roi):
+    """Signal choices: dF/F and z-score first (the default), then the raw
+    465 and 405 together, then every other channel the recording has."""
+    types = list(gt.panel_types(df, roi))
+    main = [k for k in types if k.startswith(("z-score", "dF/F"))]
+    both = [RAW_BOTH] if "465 raw" in types and "405 raw" in types else []
+    return main + both + [k for k in types if k not in main]
 
 
 def _signal(df, roi, kind, smooth_min):
+    """-> t, y (the main trace), unit, extra. extra is None or (y, label) of
+    a second channel drawn on its own axis (the 405 for RAW_BOTH)."""
+    if kind == RAW_BOTH:
+        t, y, unit, _ = gt._panel_series(df, roi, "465 raw", 0.0)
+        _, y2, unit2, _ = gt._panel_series(df, roi, "405 raw", 0.0)
+        return t, y, unit, (y2, "405 raw" + (f" ({unit2})" if unit2 else ""))
     t, y, unit, _ = gt._panel_series(df, roi, kind, smooth_min * 60.0)
-    return t, y, unit
+    return t, y, unit, None
 
 
 def _gaps(cov_sec, t0, t1):
@@ -79,8 +101,24 @@ def _band(x0, x1, lo, hi):
     return bx, by
 
 
-def _clock_axis(fig, t0, t1, cs, rows=None):
-    vals, labels = gt.time_ticks(t0, t1, cs)
+def _axis_title(cs, mode, has_recording=True):
+    if cs is None or mode == "Recording time":
+        return "Time into recording (HH:MM:SS)" if has_recording else "Elapsed"
+    if mode == "Clock + recording time" and has_recording:
+        return "Clock time  ·  <span style='color:#64748b'>time into recording</span>"
+    return "Clock time"
+
+
+def _clock_axis(fig, t0, t1, cs, rows=None, mode="Clock time", has_recording=True):
+    """Ticks on round clock times; with "Clock + recording time" each tick
+    also shows how far into the recording it is (time_sec of that moment)."""
+    if cs is None or (mode == "Recording time" and has_recording):
+        vals, labels = gt.time_ticks(t0, t1, None)
+    else:
+        vals, labels = gt.time_ticks(t0, t1, cs)
+        if mode == "Clock + recording time" and has_recording and vals is not None:
+            labels = [f"{lab}<br><span style='color:#64748b'>{gt.fmt_hms(v, 0)}</span>"
+                      for lab, v in zip(labels, vals)]
     kw = dict(tickvals=vals, ticktext=labels, showgrid=True, gridcolor="#e5e7eb",
               range=[t0, t1])
     if rows:
@@ -92,7 +130,7 @@ def _clock_axis(fig, t0, t1, cs, rows=None):
 
 def _style(fig, height):
     fig.update_layout(template="plotly_white", height=height, hovermode="x unified",
-                      dragmode="pan", margin=dict(l=64, r=64, t=50, b=50),
+                      dragmode="pan", margin=dict(l=64, r=64, t=50, b=70),
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
                                   font=dict(color="#111827", size=12)),
                       font=dict(color="#111827"))
@@ -105,14 +143,20 @@ def _style(fig, height):
 # =============================================================================
 
 def stacked_figure(t, y, sig_label, pellets_s, meals, bins, gaps, t0, t1, cs,
-                   grams_each, bin_min, height):
+                   grams_each, bin_min, height, extra=None, time_mode="Clock time",
+                   has_recording=True):
+    title = sig_label + (f" and {extra[1]}" if extra is not None else "")
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
                         row_heights=[0.58, 0.42],
-                        specs=[[{}], [{"secondary_y": True}]],
-                        subplot_titles=(sig_label, f"Food: pellets per {bin_min:g} min and cumulative"))
+                        specs=[[{"secondary_y": extra is not None}], [{"secondary_y": True}]],
+                        subplot_titles=(title, f"Food: pellets per {bin_min:g} min and cumulative"))
     if t is not None:
         fig.add_trace(go.Scatter(x=t, y=y, mode="lines", name=sig_label,
                                  line=dict(color=_SIG, width=1.1)), row=1, col=1)
+        if extra is not None:
+            fig.add_trace(go.Scatter(x=t, y=extra[0], mode="lines", name=extra[1],
+                                     hovertemplate=f"{extra[1]}: %{{y:.4g}}<extra></extra>",
+                                     line=dict(color=_UV, width=1.1)), row=1, col=1, secondary_y=True)
         top = float(np.nanmax(y)) if np.isfinite(y).any() else 1.0
         bot = float(np.nanmin(y)) if np.isfinite(y).any() else 0.0
         if len(meals):
@@ -137,9 +181,14 @@ def stacked_figure(t, y, sig_label, pellets_s, meals, bins, gaps, t0, t1, cs,
                              hovertemplate="%{y:.2f} g eaten so far<extra></extra>"),
                   row=2, col=1, secondary_y=True)
     _add_gaps(fig, gaps, rows=[1, 2])
-    _clock_axis(fig, t0, t1, cs, rows=[1, 2])
-    fig.update_xaxes(title_text="Clock time" if cs is not None else "Elapsed", row=2, col=1)
-    fig.update_yaxes(title_text=sig_label, row=1, col=1)
+    _clock_axis(fig, t0, t1, cs, rows=[1, 2], mode=time_mode, has_recording=has_recording)
+    fig.update_xaxes(title_text=_axis_title(cs, time_mode, has_recording), row=2, col=1)
+    if extra is not None:
+        fig.update_yaxes(title_text=sig_label, row=1, col=1, title_font=dict(color=_SIG))
+        fig.update_yaxes(title_text=extra[1], row=1, col=1, secondary_y=True, showgrid=False,
+                         title_font=dict(color=_UV), tickformat=".4g")
+    else:
+        fig.update_yaxes(title_text=sig_label, row=1, col=1)
     fig.update_yaxes(title_text="pellets / bin", row=2, col=1, rangemode="tozero")
     fig.update_yaxes(title_text="cumulative (g)", row=2, col=1, secondary_y=True,
                      rangemode="tozero", showgrid=False)
@@ -147,10 +196,16 @@ def stacked_figure(t, y, sig_label, pellets_s, meals, bins, gaps, t0, t1, cs,
 
 
 def overlay_figure(t, y, sig_label, pellets_s, retrieval_s, meals, rate_grid, rate,
-                   gaps, t0, t1, cs, rate_win_min, height):
+                   gaps, t0, t1, cs, rate_win_min, height, extra=None, time_mode="Clock time"):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(x=t, y=y, mode="lines", name=sig_label,
                              line=dict(color=_SIG, width=1.1)), secondary_y=False)
+    if extra is not None:
+        # 405 on the right-hand axis; the eating rate moves to a third axis
+        # further right so neither is squashed onto the other's scale.
+        fig.add_trace(go.Scatter(x=t, y=extra[0], mode="lines", name=extra[1],
+                                 hovertemplate=f"{extra[1]}: %{{y:.4g}}<extra></extra>",
+                                 line=dict(color=_UV, width=1.1)), secondary_y=True)
     good = np.isfinite(y)
     at = np.interp(pellets_s, t[good], y[good]) if good.any() and pellets_s.size else np.array([])
     hover = [f"pellet {i + 1}" + (f" · taken {r:.1f} s after drop" if np.isfinite(r) else "")
@@ -159,14 +214,28 @@ def overlay_figure(t, y, sig_label, pellets_s, retrieval_s, meals, rate_grid, ra
                              marker=dict(size=7, color=_PELLET, line=dict(color="#fff", width=0.8)),
                              text=hover, hovertemplate="%{text}<br>signal %{y:.3g}<extra></extra>"),
                   secondary_y=False)
-    fig.add_trace(go.Scatter(x=rate_grid, y=rate, mode="lines", name=f"eating rate (pellets/h, {rate_win_min:g}-min window)",
-                             line=dict(color=_CUM, width=1.6, dash="dot")), secondary_y=True)
-    _add_gaps(fig, gaps)
-    _clock_axis(fig, t0, t1, cs)
-    fig.update_xaxes(title_text="Clock time" if cs is not None else "Elapsed")
-    fig.update_yaxes(title_text=sig_label, secondary_y=False)
-    fig.update_yaxes(title_text="pellets per hour", secondary_y=True, rangemode="tozero", showgrid=False,
+    rate_tr = go.Scatter(x=rate_grid, y=rate, mode="lines", name=f"eating rate (pellets/h, {rate_win_min:g}-min window)",
+                         line=dict(color=_CUM, width=1.6, dash="dot"),
+                         hovertemplate="eating rate: %{y:.1f} pellets/h<extra></extra>")
+    rate_axis = dict(title_text="pellets per hour", rangemode="tozero", showgrid=False,
                      tickmode="auto", nticks=6, tickformat=".0f")
+    if extra is None:
+        fig.add_trace(rate_tr, secondary_y=True)
+        fig.update_yaxes(secondary_y=True, **rate_axis)
+    else:
+        rate_tr.update(yaxis="y3")
+        fig.add_trace(rate_tr)
+        fig.update_layout(xaxis=dict(domain=[0.0, 0.9]),
+                          yaxis3=dict(overlaying="y", side="right", anchor="free", position=1.0,
+                                      title=dict(text="pellets per hour", font=dict(color=_CUM)),
+                                      rangemode="tozero", showgrid=False, nticks=6, tickformat=".0f"))
+        fig.update_yaxes(title_text=extra[1], secondary_y=True, showgrid=False,
+                         title_font=dict(color=_UV), tickformat=".4g")
+    _add_gaps(fig, gaps)
+    _clock_axis(fig, t0, t1, cs, mode=time_mode)
+    fig.update_xaxes(title_text=_axis_title(cs, time_mode))
+    fig.update_yaxes(title_text=sig_label, secondary_y=False,
+                     title_font=dict(color=_SIG) if extra is not None else None)
     return _style(fig, height)
 
 
@@ -276,21 +345,31 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         res = results[rec_of[animal]]
         df = prepare_df(res["df"])
         cs = gt.clock_start_of(df, res.get("settings"))
-        kinds = [k for k in gt.panel_types(df, roi) if k.startswith(("z-score", "dF/F"))] or list(gt.panel_types(df, roi))
-        sc = st.columns([1.4, 1, 3])
-        kind = sc[0].selectbox("Signal", kinds, key="fed_kind")
+        kinds = signal_kinds(df, roi)
+        sc = st.columns([1.4, 1, 1.6, 1.4])
+        kind = sc[0].selectbox("Signal", kinds, key="fed_kind",
+                               help="dF/F or z-score, or a raw channel. 'Raw 465 + 405' draws "
+                                    "both raw channels, each on its own axis.")
         smooth = sc[1].number_input("Running-mean window (min)", 0.5, 240.0, 30.0, 1.0, key="fed_smooth") \
             if "running" in kind else 30.0
-        t, y, unit = _signal(df, roi, kind, smooth)
+        time_mode = sc[2].radio("Time axis", TIME_AXES, key="fed_time_axis", horizontal=True,
+                                help="Clock time is the PC wall clock that the FED3 and photometry "
+                                     "share. Recording time is the time since this photometry "
+                                     "recording started (time 00:00:00).") \
+            if view != "Aligned to eating" else "Clock + recording time"
+        t, y, unit, extra = _signal(df, roi, kind, smooth)
         if cs is None:
             st.error("This recording has no clock time, so it cannot be lined up with the FED "
                      "data. Re-run the analysis with this version of the app.")
             return
         t0, t1 = float(np.nanmin(t)), float(np.nanmax(t))
-        sig_label = kind + (f" ({unit})" if unit and unit not in kind else "")
+        sig_label = ("465 raw" if kind == RAW_BOTH else kind) + (
+            f" ({unit})" if unit and unit not in kind else "")
     else:
         df = None
-        t = y = None
+        t = y = extra = None
+        res = None
+        time_mode = "Clock time"
         cs = ref_clock
         st.caption(f"No photometry recording is matched to {animal}; showing intake only.")
         sig_label = ""
@@ -311,6 +390,8 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     min_p = mc[1].number_input("Meal: min pellets", 1, 50, 2, 1, key="fed_mealmin")
     meals = fed3.find_meals(pellets_s, gap_s, int(min_p))
 
+    _times_strip(res, cs, t0, t1, cov_s)
+
     # Summary line
     logged_h = sum(max(0.0, min(b, t1) - max(a, t0)) for a, b in cov_s) / 3600.0
     st.markdown(
@@ -326,9 +407,11 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     if view == "Photometry above, food below":
         bins = fed3.intake_bins(pellets_s, t0, t1, bin_min * 60.0, cov_s)
         fig = stacked_figure(t, y, sig_label, pellets_s, meals, bins, gaps, t0, t1, cs,
-                             grams_each, bin_min, int(height_mult * 760))
+                             grams_each, bin_min, int(height_mult * 760), extra=extra,
+                             time_mode=time_mode, has_recording=t is not None)
         gt.chart_block(fig, key=key, max_points=max_points, clock_start=cs, config=config,
-                       peaks=t is not None, event_counts=counts)
+                       peaks=t is not None, event_counts=counts,
+                       time_hover="clock+recording" if t is not None else "clock")
         st.caption("Grey bands: the FED was not being logged, so intake there is unknown (not zero). "
                    "Ticks above the trace and shaded bands mark pellets and meals. Hover the bars for "
                    "pellets and grams per bin; use the 📏 ruler to count pellets between any two times.")
@@ -343,9 +426,9 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             cov_mask |= (grid >= a) & (grid <= b)
         rate = np.where(cov_mask, rate, np.nan)
         fig = overlay_figure(t, y, sig_label, pellets_s, retrieval, meals, grid, rate, gaps, t0, t1, cs,
-                             rate_win, h)
+                             rate_win, h, extra=extra, time_mode=time_mode)
         gt.chart_block(fig, key=key, max_points=max_points, clock_start=cs, config=config,
-                       peaks=True, event_counts=counts)
+                       peaks=True, event_counts=counts, time_hover="clock+recording")
         st.caption("Each orange dot is a pellet taken, placed on the signal at that moment. Dotted line: "
                    "eating rate. Turn on ▲▼ Peaks to see whether the highest peaks and lowest troughs "
                    "sit near eating; the 📏 ruler gives the time from a pellet to a peak.")
@@ -353,8 +436,45 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         if t is None:
             st.info("Match a photometry recording to this animal to align its signal to eating.")
             return
+        if extra is not None:
+            st.caption("Aligned on the 465 raw channel; the 405 channel is checked as the "
+                       "control below.")
         _aligned(t, y, sig_label, pellets_s, meals, cov_s, pel_rows[inside].reset_index(drop=True),
                  cs, animal, grams_each, h, config, df=df, roi=roi)
+
+
+def _times_strip(res, cs, t0, t1, cov_s):
+    """One box with the clock times of the recording, of what is shown, and
+    of each stretch of FED logging, each with its time into the recording."""
+    def both(v):
+        clock = gt.fmt_clock(cs, v)
+        return (f"<b>{clock[:21]}</b>" if res is None else
+                f"<b>{clock[:21]}</b> <span style='color:#64748b'>(recording {gt.fmt_hms(v, 1)})</span>")
+    parts = []
+    if res is not None:
+        df = res["df"]
+        full = pd.to_numeric(df["time_sec"], errors="coerce")
+        r0, r1 = float(full.min()), float(full.max())
+        parts.append(f"🕒 <b>Recording</b> {res['name']}: started {both(0.0 if r0 <= 0 <= r1 else r0)} · "
+                     f"ended {both(r1)} · length <b>{gt.fmt_hms(r1 - min(r0, 0.0), 0)}</b>")
+        if t0 > r0 + 1 or t1 < r1 - 1:
+            parts.append(f"Shown (visual crop): {both(t0)} → {both(t1)}")
+    else:
+        parts.append(f"🕒 Shown: {both(t0)} → {both(t1)}")
+    if cov_s:
+        segs = []
+        for a, b in sorted(cov_s):
+            a_, b_ = max(a, t0), min(b, t1)
+            if b_ <= a_:
+                continue
+            seg = f"{gt.fmt_clock(cs, a_)[11:19]}–{gt.fmt_clock(cs, b_)[11:19]}"
+            if res is not None:
+                seg += (f" <span style='color:#64748b'>(rec {gt.fmt_hms(a_, 0)}–"
+                        f"{gt.fmt_hms(b_, 0)})</span>")
+            segs.append(seg)
+        if segs:
+            parts.append("🍽 <b>FED logging</b>: " + " · ".join(segs))
+    st.markdown('<div class="pp-note">' + "<br>".join(parts) + "</div>", unsafe_allow_html=True)
 
 
 def _control_405(df, roi):
@@ -460,14 +580,15 @@ def _aligned(t, y, sig_label, pellets_s, meals, cov_s, pel_rows, cs, animal, gra
     tbl = pd.DataFrame({
         "#": np.arange(1, kept.size + 1),
         "clock time": [gt.fmt_clock(cs, v)[:19] for v in kept],
+        "recording time": [gt.fmt_hms(v, 1) for v in kept],
         "baseline mean": np.round(d_base, 4), "response mean": np.round(d_resp, 4),
         "change": np.round(d_resp - d_base, 4),
     })
     if meal_mode:
         mm = meals.set_index("onset").reindex(kept)
-        tbl.insert(2, "pellets in meal", mm["n_pellets"].to_numpy())
-        tbl.insert(3, "meal (g)", np.round(mm["n_pellets"].to_numpy() * grams_each, 3))
-        tbl.insert(4, "meal length (s)", np.round(mm["duration_s"].to_numpy(), 1))
+        tbl.insert(3, "pellets in meal", mm["n_pellets"].to_numpy())
+        tbl.insert(4, "meal (g)", np.round(mm["n_pellets"].to_numpy() * grams_each, 3))
+        tbl.insert(5, "meal length (s)", np.round(mm["duration_s"].to_numpy(), 1))
     st.dataframe(tbl, hide_index=True, use_container_width=True, height=min(420, 40 + 35 * len(tbl)))
     st.download_button("Download this table (CSV)", data=lambda: tbl.to_csv(index=False).encode(),
                        file_name=f"{animal}_{'meals' if meal_mode else 'pellets'}_aligned.csv",
@@ -510,7 +631,8 @@ def _all_animals(fed, sessions, grams_each, bin_min, ref, max_points, height_mul
     fig.update_yaxes(title_text="cumulative food (g)", rangemode="tozero")
     fig.update_xaxes(title_text="Clock time")
     _style(fig, int(height_mult * 520))
-    gt.chart_block(fig, key="fed_all", max_points=max_points, clock_start=ref, config=config)
+    gt.chart_block(fig, key="fed_all", max_points=max_points, clock_start=ref, config=config,
+                   time_hover="clock")
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     st.caption("Grey: no FED logging for any animal. Meals in this table use the default "
                "definition; change it per animal in the other views.")

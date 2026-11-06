@@ -78,6 +78,29 @@ df = pd.DataFrame({"time_sec": [100.0, 101.0], "clock_time": ["2026-10-14 10:24:
 check("clock start from a cropped frame",
       gt.clock_start_of(df) == pd.Timestamp("2026-10-14 10:23:00.423"))
 
+print("\n=== hover with clock and recording time ===")
+clk, rec = gt.hover_time_strings(np.array([-5.25, 0.0, 61.04, 90061.2, np.nan]),
+                                 pd.Timestamp("2026-10-15 23:59:30"))
+check("clock strings cross midnight", list(clk[:4]) == ["23:59:24.7", "23:59:30.0", "00:00:31.0", "01:00:31.2"],
+      str(list(clk)))
+check("recording time keeps counting past 24 h", list(rec[:4]) == ["-00:00:05.2", "00:00:00.0", "00:01:01.0",
+                                                                     "25:01:01.2"], str(list(rec)))
+check("NaN gives blank", clk[4] == "" and rec[4] == "")
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+f = make_subplots(rows=2, cols=1, shared_xaxes=True)
+f.add_trace(go.Scatter(x=[0, 10, 20], y=[1, 2, 3], name="sig"), row=1, col=1)
+f.add_trace(go.Scatter(x=[0, 10, 20], y=[4, 5, 6], name="iso"), row=1, col=1)
+f.add_trace(go.Bar(x=[5, 15], y=[2, 3], customdata=[[0.04], [0.06]],
+                   hovertemplate="%{y} pellets (%{customdata[0]:.2f} g)<extra></extra>"), row=2, col=1)
+gt.add_time_hover(f, cs, show_recording=True)
+check("first trace per subplot carries the times",
+      "customdata[0]" in f.data[0].hovertemplate and "recording %{customdata[1]}" in f.data[0].hovertemplate)
+check("other traces on that subplot untouched", f.data[1].hovertemplate is None)
+check("existing customdata shifted, not lost",
+      "customdata[2]" in f.data[2].hovertemplate and float(f.data[2].customdata[1][2]) == 0.06)
+check("bar row gets its clock time", f.data[2].customdata[0][0] == "10:23:05.4", str(f.data[2].customdata[0]))
+
 print("\n" + "=" * 60)
 print("RESULT: " + ("ALL TESTS PASSED" if not fails else f"{len(fails)} FAILURES: " + ", ".join(fails)))
 raise SystemExit(1 if fails else 0)
