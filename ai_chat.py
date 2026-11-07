@@ -285,7 +285,7 @@ class ToolError(Exception):
 
 
 _REC_RE = re.compile(r"^\s*(?:rec(?:ording)?(?:\s*time)?\s*|\+)\s*(-?)(\d+):(\d{1,2})(?::(\d{1,2}(?:\.\d*)?))?\s*$", re.I)
-_CLOCK_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}(?:\.\d*)?))?\s*$")
+_CLOCK_RE = re.compile(r"^\s*(\d{1,2})(?::(\d{2}))?(?::(\d{2}(?:\.\d*)?))?\s*(?:([ap])\.?\s*m\.?)?\s*$", re.I)
 _NUMONLY = re.compile(r"^\s*[-+]?\d+(?:\.\d*)?\s*$")
 
 
@@ -294,7 +294,8 @@ def parse_time(value, clock_start, span, notes=None, is_end=False):
     A time given by the AI -> pandas Timestamp (local wall clock).
 
       None / "" / "start" / "end"     edge of span
-      "13:40" / "13:40:02.5"          clock time; the date is taken from the
+      "1:40 PM" / "13:40" / "1:40:02.5 pm" / "3 pm"
+                                      clock time; the date is taken from the
                                       data span (first match if several days)
       "2026-10-15 13:40"              absolute clock time
       "rec 01:25:00" / "+01:25:00"    time into the recording
@@ -319,8 +320,14 @@ def parse_time(value, clock_start, span, notes=None, is_end=False):
         sec = int(m.group(2)) * 3600 + int(m.group(3)) * 60 + float(m.group(4) or 0)
         return clock_start + pd.Timedelta(seconds=-sec if m.group(1) else sec)
     m = _CLOCK_RE.match(v)
-    if m:
-        tod = pd.Timedelta(hours=int(m.group(1)), minutes=int(m.group(2)), seconds=float(m.group(3) or 0))
+    if m and (m.group(2) is not None or m.group(4)):
+        hour = int(m.group(1))
+        ap = (m.group(4) or "").lower()
+        if ap:
+            if not 1 <= hour <= 12:
+                raise ToolError(f"'{v}' is not a valid 12-hour time.")
+            hour = (hour % 12) + (12 if ap == "p" else 0)
+        tod = pd.Timedelta(hours=hour, minutes=int(m.group(2) or 0), seconds=float(m.group(3) or 0))
         day = s0.normalize() - pd.Timedelta(days=1)
         cands = []
         while day <= s1.normalize() + pd.Timedelta(days=1):
@@ -329,7 +336,8 @@ def parse_time(value, clock_start, span, notes=None, is_end=False):
                 cands.append(c)
             day += pd.Timedelta(days=1)
         if not cands:
-            raise ToolError(f"{v} is not inside the data ({s0:%Y-%m-%d %H:%M} to {s1:%Y-%m-%d %H:%M}).")
+            raise ToolError(f"{v} is not inside the data ({gt.fmt12(s0, 0, seconds=False)} to "
+                            f"{gt.fmt12(s1, 0, seconds=False)}).")
         if len(cands) > 1 and notes is not None:
             notes.append(f"'{v}' occurs on {len(cands)} days; used {cands[0]:%Y-%m-%d}. "
                          "Give the date to choose another day.")
@@ -338,7 +346,7 @@ def parse_time(value, clock_start, span, notes=None, is_end=False):
         ts = pd.Timestamp(v)
         return ts.tz_localize(None) if ts.tzinfo is not None else ts
     except (ValueError, TypeError):
-        raise ToolError(f"Could not read the time '{value}'. Use 13:40, 2026-10-15 13:40, "
+        raise ToolError(f"Could not read the time '{value}'. Use 1:40 PM, 2026-10-15 1:40 PM, "
                         "rec 01:25:00 or seconds.") from None
 
 
@@ -510,7 +518,7 @@ class DataContext:
     def tfmt(ts, cs=None):
         if ts is None or pd.isna(ts):
             return None
-        s = pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S.%f")[:21]
+        s = gt.fmt12(ts, decimals=1)
         if cs is not None:
             s += " | rec " + gt.fmt_hms((pd.Timestamp(ts) - cs).total_seconds(), 1)
         return s
@@ -573,7 +581,7 @@ def tool_signal_trace(ctx, recording=None, signal="dff", start=None, end=None, p
     for i in range(pts):
         seg = y[idx[i]:idx[i + 1]]
         seg = seg[np.isfinite(seg)]
-        rows.append([ctx.sec_fmt(edges[i], cs)[11:21],
+        rows.append([gt.fmt_clock(cs, edges[i], date=False, decimals=1),
                      _r(seg.mean()) if seg.size else None,
                      _r(seg.min()) if seg.size else None,
                      _r(seg.max()) if seg.size else None])
@@ -611,7 +619,7 @@ def tool_compare_windows(ctx, recording=None, signal="dff", windows=None):
         a, b, cs = ctx.window(w.get("start"), w.get("end"), res=res)
         m = _sel(t, (a - cs).total_seconds(), (b - cs).total_seconds()) & np.isfinite(y)
         yy = y[m]
-        rows.append({"label": w.get("label") or f"{a:%H:%M}-{b:%H:%M}",
+        rows.append({"label": w.get("label") or f"{gt.fmt12(a, 0, False, False)}-{gt.fmt12(b, 0, False, False)}",
                      "window": [ctx.tfmt(a, cs), ctx.tfmt(b, cs)], "samples": int(yy.size),
                      "mean": _r(yy.mean()) if yy.size else None,
                      "sd": _r(yy.std(ddof=1)) if yy.size > 1 else None,
@@ -694,7 +702,7 @@ def tool_intake(ctx, animal=None, start=None, end=None, bin_minutes=60):
             "pellets": n, "food_g": _r(n * ctx.grams), "hours_with_fed_logging": _r(logged_h),
             "pellets_per_logged_hour": _r(n / logged_h) if logged_h else None,
             "columns": ["bin start (clock)", "pellets (null = FED not logging)"],
-            "rows": [[ctx.tfmt(ref + pd.Timedelta(seconds=r.start), None)[5:16],
+            "rows": [[(lambda x: f"{x:%m-%d} {gt.fmt12(x, 0, False, False)}")(ref + pd.Timedelta(seconds=r.start)),
                       None if pd.isna(r.pellets) else int(r.pellets)] for r in bins.itertuples()]}
 
 
@@ -853,7 +861,7 @@ def tool_raw_ppd_window(ctx, recording=None, start=None, end=None, points=30):
         clip = d.get(f"{key}_clipping_fraction")
         if clip is not None:
             out["channels"][name]["clipping_fraction_whole_file"] = _r(clip)
-    out["bin_starts_clock"] = [ctx.tfmt(p0 + pd.Timedelta(seconds=float(tax[e])), None)[11:21]
+    out["bin_starts_clock"] = [gt.fmt12(p0 + pd.Timedelta(seconds=float(tax[e])), 1, date=False)
                                for e in edges[:-1]]
     for dk in ("digital_1", "digital_2"):
         if dk in d:
@@ -963,7 +971,7 @@ def tool_time_difference(ctx, start=None, end=None, recording=None):
 
 # ---- tool registry -------------------------------------------------------
 
-_T = {"type": "string", "description": "13:40 | 2026-10-15 13:40 | rec 01:25:00 | seconds; omit = all"}
+_T = {"type": "string", "description": "1:40 PM | 2026-10-15 1:40 PM | rec 01:25:00 | seconds; omit = all"}
 _SIG = {"type": "string", "enum": list(SIGNALS)}
 _REC = {"type": "string", "description": "recording name or animal ID"}
 _AN = {"type": "string", "description": "animal ID"}
@@ -1077,7 +1085,7 @@ def run_tool(ctx, name, args):
 
 def catalogue(ctx, focus=None):
     """Compact description of the loaded data and of what is on screen."""
-    L = [f"Today: {_dt.datetime.now():%Y-%m-%d %H:%M}. ROI: {ctx.roi}."]
+    L = [f"Today: {gt.fmt12(pd.Timestamp.now(), 0, seconds=False)}. ROI: {ctx.roi}."]
     if ctx.results:
         L.append("PHOTOMETRY RECORDINGS:")
         for r in ctx.results:
@@ -1102,7 +1110,8 @@ def catalogue(ctx, focus=None):
         for an in ctx.fed.animals:
             cov = ctx.fed.coverage_of(an, ctx.sessions)
             n = len(ctx.fed.times(an, "pellet", ctx.sessions))
-            segs = "; ".join(f"{r.start:%m-%d %H:%M}-{r.stop:%m-%d %H:%M}" for r in cov.itertuples())
+            segs = "; ".join(f"{r.start:%m-%d} {gt.fmt12(r.start, 0, False, False)} to "
+                             f"{r.stop:%m-%d} {gt.fmt12(r.stop, 0, False, False)}" for r in cov.itertuples())
             L.append(f"- {an}: {n} pellets in used sessions; FED logging {segs or 'unknown'}")
     else:
         L.append("No FED3 data loaded.")
@@ -1123,7 +1132,8 @@ DATA CATALOGUE. Never estimate, recall or invent values, and never read values o
 2. Never do arithmetic yourself. For any difference, ratio, percentage or unit conversion call `calculate`; \
 for any time span call `time_difference` (get_signal_summary already gives the time from min to max).
 3. If the tools cannot answer, say so plainly and say what data or setting would be needed.
-4. Quote times as the tools give them: clock time, and the time into the recording when relevant.
+4. Write clock times in 12-hour form with AM/PM (e.g. 3:57 PM), as the tools give them, and add the time \
+into the recording (rec HH:MM:SS, a duration) when relevant. Never write clock times in 24-hour form.
 5. Separate what the data show from interpretation. FED gaps mean "not logged", not "not eating". Mention the \
 405 control when you discuss a response. Never claim causation from correlation.
 
@@ -1147,14 +1157,36 @@ def system_prompt(ctx, focus=None):
 # GROUNDING CHECK
 # =============================================================================
 
-_TIME_TOK = re.compile(r"(?<![\d:])\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?![\d:])")
+_TIME_TOK = re.compile(r"(?<![\d:])\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?![\d:])(?:\s*[AaPp]\.?\s?[Mm]\b\.?)?")
+_HOUR_TOK = re.compile(r"(?<![\d:.])(\d{1,2})\s*([AaPp])\.?\s?[Mm]\b\.?")
+
+
+def _time_forms(tok):
+    """Normalised forms of a time token: as written (zero-padded) and, when it
+    has AM/PM, converted to 24 h. Each at minute, second and full precision."""
+    m = re.match(r"(\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?\s*(?:([AaPp])\.?\s?[Mm]\.?)?", tok.strip())
+    if not m:
+        return set()
+    h, mi, se, fr, ap = int(m.group(1)), m.group(2), m.group(3), m.group(4) or "", (m.group(5) or "").lower()
+    hours = {h}
+    if ap and 1 <= h <= 12:
+        hours = {(h % 12) + (12 if ap == "p" else 0)}
+    out = set()
+    for hh in hours:
+        base = f"{hh:02d}:{mi}"
+        out.add(base)
+        if se is not None:
+            out.add(f"{base}:{se}")
+            if fr:
+                out.add(f"{base}:{se}{fr}")
+    return out
 _DATE_TOK = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _NUM_TOK = re.compile(r"(?<![\w.])[-−+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\w])")
 
 
 def _nums(text):
     out = []
-    for m in _NUM_TOK.finditer(_TIME_TOK.sub(" ", _DATE_TOK.sub(" ", text))):
+    for m in _NUM_TOK.finditer(_HOUR_TOK.sub(" ", _TIME_TOK.sub(" ", _DATE_TOK.sub(" ", text)))):
         s = m.group(0).replace("−", "-").replace(",", "")
         try:
             out.append(float(s))
@@ -1177,14 +1209,16 @@ def check_grounding(answer, reference_text):
     (n_checked, unverified_tokens).
     """
     ref_nums = np.array(_nums(reference_text) or [np.nan])
-    ref_times = set()
+    ref_times, ref_bare = set(), set()     # 24-hour forms; 12-hour forms written without AM/PM
     for m in _TIME_TOK.finditer(reference_text):
         tok = m.group(0)
-        parts = tok.split(":")
-        ref_times.add(":".join(p.zfill(2) for p in parts[:2]))
-        if len(parts) > 2:
-            ref_times.add(":".join(p.zfill(2) for p in parts[:2]) + ":" + parts[2].split(".")[0].zfill(2))
-            ref_times.add(":".join(p.zfill(2) for p in parts[:2]) + ":" + parts[2].zfill(2))
+        ref_times |= _time_forms(tok)
+        bare = re.sub(r"\s*[AaPp]\.?\s?[Mm]\.?$", "", tok)      # '3:57 PM' may be written '3:57'
+        if bare != tok:
+            ref_bare |= _time_forms(bare)
+    for m in _HOUR_TOK.finditer(reference_text):          # '6 PM' in the question
+        ref_times |= _time_forms(f"{m.group(1)}:00 {m.group(2)}M")
+    ref_hours = {t[:2] for t in ref_times}
     ref_dates = set(_DATE_TOK.findall(reference_text))
     checked, bad = 0, []
     text = re.sub(r"(?m)^\s*\d+[.)]\s", " ", answer)          # list numbering
@@ -1192,14 +1226,21 @@ def check_grounding(answer, reference_text):
         checked += 1
         if m.group(0) not in ref_dates:
             bad.append(m.group(0))
-    for m in _TIME_TOK.finditer(_DATE_TOK.sub(" ", text)):
-        tok = m.group(0)
-        parts = tok.split(":")
-        norm = ":".join(p.zfill(2) for p in parts[:2]) + (":" + parts[2].zfill(2) if len(parts) > 2 else "")
+    no_dates = _DATE_TOK.sub(" ", text)
+    for m in _TIME_TOK.finditer(no_dates):
+        tok = m.group(0).strip().rstrip(".")
+        forms = _time_forms(tok)
+        full = max(forms, key=len) if forms else tok
+        has_ap = bool(re.search(r"[AaPp]\.?\s?[Mm]$", tok))
         checked += 1
-        if norm not in ref_times:
+        if not (full in ref_times or (not has_ap and full in ref_bare)):
             bad.append(tok)
-    for m in _NUM_TOK.finditer(_TIME_TOK.sub(" ", _DATE_TOK.sub(" ", text))):
+    for m in _HOUR_TOK.finditer(_TIME_TOK.sub(" ", no_dates)):
+        f = _time_forms(f"{m.group(1)}:00 {m.group(2)}M")
+        checked += 1
+        if not f or next(iter(f))[:2] not in ref_hours:
+            bad.append(m.group(0).strip().rstrip("."))
+    for m in _NUM_TOK.finditer(_HOUR_TOK.sub(" ", _TIME_TOK.sub(" ", no_dates))):
         tok = m.group(0)
         try:
             x = float(tok.replace("−", "-").replace(",", ""))

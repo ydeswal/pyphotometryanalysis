@@ -79,11 +79,68 @@ def fmt_hms(seconds, decimals=2):
     return f"{sign}{int(h):02d}:{int(m):02d}:{sec:0{width}.{decimals}f}"
 
 
-def fmt_clock(clock_start, seconds):
+def fmt12(ts, decimals=1, date=True, seconds=True):
+    """
+    A wall-clock time in 12-hour form, e.g. '2026-11-04 3:57:31.6 PM'.
+    Fractions of a second are cut, not rounded, so a time never shows the
+    next second. date=False drops the date; seconds=False gives '3:57 PM'.
+    """
+    if ts is None or pd.isna(ts):
+        return ""
+    ts = pd.Timestamp(ts)
+    h = ts.hour % 12 or 12
+    out = f"{h}:{ts.minute:02d}"
+    if seconds:
+        out += f":{ts.second:02d}"
+        if decimals:
+            frac = int(ts.microsecond // 10 ** (6 - decimals))
+            out += "." + str(frac).zfill(decimals)
+    out += " AM" if ts.hour < 12 else " PM"
+    return (ts.strftime("%Y-%m-%d ") + out) if date else out
+
+
+def fmt_clock(clock_start, seconds, date=True, decimals=2):
+    """Wall-clock time of `seconds` into a recording, 12-hour with AM/PM."""
     if clock_start is None or seconds is None or not np.isfinite(seconds):
         return ""
     ts = pd.Timestamp(clock_start) + pd.Timedelta(seconds=float(seconds))
-    return ts.strftime("%Y-%m-%d %H:%M:%S.%f")[:-4]
+    return fmt12(ts, decimals=decimals, date=date)
+
+
+def iso_to_12h(values, with_date="md"):
+    """
+    Vectorised: ISO clock strings 'YYYY-MM-DD HH:MM:SS.fff' -> 12-hour
+    strings ('MM-DD h:MM:SS.fff PM' with with_date="md", 'YYYY-MM-DD ...' with
+    "ymd", time only with None). Strings that do not look like ISO times are
+    passed through unchanged.
+    """
+    v = np.asarray(values).astype(str)
+    out = v.astype(object)
+    if v.size == 0:
+        return out
+    w = v.dtype.itemsize // 4
+    if w < 19:
+        return out
+    ch = np.ascontiguousarray(v).view("U1").reshape(-1, w)
+    good = (ch[:, 4] == "-") & (ch[:, 13] == ":") & np.isin(ch[:, 11], list("012")) \
+        & np.char.isdigit(ch[:, 12])
+    if not good.any():
+        return out
+    g = ch[good]
+    hh = g[:, 11].astype(int) * 10 + g[:, 12].astype(int)
+    h12 = hh % 12
+    h12[h12 == 0] = 12
+    rest = np.ascontiguousarray(g[:, 13:]).view(f"U{w - 13}").ravel()
+    rest = np.char.rstrip(rest)
+    t12 = np.char.add(np.char.add(h12.astype(str), rest), np.where(hh < 12, " AM", " PM"))
+    if with_date == "md":
+        pre = np.ascontiguousarray(g[:, 5:11]).view("U6").ravel()
+    elif with_date == "ymd":
+        pre = np.ascontiguousarray(g[:, 0:11]).view("U11").ravel()
+    else:
+        pre = None
+    out[good] = (np.char.add(pre, t12) if pre is not None else t12).astype(object)
+    return out
 
 
 def clock_start_of(df, settings=None):
@@ -125,11 +182,10 @@ def time_ticks(xmin, xmax, clock_start=None, target=8):
     abs0 = (c0 - c0.normalize()).total_seconds() + xmin
     first = math.ceil(abs0 / step) * step
     vals = np.arange(first, abs0 + span + 1e-9, step) - abs0 + xmin
-    fmt = "%H:%M" if step >= 60 else "%H:%M:%S"
     labels = []
     for v in vals:
         ts = (c0 + pd.Timedelta(seconds=float(v))).round("ms")   # 11:59:59.999999 -> 12:00
-        lab = ts.strftime(fmt)
+        lab = fmt12(ts, decimals=0, date=False, seconds=step < 60)
         if ts.hour == 0 and ts.minute == 0 and ts.second == 0 or v == vals[0]:
             lab = ts.strftime("%b %d<br>") + lab
         labels.append(lab)
@@ -385,9 +441,9 @@ def _peak_controls(fig, key, trace_k, x_unit_sec, clock_start, default_markers, 
                                + "<extra></extra>"),
             ))
         msg = (f"Current ceiling **{y2[i_max]:.4g}** at {fmt_hms(t[i_max])}"
-               + (f" ({fmt_clock(clock_start, t[i_max])[11:]})" if clock_start is not None else "")
+               + (f" ({fmt_clock(clock_start, t[i_max], date=False)})" if clock_start is not None else "")
                + f" · floor **{y2[i_min]:.4g}** at {fmt_hms(t[i_min])}"
-               + (f" ({fmt_clock(clock_start, t[i_min])[11:]})" if clock_start is not None else ""))
+               + (f" ({fmt_clock(clock_start, t[i_min], date=False)})" if clock_start is not None else ""))
         if spans:
             msg += f" · {len(spans)} event(s) removed from the display"
         st.caption(msg)
@@ -420,7 +476,7 @@ def _peak_controls(fig, key, trace_k, x_unit_sec, clock_start, default_markers, 
 
 def hover_time_strings(x, clock_start=None, show_recording=True):
     """
-    Two string arrays for x in seconds: wall clock 'HH:MM:SS.s' and time into
+    Two string arrays for x in seconds: wall clock 'h:MM:SS.s AM' and time into
     the recording 'HH:MM:SS.s' (hours keep counting past 24). Vectorised, so
     it is quick even for every point of a long recording.
     """
@@ -442,7 +498,14 @@ def hover_time_strings(x, clock_start=None, show_recording=True):
         if c0.tzinfo is not None:
             c0 = c0.tz_localize(None)
         c0 = np.datetime64(c0.to_datetime64(), "ms")
-        clock = _hms_part(c0 + ms.astype("timedelta64[ms]"), 11, 21).astype(object)
+        hms = _hms_part(c0 + ms.astype("timedelta64[ms]"), 11, 21)      # HH:MM:SS.s
+        ch = np.ascontiguousarray(np.asarray(hms).astype("U10")).view("U1").reshape(-1, 10)
+        hh = ch[:, 0].astype(int) * 10 + ch[:, 1].astype(int)
+        h12 = hh % 12
+        h12[h12 == 0] = 12
+        rest = np.ascontiguousarray(ch[:, 2:]).view("U8").ravel()
+        clock = np.char.add(np.char.add(h12.astype(str), rest),
+                            np.where(hh < 12, " AM", " PM")).astype(object)
     rec = np.full(n, "", dtype=object)
     if show_recording:
         a = np.abs(ms)
@@ -620,7 +683,7 @@ def _ruler_readout(pts, clock_start, t, y, label, event_counts=None):
     d = b - a
 
     def _pt(v):
-        return f"**{fmt_hms(v)}**" + (f" (clock {fmt_clock(clock_start, v)[11:]})"
+        return f"**{fmt_hms(v)}**" + (f" (clock {fmt_clock(clock_start, v, date=False)})"
                                       if clock_start is not None else "")
     st.markdown(f"📏 Point 1 {_pt(a)} → Point 2 {_pt(b)}  \n"
                 f"**Time between: {fmt_hms(d)}**")

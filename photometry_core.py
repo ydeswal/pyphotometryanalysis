@@ -522,7 +522,7 @@ def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
             clock["start_local"] = start_hdr.isoformat()
             notes.append(
                 f"No per-sample PC timestamps. Clock times are the header start time "
-                f"({start_hdr:%Y-%m-%d %H:%M:%S}) plus elapsed time on the sample clock.")
+                f"({_clock12(start_hdr, ms=False, date=True)}) plus elapsed time on the sample clock.")
         _end_time_check(clock, header, start_hdr, fs, n_samples)
         return clock
 
@@ -625,7 +625,7 @@ def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
         g["at_elapsed_sec"] = sg["t0"] - g["gap_sec"]
     clock["gaps"] = gaps
 
-    start_txt = (pd.Timestamp(clock["start_local"]).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    start_txt = (_clock12(clock["start_local"], date=True)
                  if clock["start_local"] else f"Unix {start_unix:.3f}")
     off_txt = (f" (UTC{int(utc_offset) // 3600:+03d}:{abs(int(utc_offset)) % 3600 // 60:02d})"
                if utc_offset is not None else "")
@@ -661,6 +661,16 @@ def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
     return clock
 
 
+def _clock12(ts, ms=True, date=False):
+    """Wall-clock time for messages, 12-hour with AM/PM: '3:57:31.571 PM'."""
+    ts = pd.Timestamp(ts)
+    out = f"{ts.hour % 12 or 12}:{ts.minute:02d}:{ts.second:02d}"
+    if ms:
+        out += f".{ts.microsecond // 1000:03d}"
+    out += " AM" if ts.hour < 12 else " PM"
+    return (ts.strftime("%Y-%m-%d ") + out) if date else out
+
+
 def _end_time_check(clock, header, start_hdr, fs, n_samples):
     """Compare the header's end_time (wall clock at stop) with both predictions."""
     end_hdr = _parse_local(header.get("end_time"))
@@ -680,7 +690,7 @@ def _end_time_check(clock, header, start_hdr, fs, n_samples):
     clock["end_time_check"] = chk
     if -0.5 <= lag <= 10:
         clock["notes"].append(
-            f"Cross-check: the header end_time ({end_hdr.strftime('%H:%M:%S.%f')[:-3]}) "
+            f"Cross-check: the header end_time ({_clock12(end_hdr)}) "
             f"falls {lag:.2f} s after the last sample on this time axis, as it should.")
         if chk.get("end_minus_pc_last_sample_sec", 0) < -0.5:
             clock["notes"].append(
@@ -689,9 +699,9 @@ def _end_time_check(clock, header, start_hdr, fs, n_samples):
                 "impossible, so they drifted from the wall clock; that is why the time "
                 "axis follows the sample clock.")
     else:
-        msg = (f"The header end_time ({end_hdr.strftime('%H:%M:%S.%f')[:-3]}) is "
+        msg = (f"The header end_time ({_clock12(end_hdr)}) is "
                f"{lag:+.2f} s from the last sample on this time axis "
-               f"({pred.strftime('%H:%M:%S.%f')[:-3]}); it should be slightly after it.")
+               f"({_clock12(pred)}); it should be slightly after it.")
         if clock["source"] == "pc":
             msg += (" The per-sample PC timestamps have drifted from the wall clock. For "
                     "aligning with other devices that log the PC wall clock (FED3 "

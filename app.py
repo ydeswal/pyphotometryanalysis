@@ -916,6 +916,15 @@ def make_zip_from_results(results, roi):
 # OVERRIDES: light-mode Plotly styling, HH:MM:SS hover, and one main dFF graph
 # =============================================================================
 
+def _preview_12h(df):
+    """Copy of a data preview with clock_time shown in 12-hour form (the CSV keeps ISO time)."""
+    if df is None or "clock_time" not in df.columns:
+        return df
+    out = df.copy()
+    out["clock_time"] = gt.iso_to_12h(out["clock_time"].astype(str).str.slice(0, 23).to_numpy(), with_date="ymd")
+    return out
+
+
 def apply_hms_hover(fig, df):
     """Make hover show Time as HH:MM:SS instead of raw seconds."""
     if df is None or "elapsed_hhmmss" not in df.columns:
@@ -926,7 +935,7 @@ def apply_hms_hover(fig, df):
     # or lickometer log by its clock time.
     clock = None
     if "clock_time" in df.columns:
-        clock = df["clock_time"].astype(str).str.slice(5, 23).to_numpy()   # MM-DD HH:MM:SS.fff
+        clock = gt.iso_to_12h(df["clock_time"].astype(str).str.slice(0, 23).to_numpy())  # MM-DD h:MM:SS.fff PM
     n = len(hms)
     for trace in fig.data:
         try:
@@ -1706,7 +1715,8 @@ def render_diagnostics(settings):
                    if settings.get("pc_timestamps") else "header start time + sample clock")
             gaps = (settings.get("clock_check") or {}).get("gaps") or []
             st.caption(
-                f"🕒 **{st_ts:%a %Y-%m-%d %H:%M:%S}** → **{end_ts:%a %Y-%m-%d %H:%M:%S}** "
+                f"🕒 **{st_ts:%a %Y-%m-%d} {gt.fmt12(st_ts, 0, date=False)}** → "
+                f"**{end_ts:%a %Y-%m-%d} {gt.fmt12(end_ts, 0, date=False)}** "
                 f"local time{' (cropped window)' if offset else ''} · {src}"
                 + (f" · {len(gaps)} gap(s) with lost samples" if gaps else " · no lost samples"
                    if settings.get("pc_timestamps") else "")
@@ -2705,7 +2715,7 @@ else:
             render_chart(focus_graph)
             with st.expander("Data preview and downloads"):
                 st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
-                st.dataframe(view_df.head(500), use_container_width=True, height=360)
+                st.dataframe(_preview_12h(view_df.head(500)), use_container_width=True, height=360)
                 st.download_button(
                     label=f"Download full processed CSV for {result['name']}",
                     data=lambda _d=full_df: _d.to_csv(index=False).encode("utf-8"),
@@ -2726,7 +2736,7 @@ else:
         )
         if view == "Data preview":
             st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
-            st.dataframe(view_df.head(500), use_container_width=True, height=360)
+            st.dataframe(_preview_12h(view_df.head(500)), use_container_width=True, height=360)
             st.download_button(
                 label=f"Download full processed CSV for {result['name']}",
                 data=lambda _d=full_df: _d.to_csv(index=False).encode("utf-8"),
@@ -2848,7 +2858,7 @@ else:
                             f"**{r['name']}**: lick file starts "
                             f"{'+' if shift >= 0 else '-'}{seconds_to_hms(abs(shift))} "
                             f"relative to the photometry start "
-                            f"({pd.Timestamp(r['settings']['start_clock_local']):%Y-%m-%d %H:%M:%S}); "
+                            f"({gt.fmt12(pd.Timestamp(r['settings']['start_clock_local']), 0)}); "
                             "lick times were shifted onto the photometry clock.")
                         dur_r = float(r["df"]["time_sec"].max())
                         inside = np.mean((t_r >= 0) & (t_r <= dur_r)) if t_r.size else 1.0

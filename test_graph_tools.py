@@ -68,7 +68,15 @@ print("\n=== time formatting / ticks ===")
 check("fmt_hms", gt.fmt_hms(3725.256) == "01:02:05.26", gt.fmt_hms(3725.256))
 check("fmt_hms negative", gt.fmt_hms(-12.5) == "-00:00:12.50", gt.fmt_hms(-12.5))
 cs = pd.Timestamp("2026-10-14 10:23:00.423")
-check("fmt_clock", gt.fmt_clock(cs, 3600) == "2026-10-14 11:23:00.42", gt.fmt_clock(cs, 3600))
+check("fmt_clock is 12-hour", gt.fmt_clock(cs, 3600) == "2026-10-14 11:23:00.42 AM", gt.fmt_clock(cs, 3600))
+check("noon and midnight", gt.fmt12(pd.Timestamp("2026-11-05 12:05:09"), 0) == "2026-11-05 12:05:09 PM"
+      and gt.fmt12(pd.Timestamp("2026-11-05 00:18:06"), 0, date=False) == "12:18:06 AM")
+check("fractions cut, never rounded up", gt.fmt12(pd.Timestamp("2026-11-05 13:40:59.96"), 1, date=False) == "1:40:59.9 PM")
+v, lab = gt.time_ticks(0, 18 * 3600, pd.Timestamp("2026-11-04 15:57:31.571"))
+check("clock ticks in 12-hour form", lab[:3] == ["Nov 04<br>6:00 PM", "9:00 PM", "Nov 05<br>12:00 AM"], str(lab))
+check("ISO strings to 12-hour (vectorised)", list(gt.iso_to_12h(["2026-11-04 15:57:31.571", "2026-11-05 00:18:06.000",
+                                                                 "n/a"])) == ["11-04 3:57:31.571 PM",
+                                                                              "11-05 12:18:06.000 AM", "n/a"])
 v, lab = gt.time_ticks(0, 86_400, cs)
 check("clock ticks land on round clock times",
       all((cs + pd.Timedelta(seconds=float(x))).round("ms").minute == 0 for x in v), str(lab[:3]))
@@ -81,7 +89,7 @@ check("clock start from a cropped frame",
 print("\n=== hover with clock and recording time ===")
 clk, rec = gt.hover_time_strings(np.array([-5.25, 0.0, 61.04, 90061.2, np.nan]),
                                  pd.Timestamp("2026-10-15 23:59:30"))
-check("clock strings cross midnight", list(clk[:4]) == ["23:59:24.7", "23:59:30.0", "00:00:31.0", "01:00:31.2"],
+check("clock strings cross midnight", list(clk[:4]) == ["11:59:24.7 PM", "11:59:30.0 PM", "12:00:31.0 AM", "1:00:31.2 AM"],
       str(list(clk)))
 check("recording time keeps counting past 24 h", list(rec[:4]) == ["-00:00:05.2", "00:00:00.0", "00:01:01.0",
                                                                      "25:01:01.2"], str(list(rec)))
@@ -99,7 +107,7 @@ check("first trace per subplot carries the times",
 check("other traces on that subplot untouched", f.data[1].hovertemplate is None)
 check("existing customdata shifted, not lost",
       "customdata[2]" in f.data[2].hovertemplate and float(f.data[2].customdata[1][2]) == 0.06)
-check("bar row gets its clock time", f.data[2].customdata[0][0] == "10:23:05.4", str(f.data[2].customdata[0]))
+check("bar row gets its clock time", f.data[2].customdata[0][0] == "10:23:05.4 AM", str(f.data[2].customdata[0]))
 
 print("\n" + "=" * 60)
 print("RESULT: " + ("ALL TESTS PASSED" if not fails else f"{len(fails)} FAILURES: " + ", ".join(fails)))

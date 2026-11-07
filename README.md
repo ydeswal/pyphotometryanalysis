@@ -35,6 +35,17 @@ allowed.
 
 ---
 
+## 6 November 2026: 12-hour clock times
+
+Every clock time the app shows is now 12-hour with AM/PM (3:57:31 PM): graph
+axes, hover boxes, the times box, ruler and peak readouts, tables, data
+previews, recording notes and the AI chat (which also understands "1:40 pm").
+Times into the recording (rec 05:23:41) are durations and keep the
+stopwatch form. Saved files keep the standard 24-hour `clock_time` column,
+because the app and other software read it back.
+
+---
+
 ## 6 November 2026: "Ask the data" AI chat
 
 Under the **Display** buttons, **💬 Ask the data (AI)** answers questions

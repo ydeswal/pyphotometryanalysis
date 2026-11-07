@@ -64,6 +64,10 @@ try:
     check("time outside the data is refused", False)
 except ac.ToolError:
     check("time outside the data is refused", True)
+check("12-hour clock time", ac.parse_time("11:05 am", c0, span) == pd.Timestamp("2026-10-15 11:05")
+      and ac.parse_time("12:10 PM", c0, span) == pd.Timestamp("2026-10-15 12:10")
+      and ac.parse_time("12 pm", c0, span) == pd.Timestamp("2026-10-15 12:00"))
+check("date with 12-hour time", ac.parse_time("2026-10-15 11:05 AM", c0, span) == pd.Timestamp("2026-10-15 11:05"))
 span2 = (c0, c0 + pd.Timedelta(hours=30))
 notes = []
 ac.parse_time("12:00", c0, span2, notes)
@@ -98,6 +102,10 @@ ctx_case = ac.DataContext([{"name": NAME, "df": df, "settings": {}}], fd, "BLA",
 check("animal IDs match regardless of case", ctx_case.recording_for("m10") is not None
       and ctx_case.rec_animal[NAME] == "m10")
 
+o = ac.run_tool(ctx, "get_meals", {"animal": "m10"})
+check("tool output times are 12-hour", o["meals"][0]["onset"] == "2026-10-15 10:44:16.4 AM | rec 00:10:00.0",
+      o["meals"][0]["onset"])
+
 print("\n=== grounding check ===")
 ref = json.dumps({"mean": 0.07907, "max_at": "2026-10-15 11:19:24.3 | rec 00:45:07.9", "p": 0.0005, "n": 12,
                   "ratio": 0.3826})
@@ -106,6 +114,12 @@ n, bad = ac.check_grounding("Mean 0.079 %, peak at 11:19:24 (rec 00:45:07), p = 
 check("traceable numbers pass", bad == [], str(bad))
 n, bad = ac.check_grounding("The mean was 0.093 and the peak came at 11:21.", ref)
 check("invented number and time are flagged", set(bad) == {"0.093", "11:21"}, str(bad))
+ref12 = json.dumps({"onset": "2026-11-05 12:18:06.0 AM | rec 08:20:34.4", "max_at": "2026-11-04 1:40:02.6 PM"})
+n, bad = ac.check_grounding("It began at 12:18 AM (rec 08:20:34); the peak was at 1:40:02 PM, i.e. 13:40, or 1:40.",
+                            ref12)
+check("12-hour, 24-hour and bare forms of the same time all pass", bad == [] and n == 5, f"{n} {bad}")
+n, bad = ac.check_grounding("It began at 12:18 PM and peaked at 3 PM.", ref12)
+check("wrong AM/PM and invented hour are flagged", set(bad) == {"12:18 PM", "3 PM"}, str(bad))
 n, bad = ac.check_grounding("1. First point\n2. Second point with 1 or 2 items", ref)
 check("list numbering and 0-2 are not checked", bad == [], str(bad))
 

@@ -285,7 +285,11 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         for n in fed.notes:
             st.write("- " + n)
         if not fed.sessions.empty:
-            st.dataframe(fed.sessions, hide_index=True, use_container_width=True)
+            ses = fed.sessions.copy()
+            for c in ses.columns:
+                if pd.api.types.is_datetime64_any_dtype(ses[c]):
+                    ses[c] = [gt.fmt12(v, decimals=0) for v in ses[c]]
+            st.dataframe(ses, hide_index=True, use_container_width=True)
         cnt = fed.events.groupby(["animal", "session", "kind"]).size().unstack(fill_value=0)
         st.dataframe(cnt, use_container_width=True)
 
@@ -446,9 +450,9 @@ def _times_strip(res, cs, t0, t1, cov_s):
     """One box with the clock times of the recording, of what is shown, and
     of each stretch of FED logging, each with its time into the recording."""
     def both(v):
-        clock = gt.fmt_clock(cs, v)
-        return (f"<b>{clock[:21]}</b>" if res is None else
-                f"<b>{clock[:21]}</b> <span style='color:#64748b'>(recording {gt.fmt_hms(v, 1)})</span>")
+        clock = gt.fmt_clock(cs, v, decimals=1)
+        return (f"<b>{clock}</b>" if res is None else
+                f"<b>{clock}</b> <span style='color:#64748b'>(recording {gt.fmt_hms(v, 1)})</span>")
     parts = []
     if res is not None:
         df = res["df"]
@@ -466,7 +470,7 @@ def _times_strip(res, cs, t0, t1, cov_s):
             a_, b_ = max(a, t0), min(b, t1)
             if b_ <= a_:
                 continue
-            seg = f"{gt.fmt_clock(cs, a_)[11:19]}–{gt.fmt_clock(cs, b_)[11:19]}"
+            seg = f"{gt.fmt_clock(cs, a_, date=False, decimals=0)}–{gt.fmt_clock(cs, b_, date=False, decimals=0)}"
             if res is not None:
                 seg += (f" <span style='color:#64748b'>(rec {gt.fmt_hms(a_, 0)}–"
                         f"{gt.fmt_hms(b_, 0)})</span>")
@@ -578,7 +582,7 @@ def _aligned(t, y, sig_label, pellets_s, meals, cov_s, pel_rows, cs, animal, gra
     d_base = fed3.window_means(t, y, kept, *base)
     tbl = pd.DataFrame({
         "#": np.arange(1, kept.size + 1),
-        "clock time": [gt.fmt_clock(cs, v)[:19] for v in kept],
+        "clock time": [gt.fmt_clock(cs, v, decimals=0) for v in kept],
         "recording time": [gt.fmt_hms(v, 1) for v in kept],
         "baseline mean": np.round(d_base, 4), "response mean": np.round(d_resp, 4),
         "change": np.round(d_resp - d_base, 4),
