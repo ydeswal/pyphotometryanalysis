@@ -55,6 +55,7 @@ import theme as th
 import graph_tools as gt
 import fed3
 import fed_view
+import ai_chat
 
 # =============================================================================
 # PAGE STYLE: SMALL HEADER + WIDE GRAPH WORKSPACE
@@ -2460,9 +2461,48 @@ def standalone_lick_section(file_obj, cfg):
             file_name="lick_times.csv", mime="text/csv", key="solo_dl_times")
 
 
+def _ai_chat_panel(results, display_mode="(no recordings)"):
+    """The "Ask the data" chat, given what is loaded and what is on screen."""
+    staged = st.session_state.get("staged", {}) or {}
+    ppd_by_name = {ai_chat.safe_stem(Path(v).name): v for v in staged.values()
+                   if str(v).lower().endswith(".ppd") and Path(v).exists()}
+    ppd_paths = {str(r["name"]): ppd_by_name[str(r["name"])] for r in results
+                 if str(r["name"]) in ppd_by_name}
+    ss = st.session_state
+    fed_map = {i: ss.get(f"fed_map_{i}") for i in range(len(results))}
+    view = {"display mode": display_mode}
+    if display_mode == "Feeding (FED3)" or not results:
+        view.update({"FED view": ss.get("fed_view"), "FED animal": ss.get("fed_animal"),
+                     "signal shown": ss.get("fed_kind"), "time axis": ss.get("fed_time_axis"),
+                     "meal definition": (f"gap <= {ss.get('fed_mealgap', 60)} s, "
+                                         f">= {ss.get('fed_mealmin', 2)} pellets"),
+                     "align to": ss.get("fed_align_to")})
+    if use_window:
+        view["visual crop window (recording time)"] = f"{seconds_to_hms(start_sec)} to {seconds_to_hms(end_sec)}"
+    # Ruler points the user has placed on any graph (recording seconds).
+    for k, v in ss.items():
+        if isinstance(k, str) and k.endswith("_pts") and isinstance(v, list) and len(v) == 2:
+            view[f"ruler points on graph '{k[:-4]}' (recording time)"] = " to ".join(
+                gt.fmt_hms(float(x), 1) for x in v)
+    focus = []
+    an = ss.get("fed_animal")
+    if display_mode == "Feeding (FED3)" and an:
+        focus.append(f"FED {an}")
+        for i, r in enumerate(results):
+            if fed_map.get(i) == an or (fed_map.get(i) in (None, "(none)")
+                                        and fed3.animal_from_name(r["name"]) == an):
+                focus.append(str(r["name"]))
+    elif results and display_mode == "One recording at a time" and len(results) == 1:
+        focus.append(str(results[0]["name"]))
+    view["focus_default"] = focus
+    ai_chat.render_panel(results, FED_DATA, roi_name, ppd_paths=ppd_paths, view=view, fed_map=fed_map,
+                         sessions=ss.get("fed_sessions"), pellet_mg=ss.get("fed_mg"))
+
+
 if not results:
     st.info("Upload a `.ppd` or `.csv` file, then click **Run / refresh analysis**.")
     if FED_DATA is not None and not FED_DATA.events.empty:
+        _ai_chat_panel([])
         st.markdown("### Feeding (FED3), without photometry")
         fed_view.render([], FED_DATA, roi_name, lambda d: d, max_points=MAX_POINTS,
                         height_mult=1.0, config=PLOTLY_CONFIG)
@@ -2523,6 +2563,8 @@ else:
     def _prepare_view(_df):
         _v = filter_visual_window(_df, start_sec, end_sec) if use_window else _df
         return apply_visual_exclusions(_v, roi_name, visual_exclusions, mode=exclusion_mode_code)
+
+    _ai_chat_panel(results, display_mode)
 
     if display_mode == "Side-by-side graphs":
         gt.render_workspace(

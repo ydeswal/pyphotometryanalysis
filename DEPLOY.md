@@ -21,6 +21,45 @@ worth knowing:
   <https://share.streamlit.io>, then **⋮ → Reboot app**. Use **⋮ → Logs** to
   see why it stopped.
 
+## The "Ask the data" AI chat: adding free keys
+
+The chat needs at least one free API key. Keys are never put in the code.
+
+1. **Google Gemini (main, free):** sign in at <https://aistudio.google.com/apikey>
+   and click *Create API key*. No card needed. Its free tier is about 1,500
+   requests a day and 10 a minute per key (your key's exact limits are on the
+   AI Studio rate-limit page).
+2. **Groq (fallback, free, optional):** <https://console.groq.com/keys> →
+   *Create API Key*. 1,000 requests a day for gpt-oss-120b. Used only when
+   Gemini is out of quota or down.
+3. On <https://share.streamlit.io> open the app → **⋮ → Settings → Secrets**
+   and paste:
+
+       GEMINI_API_KEY = "your-gemini-key"
+       GROQ_API_KEY = "your-groq-key"
+       # optional: anyone opening the site must type this to use the chat
+       CHAT_PASSWORD = "choose-one"
+
+   Save; the app restarts with the chat ready. Without secrets, each person
+   can paste their own key in the chat's **⚙ AI settings** (kept only for
+   their browser session).
+
+Optional settings in the same Secrets box:
+
+    GEMINI_MODEL = "gemini-3.8-flash"     # if Google renames the model
+    GROQ_MODEL = "openai/gpt-oss-120b"
+    AI_BASE_URL = "https://openrouter.ai/api/v1"   # any OpenAI-compatible
+    AI_MODEL = "some/model:free"                    # service, tried last
+    AI_API_KEY = "key"
+
+Running locally, put the same lines in `.streamlit/secrets.toml` (already in
+`.gitignore`, so it is never committed).
+
+Privacy: on Gemini's free tier Google may use what is sent to improve its
+products, and human reviewers may read it. The chat sends computed summaries
+(numbers, times, settings), never whole files. For data that must stay
+confidential, use a paid key or keep the chat switched off.
+
 ## Publishing changes
 
     git add -A

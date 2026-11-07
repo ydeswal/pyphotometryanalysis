@@ -35,6 +35,36 @@ allowed.
 
 ---
 
+## 6 November 2026: "Ask the data" AI chat
+
+Under the **Display** buttons, **💬 Ask the data (AI)** answers questions
+about one or more graphs, the raw recordings and the FED3 data, for free.
+Set up the keys once (see `DEPLOY.md`).
+
+- **It computes, it does not guess.** The AI is never shown a picture. It
+  answers by calling data tools that run on the loaded data and return exact
+  numbers: signal statistics in any window, binned traces, peaks and troughs,
+  window comparisons, the original `.ppd` at full rate, processing and
+  quality settings, FED events, meals, intake, the meal-aligned response with
+  its permutation test and 405 control, signal-vs-intake correlation, and a
+  calculator for any arithmetic.
+- **Every answer is checked.** Each number and clock time in the answer is
+  matched against the computed results. Anything that cannot be traced is
+  listed under the answer as unverified. *How this was answered* shows every
+  data call and its result.
+- **Times** can be asked as clock time (13:40), date and time, or recording
+  time (rec 01:25:00), and answers give both.
+- **One or more graphs:** the *Graphs / data to ask about* box follows what is
+  on screen; pick several recordings or animals to compare them.
+- **Free and efficient:** Google Gemini Flash's free tier first (about 1,500
+  requests a day), Groq's gpt-oss-120b as the automatic fallback (1,000 a
+  day). A typical question uses 2-3 requests because the AI asks for several
+  calculations at once, and repeated identical calculations are reused.
+- `python test_ai_chat.py` tests the tools, the time parsing, the number check
+  and the question loop against a local stand-in API (no key needed).
+
+---
+
 ## 6 November 2026: raw signal and recording time in the Feeding (FED3) view
 
 - **Signal** now also offers the raw channels: **Raw 465 + 405** (both raw
@@ -298,6 +328,7 @@ recording if it is present.
 | `graph_tools.py` | Side-by-side graphs, peaks/troughs, time ruler, graph thinning |
 | `fed3.py` | Reads FED3 controller output; intake, meals, event alignment, permutation test |
 | `fed_view.py` | The "Feeding (FED3)" view |
+| `ai_chat.py` | The "Ask the data" AI chat: data tools, free providers, answer check |
 | `run_local.command` / `.bat` / `.sh` | Start the app on your own computer |
 | `lickometer.py` | Lick ingestion, bout detection, peri-event alignment |
 | `theme.py` | Styling and Plotly defaults |
