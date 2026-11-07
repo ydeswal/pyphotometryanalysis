@@ -4,6 +4,12 @@ import tempfile
 import subprocess
 import sys
 import zipfile
+
+# Which of this app's own modules were already in memory before this run
+# (loaded by an earlier run, possibly from older files). See
+# _reload_changed_modules() below.
+_PP_PRELOADED = {n for n in ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret",
+                             "fed_view", "group_analysis", "group_view", "ai_chat") if n in sys.modules}
 import io
 import json
 
@@ -57,6 +63,45 @@ import fed3
 import fed_view
 import ai_chat
 import group_view
+
+
+def _reload_changed_modules():
+    """
+    Keep this app's own modules in step with the files on disk.
+
+    Streamlit Cloud pulls new files while the app keeps running. A module
+    imported before the update would otherwise stay old in memory while
+    app.py is new, giving errors such as "unexpected keyword argument" or
+    KeyError: 'ai_chat' until the app is rebooted. Any module whose file
+    changed since it was loaded is reloaded, and so is everything after it
+    in this list (they may depend on it).
+    """
+    import importlib
+    import os
+    order = ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret", "fed_view",
+             "group_analysis", "group_view", "ai_chat")
+    stamps = sys.__dict__.setdefault("_pp_module_mtimes", {})
+    changed = False
+    for name in order:
+        mod = sys.modules.get(name)
+        f = getattr(mod, "__file__", None) if mod is not None else None
+        if not f:
+            continue
+        try:
+            mt = os.path.getmtime(f)
+        except OSError:
+            continue
+        stale = (name in stamps and stamps[name] != mt) or (name not in stamps and name in _PP_PRELOADED)
+        if changed or stale:
+            try:
+                importlib.reload(mod)
+                changed = True
+            except Exception:
+                continue                # a half-written file: the next run tries again
+        stamps[name] = mt
+
+
+_reload_changed_modules()
 
 # =============================================================================
 # PAGE STYLE: SMALL HEADER + WIDE GRAPH WORKSPACE
