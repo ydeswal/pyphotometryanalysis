@@ -63,6 +63,10 @@ PROVIDERS = [
         "id": "gemini", "label": "Google Gemini (free tier)",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "model": "gemini-3.8-flash", "model_secret": "GEMINI_MODEL",
+        # Each Gemini model has its own quota and its own server load, so when
+        # one is busy or used up the same key tries the next.
+        "fallback_models": ("gemini-3.6-flash", "gemini-3.5-flash-lite"),
+        "fallback_secret": "GEMINI_FALLBACK_MODELS",
         "key_secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         "key_url": "https://aistudio.google.com/apikey",
         "extra": {}, "echo_full": True,
@@ -87,6 +91,7 @@ PROVIDERS = [
 
 MAX_TOOL_ROUNDS = 6
 HTTP_TIMEOUT = 90
+BUSY_RETRIES = (3, 8)          # seconds to wait before each retry of a busy model
 
 
 def _secret(name):
@@ -98,7 +103,11 @@ def _secret(name):
 
 
 def configured_providers():
-    """Providers that have a key (secrets first, then keys pasted this session)."""
+    """
+    The chain of (service, model) pairs to try, in order: every Gemini model
+    on the Gemini key, then Groq, then a custom service. Keys come from
+    secrets first, then from keys pasted this session.
+    """
     pasted = st.session_state.get("ai_keys", {})
     out = []
     for p in PROVIDERS:
@@ -109,7 +118,13 @@ def configured_providers():
             continue
         if not key and p["id"] != "custom":
             continue
-        out.append(dict(p, key=key or "", base_url=base.rstrip("/"), model=model))
+        models = [model]
+        fb = _secret(p.get("fallback_secret", "")) if p.get("fallback_secret") else None
+        for m in ([x.strip() for x in fb.split(",")] if fb else list(p.get("fallback_models", ()))):
+            if m and m not in models:
+                models.append(m)
+        for m in models:
+            out.append(dict(p, key=key or "", base_url=base.rstrip("/"), model=m))
     return out
 
 
@@ -118,11 +133,12 @@ def _usage_store():
     return {}
 
 
-def _count_request(pid):
+def _count_request(pid, model=""):
     store = _usage_store()
     day = _dt.date.today().isoformat()
-    store.setdefault(day, {}).setdefault(pid, 0)
-    store[day][pid] += 1
+    k = f"{pid} {model}".strip()
+    store.setdefault(day, {}).setdefault(k, 0)
+    store[day][k] += 1
 
 
 def usage_today():
@@ -130,10 +146,26 @@ def usage_today():
 
 
 class ProviderError(Exception):
-    def __init__(self, msg, status=None, retry_next=True):
+    def __init__(self, msg, status=None, retry_next=True, retry_after=None, detail="", summary=""):
         super().__init__(msg)
         self.status = status
         self.retry_next = retry_next
+        self.retry_after = retry_after
+        self.detail = detail          # raw error text from the service
+        self.summary = summary        # plain-language summary for the person
+
+
+def _plain_reason(status, prov):
+    return {
+        429: "its free-tier limit is used up for now (requests per minute or per day)",
+        500: "it had an internal error", 502: "it is temporarily unreachable",
+        503: "it is overloaded right now (Google calls this 'high demand')",
+        504: "it took too long to answer",
+        401: "the API key was rejected (check the key in the secrets)",
+        403: "this key may not use this model",
+        404: f"the model name '{prov['model']}' is not recognised",
+        400: "it refused the request",
+    }.get(status, f"it returned error {status}")
 
 
 def _post(prov, body):
@@ -150,13 +182,17 @@ def _post(prov, body):
             detail = e.read().decode()[:400]
         except Exception:
             pass
-        reason = {429: "free-tier limit reached (too many requests or tokens)",
-                  401: "the API key was rejected", 403: "the API key is not allowed to use this model",
-                  404: f"model '{prov['model']}' not found (set {prov['model_secret']} in secrets)"}
-        raise ProviderError(f"{prov['label']}: {reason.get(e.code, f'HTTP {e.code}')}. {detail}",
-                            status=e.code) from None
+        ra = None
+        try:
+            ra = float(e.headers.get("Retry-After")) if e.headers and e.headers.get("Retry-After") else None
+        except (TypeError, ValueError):
+            ra = None
+        why = _plain_reason(e.code, prov)
+        raise ProviderError(f"{prov['model']}: {why}", status=e.code, retry_after=ra, detail=detail,
+                            summary=why) from None
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise ProviderError(f"{prov['label']}: could not connect ({e})") from None
+        raise ProviderError(f"{prov['model']}: could not connect ({e})", detail=str(e),
+                            summary="could not connect") from None
 
 
 def _plain_messages(msgs):
@@ -176,37 +212,68 @@ def _plain_messages(msgs):
     return out
 
 
-def complete(providers, msgs, tools, start_at=0, log=None):
-    """One chat-completion request; on quota or connection errors try the next
-    provider. Returns (message, provider_index, usage)."""
+def _no_answer_message(errors, providers):
+    """One readable paragraph for when every model in the chain failed."""
+    tried = ", ".join(f"**{m}** ({why})" for m, why in errors)
+    busy = all(why.startswith("it is overloaded") or "too long" in why or "unreachable" in why
+               for _, why in errors)
+    has_groq = any(p["id"] == "groq" for p in providers)
+    tip = []
+    if busy:
+        tip.append("This is on Google's side and usually passes within minutes: press **Ask again**.")
+    if any("limit is used up" in why for _, why in errors):
+        tip.append("Free-tier limits reset every minute (and daily at midnight Pacific time).")
+    if not has_groq:
+        tip.append("Adding a free Groq key (`GROQ_API_KEY` in the app's secrets, from "
+                   "<https://console.groq.com/keys>) gives a backup that is not affected by Google's load.")
+    if any("rejected" in why or "not recognised" in why for _, why in errors):
+        tip.append("Check the key and model names in the app's secrets.")
+    return f"No AI model could answer. Tried {tried}. " + " ".join(tip)
+
+
+def complete(providers, msgs, tools, start_at=0, log=None, prepare=None):
+    """
+    One chat-completion request. A busy model (HTTP 5xx) is retried after a
+    short wait; a model that is out of quota, unknown or still busy is skipped
+    for the next one in the chain. prepare(i) may return the messages to send
+    to chain entry i (used to restart cleanly on a different model).
+    Returns (message, chain_index, usage).
+    """
     errors = []
     for i in range(start_at, len(providers)):
         prov = providers[i]
+        m_i = prepare(i) if prepare else msgs
         body = {"model": prov["model"], "tool_choice": "auto",
-                "messages": msgs if prov.get("echo_full") else _plain_messages(msgs)}
+                "messages": m_i if prov.get("echo_full") else _plain_messages(m_i)}
         if tools:
             body["tools"] = tools
         else:
             body.pop("tool_choice")
         body.update(prov.get("extra") or {})
-        for attempt in range(2):
+        waits = list(BUSY_RETRIES)
+        while True:
             try:
                 data = _post(prov, body)
-                _count_request(prov["id"])
+                _count_request(prov["id"], prov["model"])
                 msg = data["choices"][0]["message"]
                 return msg, i, data.get("usage") or {}
             except ProviderError as e:
-                if e.status and 500 <= e.status < 600 and attempt == 0:
-                    time.sleep(2)
+                busy = e.status is None or 500 <= (e.status or 0) < 600
+                if busy and waits:
+                    w = min(max(e.retry_after or waits[0], 1.0), 15.0)
+                    waits.pop(0)
+                    if log:
+                        log(f"⏳ {prov['model']} {e.summary}; trying again in {w:.0f} s…")
+                    time.sleep(w)
                     continue
-                errors.append(str(e))
-                if log:
-                    log(f"⚠ {e}")
+                errors.append((prov["model"], e.summary or str(e)))
+                if log and i + 1 < len(providers):
+                    log(f"↪ {prov['model']} {e.summary}; switching to {providers[i + 1]['model']}…")
                 break
-            except (KeyError, IndexError, ValueError) as e:
-                errors.append(f"{prov['label']}: unexpected reply ({e})")
+            except (KeyError, IndexError, ValueError, TypeError) as e:
+                errors.append((prov["model"], f"it sent an unexpected reply ({type(e).__name__})"))
                 break
-    raise ProviderError("No AI service answered. " + " | ".join(errors), retry_next=False)
+    raise ProviderError(_no_answer_message(errors, providers), retry_next=False)
 
 
 # =============================================================================
@@ -332,9 +399,13 @@ class DataContext:
         for i, r in enumerate(self.results):
             a = (fed_map or {}).get(i)
             if a in (None, "(none)"):
-                a = fed3.animal_from_name(r["name"]) or fed3.animal_from_name(
-                    (r.get("settings") or {}).get("subject_ID", ""))
+                sid = (r.get("settings") or {}).get("subject_ID", "")
+                a = (fed3.guess_animal(r["name"], self.fed.animals, sid) if self.fed is not None else None) \
+                    or fed3.animal_from_name(r["name"]) or fed3.animal_from_name(sid)
             self.rec_animal[str(r["name"])] = a
+        if self.fed is not None:             # use the FED's spelling (it stores IDs in lower case)
+            canon = {x.lower(): x for x in self.fed.animals}
+            self.rec_animal = {k: (canon.get(str(a).lower(), a) if a else a) for k, a in self.rec_animal.items()}
         self._cache = {}
 
     # ---- lookup ---------------------------------------------------------
@@ -381,7 +452,7 @@ class DataContext:
 
     def recording_for(self, animal):
         for r in self.results:
-            if self.rec_animal.get(str(r["name"])) == animal:
+            if str(self.rec_animal.get(str(r["name"])) or "").lower() == str(animal).lower():
                 return r
         return None
 
@@ -475,6 +546,10 @@ def tool_signal_summary(ctx, recording=None, signal="dff", start=None, end=None)
         "median": _r(np.median(yy)),
         "min": _r(yy[imin]), "min_at": ctx.sec_fmt(tt[imin], cs),
         "max": _r(yy[imax]), "max_at": ctx.sec_fmt(tt[imax], cs),
+        "time_from_min_to_max": (("+" if tt[imax] >= tt[imin] else "-")
+                                 + gt.fmt_hms(abs(tt[imax] - tt[imin]), 1)
+                                 + f" ({_r(abs(tt[imax] - tt[imin]), 6)} s; max comes "
+                                 + ("after" if tt[imax] >= tt[imin] else "before") + " min)"),
         "first_minute_mean": _r(np.mean(yy[tt <= tt[0] + 60])),
         "last_minute_mean": _r(np.mean(yy[tt >= tt[-1] - 60])),
     })
@@ -860,6 +935,32 @@ def tool_calculate(ctx, expression=""):
     return {"expression": expr, "result": _r(val, 6)}
 
 
+def tool_time_difference(ctx, start=None, end=None, recording=None):
+    """Time from start to end. Both are read like any other time argument."""
+    res = None
+    if recording or ctx.results:
+        try:
+            res = ctx.rec(recording)
+        except ToolError:
+            res = None
+    if res is not None:
+        cs = ctx.clock_start(res)
+        span = ctx.rec_span(res)
+    elif ctx.fed is not None and ctx.fed.animals:
+        cs = None
+        spans = [ctx.fed_span(a) for a in ctx.fed.animals]
+        span = (min(x[0] for x in spans), max(x[1] for x in spans))
+    else:
+        raise ToolError("No data loaded to anchor the times to.")
+    if start is None or end is None:
+        raise ToolError("Give both start and end.")
+    a = parse_time(start, cs, span)
+    b = parse_time(end, cs, span, is_end=True)
+    d = (b - a).total_seconds()
+    return {"start": ctx.tfmt(a, cs), "end": ctx.tfmt(b, cs), "difference": ("-" if d < 0 else "")
+            + gt.fmt_hms(abs(d), 1), "seconds": _r(d, 7), "minutes": _r(d / 60, 6), "hours": _r(d / 3600, 6)}
+
+
 # ---- tool registry -------------------------------------------------------
 
 _T = {"type": "string", "description": "13:40 | 2026-10-15 13:40 | rec 01:25:00 | seconds; omit = all"}
@@ -927,6 +1028,8 @@ TOOLS = [
         {"recording": _REC, "start": _T, "end": _T, "points": {"type": "integer"}}, []),
     _fn("get_recording_info", "Processing settings and quality checks of a recording: pipeline, 405 fit slope "
         "and R², F0, clipping, clock drift and gaps, warnings.", {"recording": _REC}, []),
+    _fn("time_difference", "How long from one time to another (clock times, dates or recording times). "
+        "Use for any time arithmetic.", {"start": _T, "end": _T, "recording": _REC}, ["start", "end"]),
     _fn("calculate", "Arithmetic on numbers from tool results (differences, ratios, percentages, unit "
         "conversions). Always use this instead of mental arithmetic.",
         {"expression": {"type": "string", "description": "e.g. (0.412-0.298)/0.298*100"}}, ["expression"]),
@@ -938,7 +1041,7 @@ TOOL_FUNCS = {
     "get_fed_events": tool_fed_events, "get_meals": tool_meals, "get_intake": tool_intake,
     "event_aligned_response": tool_event_aligned_response, "signal_vs_intake": tool_signal_vs_intake,
     "get_raw_ppd_window": tool_raw_ppd_window, "get_recording_info": tool_recording_info,
-    "calculate": tool_calculate,
+    "calculate": tool_calculate, "time_difference": tool_time_difference,
 }
 
 
@@ -1017,7 +1120,8 @@ isosbestic control) and FED3 feeding-device analysis web app used by neuroscient
 Accuracy rules (most important):
 1. Every number, time, count or p-value you write must come from a tool result in this conversation or from the \
 DATA CATALOGUE. Never estimate, recall or invent values, and never read values off a graph you imagine.
-2. Never do arithmetic yourself. For any difference, ratio, percentage or unit conversion call `calculate`.
+2. Never do arithmetic yourself. For any difference, ratio, percentage or unit conversion call `calculate`; \
+for any time span call `time_difference` (get_signal_summary already gives the time from min to max).
 3. If the tools cannot answer, say so plainly and say what data or setting would be needed.
 4. Quote times as the tools give them: clock time, and the time into the recording when relevant.
 5. Separate what the data show from interpretation. FED gaps mean "not logged", not "not eating". Mention the \
@@ -1130,20 +1234,37 @@ def ask(question, history, ctx, providers, focus=None, log=None):
     for h in history[-6:]:
         msgs += [{"role": "user", "content": h["q"]}, {"role": "assistant", "content": h["a"]}]
     msgs.append({"role": "user", "content": question})
+    base_msgs = list(msgs)
     tools = available_tools(ctx)
     trace, ref_parts = [], [sys_msg, question] + [h.get("ref", "") + "\n" + h["q"] for h in history[-6:]]
     n_req, tokens, pidx = 0, 0, 0
     calls_seen = {}
     answer = None
+    owner = [None]        # chain index whose tool-call turns are in msgs
+
+    def prepare(i):
+        """Messages for chain entry i. A different model than the one that made
+        the tool calls so far starts over, with the results already computed
+        handed to it as data, so no model sees another model's internal fields."""
+        if owner[0] is None or owner[0] == i:
+            return msgs
+        done = [{"tool": t["tool"], "args": t["args"], "result": t["result"]} for t in trace]
+        return base_msgs[:-1] + [{"role": "user", "content": (
+            question + "\n\n(Already computed by the data tools for this question; use these results and "
+                       "call more tools only if needed:)\n" + json.dumps(done, default=str)[:12000])}]
+
     try:
         for rnd in range(MAX_TOOL_ROUNDS + 1):
             use_tools = tools if rnd < MAX_TOOL_ROUNDS else None
             if rnd == MAX_TOOL_ROUNDS:
                 msgs.append({"role": "user", "content": "Tool budget used up. Answer now from the tool results "
                                                         "above, and say what is still unknown."})
-            # complete() sends plain messages to providers that need them, so a
-            # switch to the fallback mid-question still works.
-            msg, pidx, usage = complete(providers, msgs, use_tools, start_at=pidx, log=log)
+            msg, new_idx, usage = complete(providers, msgs, use_tools, start_at=pidx, log=log, prepare=prepare)
+            if owner[0] is not None and new_idx != owner[0]:
+                msgs = prepare(new_idx)               # continue from the restarted conversation
+            pidx = new_idx
+            if msg.get("tool_calls"):
+                owner[0] = pidx
             n_req += 1
             tokens += int(usage.get("total_tokens") or 0)
             msg = {k: v for k, v in msg.items() if v is not None}
@@ -1174,7 +1295,7 @@ def ask(question, history, ctx, providers, focus=None, log=None):
                 msgs.append({"role": "tool", "tool_call_id": c.get("id") or name, "content": text})
     except ProviderError as e:
         return {"answer": None, "error": str(e), "trace": trace, "requests": n_req, "tokens": tokens,
-                "provider": None, "checked": 0, "unverified": [], "ref": ""}
+                "provider": None, "checked": 0, "unverified": [], "ref": "", "retry": True}
     ref = "\n".join(ref_parts)
     checked, bad = check_grounding(answer or "", ref)
     return {"answer": answer or "(The model gave no answer.)", "error": None, "trace": trace,
@@ -1235,6 +1356,9 @@ def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg):
             v = st.text_input(f"{p['label']} key", value=keys.get(p["id"], ""), type="password",
                               key=f"ai_key_{p['id']}", help=f"Free key: {p['key_url']}  ·  {p['free_note']}")
             keys[p["id"]] = v.strip()
+        chain = configured_providers()
+        if chain:
+            st.caption("Tried in this order: " + " → ".join(p["model"] for p in chain))
         st.toggle("Let the AI read the raw .ppd files (full rate)", value=True, key="ai_allow_raw")
         use = usage_today()
         if use:
@@ -1267,13 +1391,17 @@ def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg):
                                 "the AI use everything loaded.")
     hist = st.session_state.setdefault("ai_history", [])
 
-    for h in hist:
+    pending = None
+    retry = st.session_state.pop("ai_retry", None)
+    if retry is not None and 0 <= retry < len(hist):
+        pending = hist.pop(retry)["q"]          # replace the failed answer
+
+    for i, h in enumerate(hist):
         with st.chat_message("user"):
             st.markdown(h["q"])
         with st.chat_message("assistant"):
-            _show_answer(h)
+            _show_answer(h, i if h.get("error") else None)
 
-    pending = None
     if not hist:
         cols = st.columns(2)
         for i, s in enumerate(_suggestions(ctx, focus)):
@@ -1291,16 +1419,19 @@ def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg):
         st.markdown(q)
     with st.chat_message("assistant"):
         with st.status("Working it out from the data…", expanded=True) as status:
-            res = ask(q, hist, ctx, provs, focus=focus, log=st.write)
+            res = ask(q, [h for h in hist if not h.get("error")], ctx, provs, focus=focus, log=st.write)
             status.update(label="Done" if not res["error"] else "Could not answer",
                           state="complete" if not res["error"] else "error", expanded=False)
     hist.append({"q": q, **res, "a": res["answer"] or ""})
     st.rerun(scope="fragment")
 
 
-def _show_answer(h):
+def _show_answer(h, idx=None):
     if h.get("error"):
-        st.error(h["error"])
+        st.warning(h["error"])
+        if idx is not None and st.button("↻ Ask again", key=f"ai_retry_{idx}"):
+            st.session_state["ai_retry"] = idx
+            st.rerun(scope="fragment")
         return
     st.markdown(h["a"])
     if h.get("unverified"):

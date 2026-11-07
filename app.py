@@ -2489,8 +2489,9 @@ def _ai_chat_panel(results, display_mode="(no recordings)"):
     if display_mode == "Feeding (FED3)" and an:
         focus.append(f"FED {an}")
         for i, r in enumerate(results):
-            if fed_map.get(i) == an or (fed_map.get(i) in (None, "(none)")
-                                        and fed3.animal_from_name(r["name"]) == an):
+            if str(fed_map.get(i) or "").lower() == str(an).lower() or (
+                    fed_map.get(i) in (None, "(none)") and FED_DATA is not None
+                    and str(fed3.guess_animal(r["name"], FED_DATA.animals) or "").lower() == str(an).lower()):
                 focus.append(str(r["name"]))
     elif results and display_mode == "One recording at a time" and len(results) == 1:
         focus.append(str(results[0]["name"]))

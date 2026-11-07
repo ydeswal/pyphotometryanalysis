@@ -73,6 +73,26 @@ def animal_from_name(name):
     return None
 
 
+def guess_animal(name, animals, subject_id=""):
+    """
+    Which FED animal a recording belongs to. First any FED animal ID that
+    appears in the recording name (or subject ID) as a whole token, longest
+    first so 'm1' never takes 'm11'; then the usual ID guess. Case-insensitive.
+    Returns the FED's spelling of the ID, or None.
+    """
+    canon = {str(a).lower(): a for a in animals}
+    for text in (str(name), str(subject_id or "")):
+        low = text.lower()
+        for a in sorted(canon, key=len, reverse=True):
+            if re.search(r"(?<![a-z0-9])" + re.escape(a) + r"(?![a-z0-9])", low):
+                return canon[a]
+    for text in (str(name), str(subject_id or "")):
+        g = animal_from_name(text)
+        if g and g in canon:
+            return canon[g]
+    return None
+
+
 def _ts(text):
     if text is None:
         return pd.NaT

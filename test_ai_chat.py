@@ -94,6 +94,10 @@ check("raw .ppd tool explains when there is no .ppd", "No .ppd" in o.get("error"
 names = [x["function"]["name"] for x in ac.available_tools(ctx)]
 check("raw .ppd tool not offered without a .ppd", "get_raw_ppd_window" not in names)
 
+ctx_case = ac.DataContext([{"name": NAME, "df": df, "settings": {}}], fd, "BLA", fed_map={0: "M10"})
+check("animal IDs match regardless of case", ctx_case.recording_for("m10") is not None
+      and ctx_case.rec_animal[NAME] == "m10")
+
 print("\n=== grounding check ===")
 ref = json.dumps({"mean": 0.07907, "max_at": "2026-10-15 11:19:24.3 | rec 00:45:07.9", "p": 0.0005, "n": 12,
                   "ratio": 0.3826})
@@ -165,6 +169,80 @@ last = [b for p, b in seen][-1]
 check("echo_full keeps provider fields on the assistant turn", "thought_signature" in json.dumps(last["messages"]))
 for s in servers:
     s.shutdown()
+
+print("\n=== busy models, retries and switching models mid-question ===")
+ac.BUSY_RETRIES = (0.01,)
+calls = []
+
+
+class B(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, obj):
+        out = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(out)
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        model = body["model"]
+        calls.append((model, body))
+        n = sum(1 for m, _ in calls if m == model)
+        msgs = body["messages"]
+        busy = {"error": {"code": 503, "message": "high demand", "status": "UNAVAILABLE"}}
+        if model == "busy" or (model == "flaky" and n == 1) or (model == "dies" and n >= 2):
+            return self._send(503, busy)
+        last = msgs[-1]
+        if last["role"] == "user" and "Already computed" not in last["content"]:
+            return self._send(200, {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "t1", "type": "function", "extra_content": {"google": {"thought_signature": "SIG-" + model}},
+                 "function": {"name": "get_meals", "arguments": json.dumps({"animal": "m10"})}}]}}]})
+        if last["role"] == "tool":
+            meals = json.loads(last["content"])
+        else:
+            meals = json.loads(last["content"].split(":)\n", 1)[1])[0]["result"]
+        return self._send(200, {"choices": [{"message": {"role": "assistant",
+                                                          "content": f"{meals['meals_total']} meals."}}]})
+
+
+srv = HTTPServer(("127.0.0.1", 0), B)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+url = f"http://127.0.0.1:{srv.server_port}"
+mk = lambda m: dict(id="gemini", label="G", base_url=url, model=m, key="k", extra={}, echo_full=True,
+                    model_secret="X")
+calls.clear()
+r = ac.ask("meals?", [], ctx, [mk("flaky")])
+check("a busy model is retried and then answers", r["answer"] == "4 meals." and
+      [m for m, _ in calls].count("flaky") == 3, str([m for m, _ in calls]))
+calls.clear()
+r = ac.ask("meals?", [], ctx, [mk("busy"), mk("ok")])
+check("a model that stays busy is skipped for the next", r["answer"] == "4 meals." and r["provider"].endswith("ok"))
+calls.clear()
+r = ac.ask("meals?", [], ctx, [mk("dies"), mk("ok")])
+sent_to_ok = [b for m, b in calls if m == "ok"]
+check("switch mid-question restarts on the new model with the computed results",
+      r["answer"] == "4 meals." and len(sent_to_ok) == 1
+      and "Already computed" in sent_to_ok[0]["messages"][-1]["content"], str(r.get("answer")))
+check("the new model never sees the old model's internal fields",
+      "SIG-dies" not in json.dumps(sent_to_ok[0]["messages"]))
+check("the restarted answer is still checked against the earlier results", r["unverified"] == [], str(r["unverified"]))
+calls.clear()
+r = ac.ask("meals?", [], ctx, [mk("busy")])
+check("all busy: plain-language message with a tip", r["error"] and "overloaded" in r["error"]
+      and "Ask again" in r["error"] and "Groq" in r["error"], str(r["error"]))
+srv.shutdown()
+
+print("\n=== time arithmetic ===")
+o = ac.run_tool(ctx, "get_signal_summary", {"recording": "m10", "signal": "dff"})
+t_min = pd.Timestamp(o["min_at"][:21]); t_max = pd.Timestamp(o["max_at"][:21])
+check("summary gives time from min to max", "time_from_min_to_max" in o and
+      abs(float(o["time_from_min_to_max"].split("(")[1].split(" s")[0]) - abs((t_max - t_min).total_seconds())) < 0.2,
+      o.get("time_from_min_to_max"))
+o = ac.run_tool(ctx, "time_difference", {"start": "10:44:16", "end": "rec 01:00:00"})
+check("time_difference mixes clock and recording time", o["difference"] == "00:50:00.4", str(o))
 
 print("\n" + "=" * 60)
 print("RESULT: " + ("ALL TESTS PASSED" if not fails else f"{len(fails)} FAILURES: " + ", ".join(fails)))

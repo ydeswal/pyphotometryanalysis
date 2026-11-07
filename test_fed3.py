@@ -137,6 +137,13 @@ if real:
 else:
     print("  (skipped)")
 
+print("\n=== recording -> FED animal ===")
+A = ["k_m2", "k_m5", "k_m7", "k_m8", "k_m11", "m1"]
+check("prefixed ID found in recording name", fed3.guess_animal("k_M5_longitudinal-2026-11-04-155731", A) == "k_m5")
+check("m1 does not take m11", fed3.guess_animal("k_M11_day2", A) == "k_m11")
+check("plain ID still works", fed3.guess_animal("m1_fasted-2026", A) == "m1")
+check("no match -> None", fed3.guess_animal("rat3_session", A) is None)
+
 print("\n" + "=" * 60)
 print("RESULT: " + ("ALL TESTS PASSED" if not fails else f"{len(fails)} FAILURES: " + ", ".join(fails)))
 raise SystemExit(1 if fails else 0)

@@ -307,8 +307,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     mcols = st.columns(max(1, min(4, len(results) or 1)))
     rec_of = {}
     for i, r in enumerate(results):
-        guess = fed3.animal_from_name(r["name"]) or fed3.animal_from_name(
-            (r.get("settings") or {}).get("subject_ID", ""))
+        guess = fed3.guess_animal(r["name"], animals, (r.get("settings") or {}).get("subject_ID", ""))
         opts = ["(none)"] + animals
         a = mcols[i % len(mcols)].selectbox(rec_names[i], opts,
                                             index=opts.index(guess) if guess in opts else 0,

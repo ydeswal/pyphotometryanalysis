@@ -29,9 +29,15 @@ The chat needs at least one free API key. Keys are never put in the code.
    and click *Create API key*. No card needed. Its free tier is about 1,500
    requests a day and 10 a minute per key (your key's exact limits are on the
    AI Studio rate-limit page).
-2. **Groq (fallback, free, optional):** <https://console.groq.com/keys> →
+2. **Groq (backup, free, recommended):** <https://console.groq.com/keys> →
    *Create API Key*. 1,000 requests a day for gpt-oss-120b. Used only when
-   Gemini is out of quota or down.
+   every Gemini model is busy or out of quota. Google's free models are
+   sometimes overloaded ("high demand", HTTP 503); a Groq key keeps the chat
+   working then.
+
+   With the Gemini key alone the chat already tries three Gemini models in
+   turn (gemini-3.8-flash → gemini-3.6-flash → gemini-3.5-flash-lite), each with
+   its own quota, and waits and retries a busy model twice before moving on.
 3. On <https://share.streamlit.io> open the app → **⋮ → Settings → Secrets**
    and paste:
 
@@ -40,13 +46,16 @@ The chat needs at least one free API key. Keys are never put in the code.
        # optional: anyone opening the site must type this to use the chat
        CHAT_PASSWORD = "choose-one"
 
-   Save; the app restarts with the chat ready. Without secrets, each person
+   Save; the app restarts with the chat ready. Keep keys private: never
+   share a screenshot of this box. If one is seen, delete that key in AI
+   Studio (or Groq) and make a new one. Without secrets, each person
    can paste their own key in the chat's **⚙ AI settings** (kept only for
    their browser session).
 
 Optional settings in the same Secrets box:
 
     GEMINI_MODEL = "gemini-3.8-flash"     # if Google renames the model
+    GEMINI_FALLBACK_MODELS = "gemini-3.6-flash, gemini-3.5-flash-lite"
     GROQ_MODEL = "openai/gpt-oss-120b"
     AI_BASE_URL = "https://openrouter.ai/api/v1"   # any OpenAI-compatible
     AI_MODEL = "some/model:free"                    # service, tried last
