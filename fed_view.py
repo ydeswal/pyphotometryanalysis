@@ -443,7 +443,8 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             st.caption("Aligned on the 465 raw channel; the 405 channel is checked as the "
                        "control below.")
         _aligned(t, y, sig_label, pellets_s, meals, cov_s, pel_rows[inside].reset_index(drop=True),
-                 cs, animal, grams_each, h, config, df=df, roi=roi)
+                 cs, animal, grams_each, h, config, df=df, roi=roi,
+                 fit_r2=((res or {}).get("settings") or {}).get("fit_R2"))
 
 
 def _times_strip(res, cs, t0, t1, cov_s):
@@ -503,7 +504,7 @@ def _control_405(df, roi):
 
 
 def _aligned(t, y, sig_label, pellets_s, meals, cov_s, pel_rows, cs, animal, grams_each, h, config,
-             df=None, roi=None):
+             df=None, roi=None, fit_r2=None):
     a = st.columns([1.4, 1, 1, 1, 1])
     what = a[0].radio("Align to", ["Meal onsets", "Every pellet"], key="fed_align_to",
                       help="Douglass et al. 2025 compared −100…−50 s with 0…50 s for meals and "
@@ -558,22 +559,16 @@ def _aligned(t, y, sig_label, pellets_s, meals, cov_s, pel_rows, cs, animal, gra
             f"(permutation p = {stats['p']:.3g}, 2,000 random sets).")
         st.caption("Random times are drawn only when the FED was logging and away from real "
                    "events, so the comparison is fair against slow drifts in the signal.")
+        import interpret
+        c_eff = c_p = None
         if cstats is not None and np.isfinite(cstats["p"]):
-            c_eff = cstats["observed"] - cstats["null_mean"]
-            msg = (f"<b>405 control:</b> {c_eff:+.3g} z relative to random times (p = {cstats['p']:.3g}). ")
-            if cstats["p"] < 0.05 and np.sign(c_eff) == np.sign(stats["observed"] - stats["null_mean"]):
-                msg += ("The 405 channel moves the SAME way at eating, so movement, chewing or "
-                        "blood flow may explain part of this response.")
-                kind_ = "warn"
-            elif cstats["p"] < 0.05:
-                msg += ("The 405 channel moves the OPPOSITE way. That is what a calcium signal does "
-                        "when 405 nm is not exactly isosbestic, but it is also what made this "
-                        "recording's 405 fit slope negative; interpret with care.")
-                kind_ = "warn"
-            else:
-                msg += "405 does not change at eating, so the response is unlikely to be a movement artefact."
-                kind_ = "ok"
-            st.markdown(f'<div class="pp-note {kind_}">{msg}</div>', unsafe_allow_html=True)
+            c_eff, c_p = float(cstats["observed"] - cstats["null_mean"]), float(cstats["p"])
+        chk = interpret.assess_response(stats["n"], stats["observed"], stats["p"], stats["null_mean"], c_eff, c_p,
+                                        fit_r2, unit="meals" if meal_mode else "pellets")
+        kind_ = {"good": "ok", "uncertain": "warn"}.get(chk["level"], "")
+        rs = "".join(f"<br>· {r}" for r in chk["reasons"])
+        st.markdown(f'<div class="pp-note {kind_}">🧪 <b>Data check: {chk["label"]}</b><br>{chk["verdict"]}{rs}'
+                    "</div>", unsafe_allow_html=True)
     else:
         st.caption("Fewer than 3 events with complete windows; no test run.")
 

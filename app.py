@@ -56,6 +56,7 @@ import graph_tools as gt
 import fed3
 import fed_view
 import ai_chat
+import group_view
 
 # =============================================================================
 # PAGE STYLE: SMALL HEADER + WIDE GRAPH WORKSPACE
@@ -2507,8 +2508,14 @@ def _ai_chat_panel(results, display_mode="(no recordings)"):
     elif results and display_mode == "One recording at a time" and len(results) == 1:
         focus.append(str(results[0]["name"]))
     view["focus_default"] = focus
+    if display_mode == "Group analysis":
+        view.update({"group view": ss.get("grp_view"), "aligned by": ss.get("grp_align"),
+                     "signal": ss.get("grp_kind"), "normalisation": ss.get("grp_norm"),
+                     "group statistic": ss.get("grp_stat"), "meal definition": ss.get("grp_meal")})
+        view["focus_default"] = [str(r["name"]) for r in results]
     ai_chat.render_panel(results, FED_DATA, roi_name, ppd_paths=ppd_paths, view=view, fed_map=fed_map,
-                         sessions=ss.get("fed_sessions"), pellet_mg=ss.get("fed_mg"))
+                         sessions=ss.get("fed_sessions"), pellet_mg=ss.get("fed_mg"),
+                         groups=ss.get("grp_groups"))
 
 
 if not results:
@@ -2566,7 +2573,8 @@ else:
     )
 
     display_mode = st.radio(
-        "Display", ["One recording at a time", "Side-by-side graphs", "Feeding (FED3)"], horizontal=True,
+        "Display", ["One recording at a time", "Side-by-side graphs", "Feeding (FED3)", "Group analysis"],
+        horizontal=True,
         key="display_mode",
         help=("Side-by-side: 2-6 graphs of your choice, from any recordings, next to each "
               "other, with peak/trough tools and the time ruler in every graph."),
@@ -2588,6 +2596,10 @@ else:
     if display_mode == "Feeding (FED3)":
         fed_view.render(results, FED_DATA, roi_name, _prepare_view, max_points=MAX_POINTS,
                         height_mult=height_mult, config=PLOTLY_CONFIG)
+
+    if display_mode == "Group analysis":
+        group_view.render(results, FED_DATA, roi_name, _prepare_view, max_points=MAX_POINTS,
+                          height_mult=height_mult, config=PLOTLY_CONFIG)
 
     for idx, result in enumerate(results if display_mode == "One recording at a time" else [], start=1):
         full_df = result["df"]

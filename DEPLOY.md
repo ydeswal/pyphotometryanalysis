@@ -56,6 +56,7 @@ Optional settings in the same Secrets box:
 
     GEMINI_MODEL = "gemini-3.8-flash"     # if Google renames the model
     GEMINI_FALLBACK_MODELS = "gemini-3.6-flash, gemini-3.5-flash-lite"
+    GEMINI_REASONING = "low"              # "medium"/"high" = slower, "none" = model default
     GROQ_MODEL = "openai/gpt-oss-120b"
     AI_BASE_URL = "https://openrouter.ai/api/v1"   # any OpenAI-compatible
     AI_MODEL = "some/model:free"                    # service, tried last

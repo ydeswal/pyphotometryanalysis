@@ -4,6 +4,7 @@ network or API key needed)."""
 import json
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -227,13 +228,16 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 url = f"http://127.0.0.1:{srv.server_port}"
 mk = lambda m: dict(id="gemini", label="G", base_url=url, model=m, key="k", extra={}, echo_full=True,
                     model_secret="X")
+ac._health_store().clear()
 calls.clear()
 r = ac.ask("meals?", [], ctx, [mk("flaky")])
 check("a busy model is retried and then answers", r["answer"] == "4 meals." and
       [m for m, _ in calls].count("flaky") == 3, str([m for m, _ in calls]))
+ac._health_store().clear()
 calls.clear()
 r = ac.ask("meals?", [], ctx, [mk("busy"), mk("ok")])
 check("a model that stays busy is skipped for the next", r["answer"] == "4 meals." and r["provider"].endswith("ok"))
+ac._health_store().clear()
 calls.clear()
 r = ac.ask("meals?", [], ctx, [mk("dies"), mk("ok")])
 sent_to_ok = [b for m, b in calls if m == "ok"]
@@ -243,11 +247,91 @@ check("switch mid-question restarts on the new model with the computed results",
 check("the new model never sees the old model's internal fields",
       "SIG-dies" not in json.dumps(sent_to_ok[0]["messages"]))
 check("the restarted answer is still checked against the earlier results", r["unverified"] == [], str(r["unverified"]))
+ac._health_store().clear()
+calls.clear()
+t0 = time.perf_counter()
+r = ac.ask("meals?", [], ctx, [mk("busy"), mk("ok")])
+r = ac.ask("meals again?", [], ctx, [mk("busy"), mk("ok")])
+check("a model that just failed is not tried first next time",
+      [m for m, _ in calls].count("busy") == 1 and r["answer"] == "4 meals.", str([m for m, _ in calls]))
+check("switching to the next model does not wait", time.perf_counter() - t0 < 5, f"{time.perf_counter() - t0:.1f} s")
+chain = ac.order_chain([mk("busy"), mk("ok"), mk("fresh")])
+check("chain order: last good first, failing last", [p["model"] for p in chain] == ["ok", "fresh", "busy"],
+      str([p["model"] for p in chain]))
+ac._health_store().clear()
 calls.clear()
 r = ac.ask("meals?", [], ctx, [mk("busy")])
 check("all busy: plain-language message with a tip", r["error"] and "overloaded" in r["error"]
       and "Ask again" in r["error"] and "Groq" in r["error"], str(r["error"]))
 srv.shutdown()
+
+print("\n=== interpretation checks ===")
+ac._health_store().clear()
+OVER = "High confidence: the opposite 405 shift confirms the signal is genuine, and the low R² shows low motion."
+GOOD = ("The signal rises after meals, but the 405 control also changes, so this may not be neural. "
+        "Motion correction removed almost nothing.")
+
+
+class O(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        msgs = body["messages"]
+        calls.append(("o", body))
+        if msgs[-1]["role"] == "user" and "not consistent with the app's fixed data checks" in msgs[-1]["content"]:
+            msg = {"role": "assistant", "content": GOOD}
+        elif msgs[-1]["role"] == "user":
+            msg = {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "e1", "type": "function", "function": {"name": "event_aligned_response",
+                                                              "arguments": json.dumps({"animal": "m10"})}}]}
+        else:
+            msg = {"role": "assistant", "content": OVER}
+        out = json.dumps({"choices": [{"message": msg}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(out)
+
+
+# a recording whose 405 channel jumps at every meal
+df405 = df.copy()
+uv = 0.5 + 0.002 * rng.standard_normal(t.size)
+for m_ in meals:
+    uv -= 0.02 * np.exp(-np.clip(t - m_ - 20, 0, None) / 120) * (t > m_)
+df405["BLA_uv_raw"] = uv
+ctx405 = ac.DataContext([{"name": NAME, "df": df405, "settings": {"fit_R2": 0.009}}], fd, "BLA")
+osrv = HTTPServer(("127.0.0.1", 0), O)
+threading.Thread(target=osrv.serve_forever, daemon=True).start()
+calls.clear()
+r = ac.ask("Does m10 respond to eating?", [], ctx405,
+           [dict(id="gemini", label="G", base_url=f"http://127.0.0.1:{osrv.server_port}", model="o", key="k",
+                 extra={}, echo_full=True, model_secret="X")])
+lv = [c["level"] for c in r["checks"]]
+check("tool gives a fixed verdict: uncertain when 405 moves", "uncertain" in lv, str(lv))
+check("overclaiming draft is sent back and corrected", r["corrected"] and r["answer"] == GOOD and not r["overclaims"],
+      str(r.get("overclaims")))
+check("the correction request lists the bad phrases",
+      "High confidence" in calls[-1][1]["messages"][-1]["content"])
+osrv.shutdown()
+check("signed numbers must match the sign", ac.check_grounding("It changed by +0.30.", json.dumps({"x": -0.30}))[1]
+      == ["+0.30"] and ac.check_grounding("It fell by 0.30.", json.dumps({"x": -0.30}))[1] == [])
+
+print("\n=== group tools ===")
+df2 = df.copy()
+df2["BLA_dFF_percent"] = df["BLA_dFF_percent"] * 0.7 + 0.3 * rng.standard_normal(t.size)
+df2["BLA_z_dFF"] = (df2["BLA_dFF_percent"] - df2["BLA_dFF_percent"].mean()) / df2["BLA_dFF_percent"].std()
+ctxg = ac.DataContext([{"name": NAME, "df": df, "settings": {"fit_R2": 0.4}},
+                       {"name": "m10_day2", "df": df2, "settings": {"fit_R2": 0.4}}], fd, "BLA",
+                      groups={NAME: "Day 1", "m10_day2": "Day 2"})
+o = ac.run_tool(ctxg, "group_meal_response", {"signal": "z"})
+check("group tool runs per group", set(o.get("groups", {})) == {"Day 1", "Day 2"}, str(o)[:300])
+check("no between-group test with one animal per group", not o.get("comparisons"), str(o.get("comparisons")))
+check("one animal: group verdict says it cannot be tested",
+      all(g["data_check"]["level"] == "not testable" for g in o["groups"].values()))
+o = ac.run_tool(ctxg, "meal_patterns", {})
+check("meal pattern tool", len(o["animals"]) == 2 and o["animals"][0]["meals"] == 4, str(o["animals"])[:200])
 
 print("\n=== time arithmetic ===")
 o = ac.run_tool(ctx, "get_signal_summary", {"recording": "m10", "signal": "dff"})

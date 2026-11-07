@@ -53,6 +53,8 @@ import streamlit as st
 
 import fed3
 import graph_tools as gt
+import group_analysis as ga
+import interpret
 
 # =============================================================================
 # PROVIDERS
@@ -69,7 +71,9 @@ PROVIDERS = [
         "fallback_secret": "GEMINI_FALLBACK_MODELS",
         "key_secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         "key_url": "https://aistudio.google.com/apikey",
-        "extra": {}, "echo_full": True,
+        # Low thinking: the tools do the analysis, so long reasoning only adds
+        # delay. Override with GEMINI_REASONING = "medium" / "high" / "none".
+        "extra": {"reasoning_effort": "low"}, "reasoning_secret": "GEMINI_REASONING", "echo_full": True,
         "free_note": "about 1,500 requests/day and 10/minute per key (check your key's limits in AI Studio)",
     },
     {
@@ -90,8 +94,14 @@ PROVIDERS = [
 ]
 
 MAX_TOOL_ROUNDS = 6
-HTTP_TIMEOUT = 90
-BUSY_RETRIES = (3, 8)          # seconds to wait before each retry of a busy model
+HTTP_TIMEOUT = 40              # a free Flash model that has not answered by then is usually stuck
+BUSY_RETRIES = (3,)            # wait before retrying, used ONLY when no other model is left
+GOOD_FOR = 1800                # a model that answered within this many seconds is tried first
+
+# How long to skip a model after a failure (seconds). Busy models get longer
+# pauses each time they fail again (up to 8x).
+COOLDOWN = {503: 180, 500: 120, 502: 120, 504: 180, None: 150, 429: 65, 404: 86400, 401: 86400,
+            403: 86400}
 
 
 def _secret(name):
@@ -123,9 +133,68 @@ def configured_providers():
         for m in ([x.strip() for x in fb.split(",")] if fb else list(p.get("fallback_models", ()))):
             if m and m not in models:
                 models.append(m)
+        extra = dict(p.get("extra") or {})
+        rs = _secret(p.get("reasoning_secret", "")) if p.get("reasoning_secret") else None
+        if rs:
+            if rs.lower() in ("none", "off", "default"):
+                extra.pop("reasoning_effort", None)
+            else:
+                extra["reasoning_effort"] = rs.lower()
         for m in models:
-            out.append(dict(p, key=key or "", base_url=base.rstrip("/"), model=m))
+            out.append(dict(p, key=key or "", base_url=base.rstrip("/"), model=m, extra=extra))
     return out
+
+
+# ---- model health: remembered across questions and users of this server --
+
+@st.cache_resource
+def _health_store():
+    return {}
+
+
+def _hkey(prov):
+    return f"{prov['id']}:{prov['model']}"
+
+
+def health(prov):
+    return _health_store().setdefault(_hkey(prov), {"until": 0.0, "why": "", "ok_at": 0.0, "fails": 0,
+                                                    "lat": None, "no_reasoning": False})
+
+
+def mark_ok(prov, seconds):
+    h = health(prov)
+    h.update(until=0.0, why="", ok_at=time.time(), fails=0)
+    h["lat"] = seconds if h["lat"] is None else 0.7 * h["lat"] + 0.3 * seconds
+
+
+def mark_failed(prov, err):
+    h = health(prov)
+    h["fails"] += 1
+    base = COOLDOWN.get(err.status, 120 if err.status is None or err.status >= 500 else 0)
+    if err.status == 429 and re.search(r"per ?day|PerDay|daily", err.detail or "", re.I):
+        base = 3600
+    if err.status and 500 <= err.status < 600 or err.status is None:
+        base *= min(2 ** (h["fails"] - 1), 8)
+    if base:
+        h["until"] = time.time() + base
+        h["why"] = err.summary or str(err)
+
+
+def order_chain(providers):
+    """
+    Models to try, best first: the model that answered most recently (if in
+    the last 30 min), then the others in their configured order, then the
+    ones that failed recently (still tried as a last resort, soonest-to-
+    recover first). So a model that keeps failing stops costing time.
+    """
+    now = time.time()
+    ok = [p for p in providers if health(p)["until"] <= now]
+    cooling = sorted([p for p in providers if health(p)["until"] > now], key=lambda p: health(p)["until"])
+    recent = [p for p in ok if now - health(p)["ok_at"] < GOOD_FOR]
+    if recent:
+        best = max(recent, key=lambda p: health(p)["ok_at"])
+        ok = [best] + [p for p in ok if p is not best]
+    return ok + cooling
 
 
 @st.cache_resource
@@ -233,11 +302,11 @@ def _no_answer_message(errors, providers):
 
 def complete(providers, msgs, tools, start_at=0, log=None, prepare=None):
     """
-    One chat-completion request. A busy model (HTTP 5xx) is retried after a
-    short wait; a model that is out of quota, unknown or still busy is skipped
-    for the next one in the chain. prepare(i) may return the messages to send
-    to chain entry i (used to restart cleanly on a different model).
-    Returns (message, chain_index, usage).
+    One chat-completion request along the chain. A model that fails is
+    remembered as failing (see mark_failed) and the next one is tried at once,
+    with no waiting; only the very last model left is retried after a short
+    pause. prepare(i) may return the messages to send to chain entry i (used to
+    restart cleanly on a different model). Returns (message, chain_index, usage).
     """
     errors = []
     for i in range(start_at, len(providers)):
@@ -250,22 +319,31 @@ def complete(providers, msgs, tools, start_at=0, log=None, prepare=None):
         else:
             body.pop("tool_choice")
         body.update(prov.get("extra") or {})
-        waits = list(BUSY_RETRIES)
+        if health(prov)["no_reasoning"]:
+            body.pop("reasoning_effort", None)
+        waits = list(BUSY_RETRIES) if i == len(providers) - 1 else []
         while True:
+            t0 = time.perf_counter()
             try:
                 data = _post(prov, body)
                 _count_request(prov["id"], prov["model"])
                 msg = data["choices"][0]["message"]
+                mark_ok(prov, time.perf_counter() - t0)
                 return msg, i, data.get("usage") or {}
             except ProviderError as e:
+                if e.status == 400 and "reasoning_effort" in body and re.search(r"reason|thinking", e.detail or "", re.I):
+                    body.pop("reasoning_effort")            # this model does not take the setting
+                    health(prov)["no_reasoning"] = True
+                    continue
                 busy = e.status is None or 500 <= (e.status or 0) < 600
                 if busy and waits:
-                    w = min(max(e.retry_after or waits[0], 1.0), 15.0)
+                    w = min(max(e.retry_after or waits[0], 1.0), 10.0)
                     waits.pop(0)
                     if log:
-                        log(f"⏳ {prov['model']} {e.summary}; trying again in {w:.0f} s…")
+                        log(f"⏳ {prov['model']} {e.summary}; last model left, trying again in {w:.0f} s…")
                     time.sleep(w)
                     continue
+                mark_failed(prov, e)
                 errors.append((prov["model"], e.summary or str(e)))
                 if log and i + 1 < len(providers):
                     log(f"↪ {prov['model']} {e.summary}; switching to {providers[i + 1]['model']}…")
@@ -392,8 +470,9 @@ class DataContext:
     """Everything the tools may read, plus what the user is looking at."""
 
     def __init__(self, results, fed, roi, ppd_paths=None, view=None, fed_map=None,
-                 sessions=None, allow_raw=True, pellet_mg=None):
+                 sessions=None, allow_raw=True, pellet_mg=None, groups=None):
         self.results = list(results or [])
+        self.groups = dict(groups or {})          # recording name -> group label (group view)
         self.fed = fed if (fed is not None and not fed.events.empty) else None
         self.roi = roi
         self.ppd_paths = dict(ppd_paths or {})
@@ -754,22 +833,20 @@ def tool_event_aligned_response(ctx, animal=None, recording=None, align_to="meal
             out["largest_mean_change_after_event"] = {"seconds_after": _r(tax[k]), "value": _r(mean_curve[k])}
     else:
         out["result"] = "fewer than 3 events with a full window; no test run"
+    c_eff = c_p = None
     try:
         import fed_view
         ct, cu = fed_view._control_405(res["df"], ctx.roi)
         if ct is not None and stats["n"] >= 3:
             c = fed3.permutation_test(ct, cu, kept, base, resp, allowed_sec=cov, n_perm=2000)
             if np.isfinite(c["p"]):
-                eff = c["observed"] - c["null_mean"]
-                same = np.sign(eff) == np.sign(stats["observed"] - stats["null_mean"])
-                out["control_405"] = {
-                    "change_vs_random_z": _r(eff), "permutation_p": _r(c["p"], 3),
-                    "verdict": ("405 also changes in the SAME direction: movement or blood flow may explain part "
-                                "of the response" if c["p"] < 0.05 and same else
-                                "405 changes in the OPPOSITE direction: interpret with care" if c["p"] < 0.05
-                                else "405 does not change at eating")}
+                c_eff, c_p = float(c["observed"] - c["null_mean"]), float(c["p"])
+                out["control_405"] = {"change_vs_random_z": _r(c_eff), "permutation_p": _r(c_p, 3)}
     except Exception:
         pass
+    r2 = (res.get("settings") or {}).get("fit_R2")
+    out["data_check"] = interpret.assess_response(stats["n"], stats["observed"], stats["p"], stats["null_mean"],
+                                                  c_eff, c_p, r2, unit="meals" if meal_mode else "pellets")
     deltas = fed3.window_means(t, y, kept, *resp) - fed3.window_means(t, y, kept, *base)
     out["per_event"] = [{"time": ctx.sec_fmt(e, cs), "change": _r(d)} for e, d in zip(kept[:25], deltas[:25])]
     if kept.size > 25:
@@ -901,7 +978,93 @@ def tool_recording_info(ctx, recording=None):
         out["warnings"] = [str(w)[:240] for w in s["warnings"][:6]]
     if s.get("notes"):
         out["notes"] = [str(n)[:200] for n in s["notes"][:4]]
+    meaning = interpret.recording_notes(s)
+    if meaning:
+        out["what_these_numbers_mean"] = meaning
     return out
+
+
+# ---- group tools (same code as the Group analysis view) -----------------
+
+def _members(ctx, signal="z", animals=None, groups=None):
+    import fed_view
+    mem = []
+    for r in ctx.results:
+        an = ctx.rec_animal.get(str(r["name"]))
+        if animals and (an or "").lower() not in {a.lower() for a in animals}:
+            continue
+        g = ctx.groups.get(str(r["name"]), "All")
+        if groups and g not in groups:
+            continue
+        t, y, _, _ = ctx.series(r, signal)
+        try:
+            ctrl = fed_view._control_405(r["df"], ctx.roi)
+            ctrl = ctrl if ctrl[0] is not None else None
+        except Exception:
+            ctrl = None
+        mem.append(ga.make_member(str(r["name"]), an, g, t, y, ctx.clock_start(r), ctx.fed, ctx.sessions,
+                                  (r.get("settings") or {}).get("fit_R2"), ctrl, ctx.grams))
+    return mem
+
+
+def tool_group_meal_response(ctx, signal="z", animals=None, groups=None, max_gap_s=300, min_pellets=1):
+    """Meal-aligned response with animals as the unit (each animal averaged
+    over its own meals first), per group, plus between-group comparison."""
+    if ctx.fed is None:
+        raise ToolError("No FED3 data is loaded.")
+    mem = [m for m in _members(ctx, signal, animals, groups) if m["pellets"].size]
+    if not mem:
+        raise ToolError("No recording with FED data matches.")
+    R = [ga.member_meal_response(m, float(max_gap_s), int(min_pellets), n_perm=1000) for m in mem]
+    G = ga.group_meal_response(R)
+    out = {"signal": signal, "unit_of_analysis": "animal (each animal's mean over its own meals)",
+           "meal_definition": f"pellets < {max_gap_s} s apart, >= {min_pellets} pellet(s)",
+           "baseline_window_s": [-100, -50], "response_window_s": [0, 50], "animals": [], "groups": {}}
+    for r in R:
+        if r is None:
+            continue
+        out["animals"].append({"animal": r["animal"], "group": r["group"], "meals": r["n_meals"],
+                               "mean_change": _r(r["mean_delta"]), "p_vs_random": _r(r["p_vs_random"], 3),
+                               "control_405_p": _r(r["control"]["p"], 3),
+                               "control_405_change": _r(r["control"]["effect"]),
+                               "data_check_level": r["check"]["level"]})
+    for g, v in G.items():
+        out["groups"][g] = {"n_animals": v["n_animals"], "mean_change": _r(v["mean_delta"]),
+                            "sem": _r(v["sem_delta"]), "t_test_vs_0_p": _r(v["t_p"], 3),
+                            "wilcoxon_p": _r(v["wilcoxon_p"], 3),
+                            "smallest_possible_wilcoxon_p": _r(v["wilcoxon_min_p"], 3),
+                            "pooled_meals_for_reference_only": v["pooled_meals"],
+                            "data_check": v["check"]}
+    gs = list(G)
+    if len(gs) >= 2:
+        out["comparisons"] = []
+        for i in range(len(gs)):
+            for j in range(i + 1, len(gs)):
+                c = ga.compare_groups(R, gs[i], gs[j])
+                if c:
+                    out["comparisons"].append({"groups": [gs[i], gs[j]], **{k: (_r(v, 3) if isinstance(v, float)
+                                                                              else v) for k, v in c.items()}})
+    return out
+
+
+def tool_meal_patterns(ctx, animals=None, groups=None, max_gap_s=60, min_pellets=2):
+    """Feeding pattern per animal (inside each recording, or each FED-only
+    animal's logging) and group mean ± SEM."""
+    if ctx.fed is None:
+        raise ToolError("No FED3 data is loaded.")
+    mem = _members(ctx, "dff", animals, groups) if ctx.results else []
+    have = {m["animal"] for m in mem}
+    for an in ctx.fed.animals:
+        if an not in have and (not animals or an.lower() in {a.lower() for a in animals}):
+            cov = ctx.fed.coverage_of(an, ctx.sessions)
+            if len(cov):
+                mem.append(ga.make_member(f"FED {an}", an, "FED only", None, None, cov["start"].min(), ctx.fed,
+                                          ctx.sessions, None, None, ctx.grams))
+    df, summ = ga.meal_table(mem, float(max_gap_s), int(min_pellets))
+    rows = [{k: (_r(v) if isinstance(v, float) else v) for k, v in r.items()} for r in df.to_dict("records")]
+    return {"meal_definition": f"pellets < {max_gap_s} s apart, >= {min_pellets} pellets",
+            "satiety_ratio": "minutes without eating after a meal per pellet in that meal",
+            "animals": rows, "group_mean_sem": summ.to_dict("records")}
 
 
 # ---- safe calculator -----------------------------------------------------
@@ -1036,6 +1199,18 @@ TOOLS = [
         {"recording": _REC, "start": _T, "end": _T, "points": {"type": "integer"}}, []),
     _fn("get_recording_info", "Processing settings and quality checks of a recording: pipeline, 405 fit slope "
         "and R², F0, clipping, clock drift and gaps, warnings.", {"recording": _REC}, []),
+    _fn("group_meal_response", "Several animals together: meal-aligned response with each ANIMAL as the unit "
+        "(per-animal means, then group mean, t-test and Wilcoxon across animals), per group, between-group "
+        "comparison, and a data_check verdict per group. Use for any question about more than one animal.",
+        {"signal": _SIG, "animals": {"type": "array", "items": {"type": "string"}},
+         "groups": {"type": "array", "items": {"type": "string"}},
+         "max_gap_s": {"type": "number", "description": "meal gap, default 300 (Douglass et al. 2024)"},
+         "min_pellets": {"type": "integer", "description": "default 1"}}, []),
+    _fn("meal_patterns", "Feeding pattern of every animal (pellets, grams, rate, meals, meal size and duration, "
+        "inter-meal interval, satiety ratio, first-pellet latency) and group mean ± SEM.",
+        {"animals": {"type": "array", "items": {"type": "string"}},
+         "groups": {"type": "array", "items": {"type": "string"}},
+         "max_gap_s": {"type": "number"}, "min_pellets": {"type": "integer"}}, []),
     _fn("time_difference", "How long from one time to another (clock times, dates or recording times). "
         "Use for any time arithmetic.", {"start": _T, "end": _T, "recording": _REC}, ["start", "end"]),
     _fn("calculate", "Arithmetic on numbers from tool results (differences, ratios, percentages, unit "
@@ -1050,6 +1225,7 @@ TOOL_FUNCS = {
     "event_aligned_response": tool_event_aligned_response, "signal_vs_intake": tool_signal_vs_intake,
     "get_raw_ppd_window": tool_raw_ppd_window, "get_recording_info": tool_recording_info,
     "calculate": tool_calculate, "time_difference": tool_time_difference,
+    "group_meal_response": tool_group_meal_response, "meal_patterns": tool_meal_patterns,
 }
 
 
@@ -1059,7 +1235,10 @@ def available_tools(ctx):
         skip |= {"get_signal_summary", "get_signal_trace", "find_extremes", "compare_windows",
                  "event_aligned_response", "signal_vs_intake", "get_raw_ppd_window", "get_recording_info"}
     if ctx.fed is None:
-        skip |= {"get_fed_events", "get_meals", "get_intake", "event_aligned_response", "signal_vs_intake"}
+        skip |= {"get_fed_events", "get_meals", "get_intake", "event_aligned_response", "signal_vs_intake",
+                 "group_meal_response", "meal_patterns"}
+    if len(ctx.results) < 2:
+        skip.add("group_meal_response")
     if not ctx.allow_raw or not ctx.ppd_paths:
         skip.add("get_raw_ppd_window")
     return [t for t in TOOLS if t["function"]["name"] not in skip]
@@ -1093,7 +1272,10 @@ def catalogue(ctx, focus=None):
                 a, b = ctx.rec_span(r)
                 cs = ctx.clock_start(r)
                 s = r.get("settings") or {}
+                grp = ctx.groups.get(str(r["name"]))
                 L.append(f"- {r['name']}: animal {ctx.rec_animal.get(str(r['name'])) or '?'}; "
+                         + (f"group {grp}; " if grp else "")
+                         + ""
                          f"{ctx.tfmt(a, cs)} to {ctx.tfmt(b, cs)} (length {gt.fmt_hms((b - a).total_seconds(), 0)}); "
                          f"signals {', '.join(ctx.signals_of(r))}; raw .ppd "
                          f"{'yes' if str(r['name']) in ctx.ppd_paths and ctx.allow_raw else 'no'}"
@@ -1136,6 +1318,18 @@ for any time span call `time_difference` (get_signal_summary already gives the t
 into the recording (rec HH:MM:SS, a duration) when relevant. Never write clock times in 24-hour form.
 5. Separate what the data show from interpretation. FED gaps mean "not logged", not "not eating". Mention the \
 405 control when you discuss a response. Never claim causation from correlation.
+
+Interpretation rules (the app checks these; breaking them makes the app correct you):
+6. When a tool result has `data_check`, its `level` and `verdict` are final. Put the verdict's meaning in your \
+first paragraph and include every point in `must_say`. Never state a higher level of trust than `level`.
+7. Unless data_check level is "good", never write: confirms, genuine, high confidence, rules out, not an \
+artifact, low/minimal motion, clearly neural. Never write "proves" or "definitively" at all.
+8. A change of the 405 control in EITHER direction is a reason for caution, never a confirmation. An OPPOSITE \
+405 change has more than one cause (GCaMP's small response at 405 nm, or blood absorbing 405 nm light).
+9. A low 405 fit R² means motion correction removed almost nothing. It never means there was little motion.
+10. For several animals, the animal is the unit: use group_meal_response, report n as animals, and treat \
+pooled-meal numbers as reference only. With few animals say how small the sample is.
+11. Use `what_these_numbers_mean` from get_recording_info as given; do not reinterpret it.
 
 Signals: dff = dF/F, z = z-scored dF/F, raw465 / raw405 = raw channels at the app's export rate (the original \
 .ppd at full rate is get_raw_ppd_window), deltaF = 465 - fitted 405, filt465, fit405, F0 = baseline.
@@ -1251,10 +1445,17 @@ def check_grounding(answer, reference_text):
         checked += 1
         tol = 0.5 * 10 ** (-_decimals(tok)) * 1.0001 + 1e-12
         ok = False
-        for cand in (ref_nums, np.abs(ref_nums), ref_nums * 100.0, np.abs(ref_nums) * 100.0):
-            if np.any(np.abs(cand - abs(x)) <= tol) or np.any(np.abs(cand - x) <= tol):
-                ok = True
-                break
+        if tok.lstrip()[:1] in "+-−":
+            # Written with a sign: the sign must match ("+0.30" is wrong if the
+            # data say -0.30).
+            cands = (ref_nums, ref_nums * 100.0)
+            ok = any(np.any(np.abs(c - x) <= tol) for c in cands)
+        else:
+            # Unsigned ("fell by 3.47%"): magnitude must match.
+            for cand in (np.abs(ref_nums), np.abs(ref_nums) * 100.0):
+                if np.any(np.abs(cand - abs(x)) <= tol):
+                    ok = True
+                    break
         if not ok:
             bad.append(tok)
     return checked, bad
@@ -1278,6 +1479,8 @@ def ask(question, history, ctx, providers, focus=None, log=None):
     base_msgs = list(msgs)
     tools = available_tools(ctx)
     trace, ref_parts = [], [sys_msg, question] + [h.get("ref", "") + "\n" + h["q"] for h in history[-6:]]
+    providers = order_chain(providers)
+    t_start = time.perf_counter()
     n_req, tokens, pidx = 0, 0, 0
     calls_seen = {}
     answer = None
@@ -1334,15 +1537,98 @@ def ask(question, history, ctx, providers, focus=None, log=None):
                 trace.append({"tool": name, "args": args, "result": out})
                 ref_parts += [text, json.dumps(args, default=str)]
                 msgs.append({"role": "tool", "tool_call_id": c.get("id") or name, "content": text})
+        # ---- interpretation check: no claim stronger than the data checks --
+        checks = data_checks(trace)
+        over = interpret.find_overclaims(answer or "", [c["level"] for c in checks])
+        missing = missing_points(answer or "", checks)
+        corrected = False
+        if (over or missing) and answer:
+            if log:
+                log("🔎 The draft claimed more than the data checks allow; asking for a corrected answer…")
+            fix = ("Your answer is not consistent with the app's fixed data checks.\n"
+                   + (f"Phrases that claim too much: {', '.join(repr(o) for o in over)}.\n" if over else "")
+                   + (f"Points it must state: {'; '.join(missing)}.\n" if missing else "")
+                   + "Data checks:\n" + "\n".join(f"- [{c['level']}] {c['verdict']} " + " ".join(c["reasons"])
+                                                   for c in checks)
+                   + "\nRewrite the whole answer: keep every number exactly, state the data-check verdict in the "
+                     "first paragraph, include the required points, and do not use the phrases listed.")
+            msgs.append({"role": "user", "content": fix})      # the draft is already the last message
+            try:
+                msg2, pidx, usage = complete(providers, msgs, None, start_at=pidx, log=log, prepare=None)
+                n_req += 1
+                tokens += int(usage.get("total_tokens") or 0)
+                new = (msg2.get("content") or "").strip()
+                if new:
+                    answer = new
+                    corrected = True
+            except ProviderError:
+                pass
+            over = interpret.find_overclaims(answer or "", [c["level"] for c in checks])
+            missing = missing_points(answer or "", checks)
     except ProviderError as e:
         return {"answer": None, "error": str(e), "trace": trace, "requests": n_req, "tokens": tokens,
-                "provider": None, "checked": 0, "unverified": [], "ref": "", "retry": True}
+                "provider": None, "checked": 0, "unverified": [], "ref": "", "retry": True,
+                "seconds": time.perf_counter() - t_start}
     ref = "\n".join(ref_parts)
     checked, bad = check_grounding(answer or "", ref)
     return {"answer": answer or "(The model gave no answer.)", "error": None, "trace": trace,
             "provider": f"{providers[pidx]['label']} · {providers[pidx]['model']}", "requests": n_req,
-            "tokens": tokens, "checked": checked, "unverified": bad,
+            "tokens": tokens, "checked": checked, "unverified": bad, "checks": checks,
+            "overclaims": over, "missing": missing, "corrected": corrected,
+            "seconds": time.perf_counter() - t_start,
             "ref": "\n".join(json.dumps(t["result"], default=str) for t in trace)[:20000]}
+
+
+def data_checks(trace):
+    """Every fixed trust verdict in the tool results of one answer."""
+    out = []
+
+    def walk(o, where):
+        if isinstance(o, dict):
+            if isinstance(o.get("data_check"), dict) and "level" in o["data_check"]:
+                dc = dict(o["data_check"])
+                dc["where"] = where
+                out.append(dc)
+            for k, v in o.items():
+                if k != "data_check":
+                    walk(v, f"{where} · {k}" if isinstance(v, dict) and "data_check" in v else where)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v, where)
+
+    for t in trace:
+        r = t["result"]
+        label = t["tool"]
+        if isinstance(r, dict):
+            label += " " + " ".join(str(r.get(k)) for k in ("animal", "recording") if r.get(k))
+        walk(r, label.strip())
+        if t["tool"] == "get_recording_info" and isinstance(r, dict):
+            r2 = (r.get("settings") or {}).get("fit_R2")
+            if isinstance(r2, (int, float)) and r2 < interpret.LOW_R2:
+                out.append({"level": "moderate", "label": "Motion correction had little effect",
+                            "verdict": next((x for x in r.get("what_these_numbers_mean", []) if "R²" in x), ""),
+                            "reasons": [], "must_say": [], "where": label})
+    return out
+
+
+_MUST_PATTERNS = {
+    "405": re.compile(r"\b405\b|isosbestic|control", re.I),
+    "not statistically reliable": re.compile(r"not (statistically )?(reliable|significant)|no (reliable|significant)",
+                                             re.I),
+    "motion correction": re.compile(r"motion correction|correct(ion|ed)|R²|R2|fit", re.I),
+}
+
+
+def missing_points(answer, checks):
+    """Required points (data_check must_say) the answer does not mention."""
+    out = []
+    for c in checks:
+        for m in c.get("must_say", []):
+            key = "405" if "405" in m else ("not statistically reliable" if "not statistically" in m else
+                                            ("motion correction" if "motion correction" in m else None))
+            if key and not _MUST_PATTERNS[key].search(answer):
+                out.append(m)
+    return list(dict.fromkeys(out))
 
 
 # =============================================================================
@@ -1368,15 +1654,15 @@ def _suggestions(ctx, focus):
 
 
 def render_panel(results, fed, roi, ppd_paths=None, view=None, fed_map=None, sessions=None,
-                 pellet_mg=None):
+                 pellet_mg=None, groups=None):
     """The chat panel. Call once per page run; it reruns on its own (fragment)."""
     with st.container(key="ai-panel"):          # styled in theme.py (.st-key-ai-panel)
         with st.expander("✨ Ask the data with AI", expanded=bool(st.session_state.get("ai_history"))):
-            _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg)
+            _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups)
 
 
 @st.fragment
-def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg):
+def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups=None):
     pw = _secret("CHAT_PASSWORD")
     if pw and st.session_state.get("ai_unlocked") != pw:
         got = st.text_input("Chat password", type="password", key="ai_pw")
@@ -1419,7 +1705,7 @@ def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg):
         return
 
     ctx = DataContext(results, fed, roi, ppd_paths, view, fed_map, sessions,
-                      allow_raw=st.session_state.get("ai_allow_raw", True), pellet_mg=pellet_mg)
+                      allow_raw=st.session_state.get("ai_allow_raw", True), pellet_mg=pellet_mg, groups=groups)
     options = ctx.names() + ([f"FED {a}" for a in ctx.fed.animals] if ctx.fed is not None else [])
     auto = [o for o in options if o in (view or {}).get("focus_default", [])]
     ss = st.session_state
@@ -1468,6 +1754,38 @@ def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg):
     st.rerun(scope="fragment")
 
 
+_LEVEL_CLASS = {"good": "ok", "moderate": "", "uncertain": "warn", "not significant": "", "not testable": ""}
+
+
+def _show_checks(h):
+    """The app's own verdicts, shown under the answer whatever the AI wrote."""
+    checks = [c for c in h.get("checks") or [] if c.get("verdict")]
+    if not checks:
+        return
+    seen, parts = set(), []
+    worst = "good"
+    order = ["good", "moderate", "not testable", "not significant", "uncertain"]
+    for c in checks:
+        key = (c["level"], c["verdict"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if order.index(c["level"]) > order.index(worst):
+            worst = c["level"]
+        rs = "".join(f"<br>· {r}" for r in c.get("reasons", []))
+        parts.append(f"<b>{c.get('label', c['level'])}</b> <span style='opacity:.7'>({c.get('where', '')})</span>"
+                     f"<br>{c['verdict']}{rs}")
+    flag = ""
+    if h.get("overclaims"):
+        flag = ("<br><b>The AI's wording above still overstates this</b> (" + ", ".join(h["overclaims"])
+                + "). Go by this box.")
+    elif h.get("missing"):
+        flag = "<br><b>The answer above leaves out:</b> " + "; ".join(h["missing"]) + "."
+    st.markdown(f'<div class="pp-note {_LEVEL_CLASS.get(worst, "")}">🧪 <b>Data check by the app</b> '
+                f'(fixed rules, not AI)<br>' + "<br><br>".join(parts[:6]) + flag + "</div>",
+                unsafe_allow_html=True)
+
+
 def _show_answer(h, idx=None):
     if h.get("error"):
         st.warning(h["error"])
@@ -1476,13 +1794,17 @@ def _show_answer(h, idx=None):
             st.rerun(scope="fragment")
         return
     st.markdown(h["a"])
+    _show_checks(h)
     if h.get("unverified"):
         st.markdown(f'<div class="pp-note warn">⚠ Not found in any computed result, so treat as unverified: '
                     f'{", ".join(h["unverified"][:12])}</div>', unsafe_allow_html=True)
     elif h.get("checked"):
         st.caption(f"✓ All {h['checked']} numbers and times in this answer were traced to computed results.")
+    secs = f" · {h['seconds']:.0f} s" if h.get("seconds") else ""
     with st.expander(f"How this was answered · {len(h.get('trace', []))} data calls · "
-                     f"{h.get('requests', 0)} AI requests · {h.get('provider') or ''}"):
+                     f"{h.get('requests', 0)} AI requests{secs} · {h.get('provider') or ''}"):
+        if h.get("corrected"):
+            st.caption("The first draft claimed more than the data checks allow; the AI was asked to correct it.")
         for t in h.get("trace", []):
             st.markdown(f"**{t['tool']}** `{json.dumps(t['args'], default=str)}`")
             st.json(t["result"], expanded=False)

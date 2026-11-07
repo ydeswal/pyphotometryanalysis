@@ -35,6 +35,83 @@ allowed.
 
 ---
 
+## 7 November 2026: Group analysis, a sturdier and faster AI
+
+### Group analysis (Display → Group analysis)
+
+For several recordings together, e.g. an ad-lib test on five animals, or the
+same animals on several days. Pick which recordings to use, their animal
+(FED ID) and an optional **group** label (Day 1 / Day 7, Control / Drug).
+
+| View | What it shows |
+|---|---|
+| Combined (group mean) | Group line ± band for the signal, and FED intake underneath on the same axis; each animal faintly behind it |
+| Each recording | Every recording in its own panel on one shared axis (pellet ticks and pellets-per-bin bars), or all overlaid in one graph |
+| Heatmap | Animals × time, signal and intake |
+| Meal-aligned (group) | Signal around meal onsets, averaged per animal first, then across animals; animal-level t-test and Wilcoxon, between-group test (paired when the same animals are in both), 405 check per animal |
+| Feeding pattern table | Pellets, grams, rate, meals, meal size and duration, inter-meal interval, satiety ratio, first-pellet latency, % in the dark; per animal and group mean ± SEM |
+
+Options, and why:
+
+- **Line recordings up by** clock time (recorded together), time of day
+  (different days overlaid, ZT ticks and dark-phase shading), time since
+  each recording started, or time since each animal's first pellet.
+- **Normalise each recording**: z-score (default), robust z (median/MAD, for
+  long recordings with big transients), z-score or subtraction against a
+  baseline period, as recorded, or 0–1 scaling. z removes size differences
+  between animals; compare amplitudes in dF/F.
+- **Group line and band**: mean ± SEM (standard), mean ± 95% bootstrap CI
+  (resamples animals, no normality assumption), median & IQR (robust with
+  few animals), mean ± SD (spread).
+- **Food shown as**: pellets per bin, cumulative grams, cumulative % of each
+  animal's own total (removes differences in appetite, shows timing), % of
+  animals eating, or rolling eating rate. Times without FED logging are
+  missing, never zero.
+- **Meal definition** presets: Douglass et al. 2024 (gap ≥ 300 s, any size;
+  default, keeps a clean baseline before each meal), FED3 paper (gap < 60 s,
+  ≥ 5 pellets), short meals (gap < 60 s, ≥ 2), or custom.
+- **Smoothing** including the 30-min running mean used for long recordings.
+- **Animals are the unit.** Recordings of the same animal in a group are
+  averaged first; meal responses are averaged within each animal, then
+  across animals. The per-meal changes can be downloaded with animal IDs for
+  a mixed model.
+
+References: Douglass AM et al. (2024) *Cell Metabolism* 37:708 (pyPhotometry
+with Doric mini-cubes, recordings up to a month: 30-min running mean, group
+mean ± SEM on a ZT axis, double-plotted heatmaps, meals ≥ 300 s apart,
+baseline-subtracted meal responses). Loewinger G et al. (2024) *eLife*, article 95802
+(animal and session as units; problems of pooling trials). Matikainen-Ankney BA
+et al. (2021) *eLife* 10:e66173 (FED3; meals, pellets per hour as mean ± SEM).
+
+### The AI cannot overstate a result any more
+
+- Fixed rules in `interpret.py` (not AI) decide how far a result can be
+  trusted: significant against random times; **405 control** changes in either
+  direction → at most "uncertain"; low 405 fit R² → motion correction removed
+  almost nothing (never "low motion"); few events or animals → at most
+  "moderate". The Feeding view, the Group view and the AI all show the same
+  verdict.
+- Every answer carries a **🧪 Data check by the app** box with that verdict,
+  whatever the AI wrote.
+- If the AI's draft uses stronger words than the verdict allows ("confirms",
+  "genuine", "high confidence", "rules out", "low motion" …) or leaves out a
+  required point, the app sends it back for correction automatically, and
+  flags it if it still overstates.
+- Numbers written with a sign must match the sign in the data.
+- New AI tools for groups: `group_meal_response` (animals as the unit) and
+  `meal_patterns`.
+
+### Faster answers
+
+- A model that fails (busy, out of quota, too slow) is remembered and skipped
+  for a few minutes; the next model is tried at once, with no waiting.
+- The model that answered last is tried first.
+- Gemini runs with low "thinking" (the data tools do the analysis); the
+  request time-out is 40 s instead of 90 s.
+- Each answer shows how long it took.
+
+---
+
 ## 6 November 2026: 12-hour clock times
 
 Every clock time the app shows is now 12-hour with AM/PM (3:57:31 PM): graph
@@ -340,6 +417,9 @@ recording if it is present.
 | `fed3.py` | Reads FED3 controller output; intake, meals, event alignment, permutation test |
 | `fed_view.py` | The "Feeding (FED3)" view |
 | `ai_chat.py` | The "Ask the data" AI chat: data tools, free providers, answer check |
+| `group_view.py` | The "Group analysis" view |
+| `group_analysis.py` | Group computations (alignment, normalisation, group statistics, FED averaging, meal patterns, group meal response) |
+| `interpret.py` | Fixed rules for how far a result can be trusted (405 control, fit R², n) |
 | `run_local.command` / `.bat` / `.sh` | Start the app on your own computer |
 | `lickometer.py` | Lick ingestion, bout detection, peri-event alignment |
 | `theme.py` | Styling and Plotly defaults |
