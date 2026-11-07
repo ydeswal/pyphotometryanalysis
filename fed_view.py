@@ -349,7 +349,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         df = prepare_df(res["df"])
         cs = gt.clock_start_of(df, res.get("settings"))
         kinds = signal_kinds(df, roi)
-        sc = st.columns([1.4, 1, 1.6, 1.4])
+        sc = st.columns([1.3, 0.9, 2.8])
         kind = sc[0].selectbox("Signal", kinds, key="fed_kind",
                                help="dF/F or z-score, or a raw channel. 'Raw 465 + 405' draws "
                                     "both raw channels, each on its own axis.")

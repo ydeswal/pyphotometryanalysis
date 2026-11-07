@@ -74,8 +74,9 @@ th.inject_theme()
 
 th.page_header(
     "Fiber Photometry Analysis",
-    "pyPhotometry .ppd / .csv  \u00b7  motion correction, dF/F, z-score, lickometer",
+    "pyPhotometry .ppd / .csv  \u00b7  motion correction, dF/F, z-score, feeding and licking on one clock",
     mark="FP",
+    tags=("Photometry", "FED3", "Lickometer", "AI chat"),
 )
 
 # =============================================================================
@@ -3144,3 +3145,7 @@ else:
         mime="application/zip",
         use_container_width=True,
     )
+
+
+# Credit line, shown on every page and view.
+th.footer()

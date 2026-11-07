@@ -48,7 +48,7 @@ because the app and other software read it back.
 
 ## 6 November 2026: "Ask the data" AI chat
 
-Under the **Display** buttons, **💬 Ask the data (AI)** answers questions
+Under the **Display** buttons, **✨ Ask the data with AI** answers questions
 about one or more graphs, the raw recordings and the FED3 data, for free.
 Set up the keys once (see `DEPLOY.md`).
 

@@ -1370,8 +1370,9 @@ def _suggestions(ctx, focus):
 def render_panel(results, fed, roi, ppd_paths=None, view=None, fed_map=None, sessions=None,
                  pellet_mg=None):
     """The chat panel. Call once per page run; it reruns on its own (fragment)."""
-    with st.expander("💬 Ask the data (AI)", expanded=bool(st.session_state.get("ai_history"))):
-        _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg)
+    with st.container(key="ai-panel"):          # styled in theme.py (.st-key-ai-panel)
+        with st.expander("✨ Ask the data with AI", expanded=bool(st.session_state.get("ai_history"))):
+            _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg)
 
 
 @st.fragment
