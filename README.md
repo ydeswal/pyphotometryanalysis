@@ -35,6 +35,23 @@ allowed.
 
 ---
 
+## 9 November 2026 (b): cleaner pages, explanations on request, signal check checked on a 2nd cohort
+
+* **Explanations only when you ask.** Notes that used to sit on the page are now small buttons (*About this view*,
+  *How to read this graph*, *What these settings do*, *What is a hidden region?* …) that open on a click.
+* **Processing notes once.** Warnings that repeated under every recording (short-recording F0, negative 405 fit
+  slope, clock source …) are listed once, in one collapsed *Processing notes* box, with the recordings each one
+  applies to. Under each recording only its start → end local time is shown.
+* **Signal check:** the coloured grade chips stay; the explanation moved to **Method of classification · why
+  signals look the way they do**, written in plain language. New checks: *405 follows 465* (r of the fast ups and
+  downs; ≥ 0.8 lowers the grade), *changing before the event* (the animal noticed the food before the marked
+  time), *brief, recovered* (a short dip that came back). The noise check now needs the change to be 2× (not 3×)
+  the baseline wobble, because active AgRP baselines wobble a lot.
+* **Checked on two cohorts (28 mice):** the app's ranking matches hand ratings with rank correlation 0.93; every
+  "bad / no signal" mouse is *No response*; every "questionable" mouse is *Weak* or *No response*.
+* **ROI name is optional** (no more "BLA" by default). Old CSVs keep their own ROI prefix automatically.
+* Header badges removed; the AI panel is now simply **Ask AI**, in a calmer colour. "Events" has no emoji.
+
 ## 9 November 2026: events, signal checks, raw traces in groups, sliding-mean guidance
 
 ### Events (Group analysis → 📍 Events, and the sidebar event lines)
@@ -171,7 +188,7 @@ because the app and other software read it back.
 
 ## 6 November 2026: "Ask the data" AI chat
 
-Under the **Display** buttons, **✨ Ask the data with AI** answers questions
+Under the **Display** buttons, **Ask AI** answers questions
 about one or more graphs, the raw recordings and the FED3 data, for free.
 Set up the keys once (see `DEPLOY.md`).
 

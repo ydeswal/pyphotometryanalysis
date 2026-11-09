@@ -45,8 +45,10 @@ Grades (on the change in the expected direction)
   Weak         2 - 5 %
   No response  < 2 %, or the wrong direction
 
-Two checks can lower a grade by one step:
-  * the change is less than 3x the baseline noise (it does not stand out);
+Three checks can lower a grade by one step:
+  * the change is less than 2x the baseline noise (it does not stand out);
+  * 405 follows 465's fast ups and downs (r >= 0.8, 1-s means, 15-s trend
+    removed, whole recording);
   * the 405 channel moves in the SAME direction as 465 by at least half as
     much (and >= 2 %): the change may be movement / light-path, not calcium.
 A 405 change of >= 5 % in either direction is always flagged for a look.
@@ -64,7 +66,9 @@ DIRECTIONS = ["Decrease (e.g. AgRP neurons when food appears)", "Increase", "Eit
 BASELINE = (-30.0, -5.0)
 RESPONSE = (30.0, 120.0)
 DEEP_WIN = 10.0
-NOISE_RATIO = 3.0
+NOISE_RATIO = 2.0
+TRACK_FLAG = 0.6
+TRACK_DOWN = 0.8
 ISO_SAME_FRACTION = 0.5
 ISO_FLAG_PCT = 5.0
 
@@ -81,45 +85,71 @@ TIER_COLOR = {t[0]: t[2] for t in TIERS}
 TIER_COLOR["Not testable"] = "#64748b"
 
 CRITERIA_MD = """
-**What is measured** (event at time 0, for every recording separately)
+#### What the app measures
 
-| Number | How it is computed | Why |
+For every recording, the moment you marked (for example food going into the cage) is time 0.
+
+1. **Before:** the average signal from **{b0:g} to {b1:g} s** (just before the event, leaving out the last few
+   seconds when the cage is being opened).
+2. **After:** the average signal from **{r0:+g} to {r1:+g} s**. It starts {r0:g} s after the event because a
+   mouse needs a few seconds to notice the food, and it lasts long enough to show whether the change holds.
+3. **Change** = how much *After* differs from *Before*, in %. The grade is based on this number.
+
+The signal used is **{signal}**. Dividing 465 by 405 matters: when the light slowly fades (bleaching) or the
+fibre shifts, both channels go down together and the ratio stays flat. When calcium changes, only 465 moves, so
+the ratio follows it. This stops slow fading from looking like a response.
+
+#### The grades
+
+| Grade | Change | What it means |
 |---|---|---|
-| **Change (%)** | mean signal from **{r0:+g} to {r1:+g} s** vs the mean from **{b0:+g} to {b1:+g} s**, as % change | the sustained response; the {r0:g} s gap gives the mouse time to notice the food |
-| Deepest 10 s (%) | most extreme 10-s mean between 0 and {r1:+g} s | the full size of the response |
-| Time to half (s) | first time the signal reaches half of the change | a real neural response is a step within seconds; bleaching is a slow slope |
-| 465 / 405 change (%) | the same change for each raw channel | where the change comes from |
-| Noise (%) | SD of 1-s means in the baseline | how much the signal moves anyway |
-| Change ÷ noise | | does the change stand out? |
+| Excellent | 25 % or more | a large drop nobody would miss |
+| Very good | 15 to 25 % | a clear drop |
+| Good | 10 to 15 % | a clear drop that passes the usual cut-off (see below) |
+| OK | 5 to 10 % | a small drop; usable, but expect noisy group data |
+| Weak | 2 to 5 % | barely there |
+| No response | under 2 %, or the wrong way | likely off target, poor expression, or the virus did not take |
 
-**Signal:** {signal}. The 465 ÷ 405 ratio cancels bleaching and light-path changes, which scale both channels, and
-keeps calcium changes, which move 465 only.
+**Why 10 % is the line between Good and OK.** AgRP neurons are very active after a fast and fall within seconds of
+seeing or smelling food, before the mouse eats (Chen et al. 2015, *Cell*; Betley et al. 2015, *Nature*).
+Deem et al. 2020 (*eLife*) treated fasted mice whose signal fell by less than 10 % when chow was given as surgical
+misses. The app keeps that line and splits the rest into steps so mice can be ranked.
 
-**Grades** (change in the expected direction)
+**A grade goes down one step when:**
+* the change is less than **2 times** the normal second-to-second wobble before the event, so it does not stand out;
+* the **405 channel falls (or rises) together with 465** by at least half as much: that is what movement or a
+  shifting fibre looks like, not calcium;
+* **405 follows every small up and down of 465** (correlation 0.8 or more): the fluctuations are probably light-path,
+  not neurons.
 
-| Grade | Change | Meaning |
-|---|---|---|
-| 🟢 Excellent | ≥ 25 % | large, unmistakable response |
-| 🟢 Very good | 15–25 % | clear response |
-| 🟢 Good | 10–15 % | clear; passes the 10 % cut-off used by Deem et al. 2020 (*eLife*) to accept AgRP mice |
-| 🟡 OK | 5–10 % | small; below the published cut-off, use with care |
-| 🟠 Weak | 2–5 % | barely there |
-| 🔴 No response | < 2 % or wrong direction | likely miss, poor expression, or the fibre is off target |
+#### Why a recording looks the way it does
 
-**A grade drops one step when**
-* the change is less than **3 ×** the baseline noise (it does not stand out from the ongoing fluctuation), or
-* the **405 channel moves the same way** as 465 by at least half as much (≥ 2 %): that pattern fits movement or a
-  light-path change, not calcium.
+* **465 drops, 405 stays flat or rises a little:** a real calcium drop. 405 nm is a few nm below the wavelength
+  where GCaMP ignores calcium, so when calcium falls 405 rises slightly. Your best mice show this.
+* **Both channels drift down slowly together:** bleaching. The ratio removes it, so the grade is low even though
+  raw 465 went down.
+* **405 copies 465's wiggles:** movement or fibre artefact (flagged).
+* **Big, fast wiggles in 465 before the food, with a flat 405:** very active AgRP neurons in a hungry mouse. These
+  "dynamic" recordings usually have the largest drops.
+* **Already half-way down at the marked time:** the mouse noticed the food earlier (sniffing). Move the event earlier
+  for that mouse (event time table) to measure the whole drop.
+* **A short dip that comes back up:** the grade uses the average over {r0:+g} to {r1:+g} s, so a brief response gets
+  a lower grade; the *deepest 10 s* column shows how far it went.
 
-A 405 change of 5 % or more in either direction is always flagged. A real calcium fall makes 405 *rise* slightly
-(405 nm is a few nm below GCaMP's isosbestic point), so "465 down, 405 slightly up" is what a genuine AgRP
-response looks like.
+#### Other columns
 
-**Background.** AgRP neurons are highly active after a fast and fall within seconds of food being seen or smelled,
-before eating starts (Chen et al. 2015 *Cell*; Betley et al. 2015 *Nature*; Mandelblat-Cerf et al. 2015 *eLife*).
-Deem et al. 2020 (*eLife*) excluded overnight-fasted mice whose F/F fell by less than 10 % on chow presentation as
-surgical misses. The grades above extend that single cut-off into steps so mice can be ranked. They are a quality
-screen, not a statistical test: each mouse has one event.
+| Column | Meaning |
+|---|---|
+| Deepest 10 s | the lowest 10-second average after the event |
+| Time to half | seconds until the signal is half-way to its new level (real responses: seconds; bleaching: never) |
+| 465 % and 405 % | the change of each raw channel on its own |
+| Noise % | how much the signal wobbles second to second before the event |
+| 405 follows 465 (r) | how closely 405 copies 465's fast ups and downs (0 = not at all, 1 = exactly) |
+
+**Checked against hand ratings.** On 28 AgRP mice from two cohorts (23 Oct and 8 Nov 2026) the app's order matched
+the order from rating the raw traces by eye (rank correlation 0.93). Every mouse rated "bad" or "no signal" was
+graded No response, and the mice rated "questionable" were graded Weak or No response. The grade is a quality
+screen from one event per mouse, not a statistical test.
 """
 
 
@@ -283,14 +313,54 @@ def assess(t, sig, iso, event, signal=SIGNALS[0], dff=None, baseline=BASELINE, r
             iso_note = f"405 is nearly flat ({_f(c405)} %)."
     if iso_note:
         out["notes"].append(iso_note)
+    r_fast = tracking(t, sig, iso) if iso is not None else float("nan")
+    if math.isfinite(r_fast) and r_fast >= TRACK_FLAG:
+        out["flags"].append("405 follows 465")
+        msg = (f"405 copies 465's fast ups and downs (r = {r_fast:.2f}): part of the 465 fluctuation is probably "
+               "movement or the light path, not neurons.")
+        if r_fast >= TRACK_DOWN and tier not in ("No response", "Not testable"):
+            tier = _down(tier)
+            msg += " The grade drops one step."
+        out["notes"].append(msg)
     if score < 0 and abs(ch) >= 2:
         out["notes"].append(f"The signal moves the opposite way to the one expected ({_f(ch)} %).")
+    if score >= 5 and math.isfinite(t_half) and t_half <= 0.5:
+        out["flags"].append("changing before the event")
+        out["notes"].append("The signal was already half-way down at the marked time: the animal probably noticed "
+                            "the food earlier (e.g. sniffing). Move this recording's event time earlier to measure "
+                            "the whole change.")
+    if math.isfinite(deep) and abs(deep) >= 10 and abs(ch) < 0.5 * abs(deep):
+        out["flags"].append("brief, recovered")
+        out["notes"].append(f"A brief change that came back: deepest 10 s {_f(deep)} % at {deep_at:.0f} s, but the "
+                            f"average over {response[0]:+g} to {response[1]:+g} s is only {_f(ch)} %.")
     if math.isfinite(t_half) and t_half > 0.6 * response[1]:
         out["notes"].append(f"Slow change (half reached only at {t_half:.0f} s): a step-like neural response "
                             "is usually faster; check for slow drift.")
     out.update(score=score, change=ch, deepest=deep, deepest_at=deep_at, t_half=t_half, noise=noise, snr=snr,
-               change_465=c465, change_405=c405, tier=tier, tier_before_checks=raw_tier)
+               change_465=c465, change_405=c405, tier=tier, tier_before_checks=raw_tier, r_fast=r_fast)
     return out
+
+
+def tracking(t, sig, iso, trend_s=15, edge_s=10):
+    """How closely 405 copies 465's fast ups and downs: Pearson r of 1-s means after removing a
+    `trend_s` running mean, over the whole recording (first and last `edge_s` s left out)."""
+    t = np.asarray(t, float)
+    k = np.isfinite(t) & np.isfinite(sig) & np.isfinite(iso)
+    if k.sum() < 50:
+        return float("nan")
+    tb = np.floor(t[k] - t[k][0]).astype(int)
+    c = np.bincount(tb)
+    ok = c > 0
+    a = (np.bincount(tb, np.asarray(sig, float)[k]) / np.maximum(c, 1))[ok]
+    b = (np.bincount(tb, np.asarray(iso, float)[k]) / np.maximum(c, 1))[ok]
+    if a.size < 2 * edge_s + trend_s + 5:
+        return float("nan")
+    w = np.ones(trend_s) / trend_s
+    ha = (a - np.convolve(a, w, mode="same"))[edge_s:-edge_s]
+    hb = (b - np.convolve(b, w, mode="same"))[edge_s:-edge_s]
+    if np.std(ha) == 0 or np.std(hb) == 0:
+        return float("nan")
+    return float(np.corrcoef(ha, hb)[0, 1])
 
 
 def summary_sentence(a):
@@ -311,7 +381,7 @@ def table(assessments):
             "recording": name, "animal": animal, "grade": a["tier"],
             "change %": a.get("change"), "deepest 10 s %": a.get("deepest"),
             "time to half (s)": a.get("t_half"), "465 %": a.get("change_465"), "405 %": a.get("change_405"),
-            "noise %": a.get("noise"), "change ÷ noise": a.get("snr"),
+            "noise %": a.get("noise"), "change ÷ noise": a.get("snr"), "405 follows 465 (r)": a.get("r_fast"),
             "event at (s)": a.get("event_s"), "flags": ", ".join(a.get("flags", [])),
             "notes": " ".join(a.get("notes", [])),
         })

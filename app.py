@@ -123,7 +123,6 @@ th.page_header(
     "Fiber Photometry Analysis",
     "pyPhotometry .ppd / .csv  \u00b7  motion correction, dF/F, z-score, feeding and licking on one clock",
     mark="FP",
-    tags=("Photometry", "FED3", "Lickometer", "AI chat"),
 )
 
 # =============================================================================
@@ -448,6 +447,22 @@ def filtered_signal_column(df, roi):
         if c in df.columns:
             return c
     return None
+
+
+ROI_FALLBACK = "ROI"
+
+
+def detect_roi(df, wanted):
+    """The ROI prefix a processed table really uses ('BLA_dFF' -> 'BLA'); `wanted` if present."""
+    cols = list(getattr(df, "columns", []))
+    if any(str(c).startswith(f"{wanted}_") for c in cols):
+        return wanted
+    for suffix in ("_sig_raw", "_dFF", "_z_dFF", "_uv_raw"):
+        hit = next((str(c)[: -len(suffix)] for c in cols if str(c).endswith(suffix)
+                    and not str(c).endswith("_z" + suffix)), None)
+        if hit:
+            return hit
+    return wanted
 
 
 def processed_columns_exist(df, roi):
@@ -1787,29 +1802,64 @@ def render_diagnostics(settings):
                 end_sec = min(end_sec, float(settings["crop_end_sec_original_timeline"]))
             st_ts = start0 + pd.Timedelta(seconds=offset)
             end_ts = start0 + pd.Timedelta(seconds=end_sec)
-            src = ("PC clock (per-sample timestamps, " +
-                   ("sample-clock time axis" if settings.get("time_axis", "sample") == "sample"
-                    else "PC-timestamp time axis") + ")"
-                   if settings.get("pc_timestamps") else "header start time + sample clock")
-            gaps = (settings.get("clock_check") or {}).get("gaps") or []
             st.caption(
-                f"🕒 **{st_ts:%a %Y-%m-%d} {gt.fmt12(st_ts, 0, date=False)}** → "
+                f"**{st_ts:%a %Y-%m-%d} {gt.fmt12(st_ts, 0, date=False)}** → "
                 f"**{end_ts:%a %Y-%m-%d} {gt.fmt12(end_ts, 0, date=False)}** "
-                f"local time{' (cropped window)' if offset else ''} · {src}"
-                + (f" · {len(gaps)} gap(s) with lost samples" if gaps else " · no lost samples"
-                   if settings.get("pc_timestamps") else "")
-                + ". Hover any trace for its clock time; the CSV has a "
-                "`clock_time` column" + (" and `clock_unix`" if settings.get("start_clock_unix")
-                                         else "") + ".")
+                f"local time{' (cropped window)' if offset else ''}")
         except Exception:
             pass
-    for w in settings.get("warnings", []) or []:
-        th.note(w, kind="warn")
-    notes = settings.get("notes", []) or []
-    if notes:
-        with st.expander("Processing notes"):
-            for n_ in notes:
-                st.write("- " + n_)
+
+
+def _note_items(settings):
+    """Warnings and processing notes of one recording, plus clock facts that used to sit under the times."""
+    s = settings or {}
+    items = [("warning", w) for w in (s.get("warnings") or [])]
+    if s.get("start_clock_local"):
+        src = ("PC clock (per-sample timestamps, " +
+               ("sample-clock time axis" if s.get("time_axis", "sample") == "sample" else "PC-timestamp time axis")
+               + ")" if s.get("pc_timestamps") else "header start time + sample clock")
+        gaps = (s.get("clock_check") or {}).get("gaps") or []
+        items.append(("warning" if gaps else "note",
+                      f"Clock source: {src}. " + (f"{len(gaps)} gap(s) with lost samples." if gaps else
+                                                  "No lost samples." if s.get("pc_timestamps") else "")
+                      + " Hover any trace for its clock time; the CSV has a `clock_time` column."))
+    items += [("note", n_) for n_ in (s.get("notes") or [])]
+    return items
+
+
+def render_shared_notes(results):
+    """Every warning and processing note once, grouped across recordings, behind one click."""
+    import re as _re
+    groups = {}
+    num = r"[-+−]?\d[\d.,:]*"
+    for r in results:
+        for kind, text in _note_items(r.get("settings")):
+            key = (kind, _re.sub(num, "#", str(text)))
+            g = groups.setdefault(key, {"texts": [], "recs": []})
+            g["texts"].append(str(text))
+            g["recs"].append(str(r["name"]))
+    if not groups:
+        return
+
+    def merged(texts):
+        """One text; numbers that differ between recordings become '…' (each recording's own values are in its
+        header and its Settings tab)."""
+        parts = [_re.split(f"({num})", t) for t in texts]
+        out = []
+        for i, piece in enumerate(parts[0]):
+            if i % 2 == 1 and any(len(p_) <= i or p_[i] != piece for p_ in parts[1:]):
+                out.append("…")
+            else:
+                out.append(piece)
+        return "".join(out)
+    n_warn = sum(1 for (k, _) in groups if k == "warning")
+    label = f"Processing notes ({n_warn} warning{'s' if n_warn != 1 else ''})" if n_warn else "Processing notes"
+    with st.expander(label, expanded=False):
+        n = len(results)
+        for (kind, _), g in sorted(groups.items(), key=lambda kv: kv[0][0] != "warning"):
+            who = (f"all {n} recordings" if len(g["recs"]) == n and n > 1 else ", ".join(g["recs"]))
+            th.note(merged(g["texts"]) + f"<br><span style='opacity:.75'>Applies to: {who}</span>",
+                    kind="warn" if kind == "warning" else "")
 
 
 METHODS_DOC = Path(__file__).with_name("METHODS_EXPLAINED.md")
@@ -1889,7 +1939,10 @@ with st.sidebar:
                 st.rerun()
         uploaded_files = [Path(v) for v in _staged.values()]
 
-        roi_name = st.text_input("ROI name", value="BLA")
+        roi_typed = st.text_input("ROI name (optional)", value="", placeholder="e.g. ARC or BLA",
+                                  help="Only a label for the brain region, used in column and file names. "
+                                       "Leave empty if you do not need one.").strip()
+        roi_name = roi_typed or ROI_FALLBACK
         scale_mode = st.selectbox("Auto y-axis scaling", ["full", "robust", "none"], index=0)
         save_full = st.checkbox("Save full 20 Hz processed CSV for PPD runs", value=False)
 
@@ -2158,7 +2211,15 @@ with st.sidebar:
             lick_norm = "baseline_z"
 
     with st.expander("Hide/remove time periods visually", expanded=False):
-        st.caption("These controls only affect graph display. They do not alter downloaded processed CSVs.")
+        th.explain("What is a hidden region?",
+                   "A **hidden region** is a stretch of time you choose not to look at, for example while the "
+                   "patch cable was being changed, the animal was picked up, or the signal was clipped.\n\n"
+                   "* **Blank signal but keep true time axis**: the traces have a gap there, and the time axis "
+                   "stays as recorded.\n"
+                   "* **Remove rows from visual display**: those samples are left out of the graphs.\n\n"
+                   "Either way it changes **only what the graphs show**. The motion correction, dF/F, z-scores "
+                   "and the downloaded CSV still use every sample. To really cut the recording, use **Crop** "
+                   "instead.", use_container_width=True)
         if st.button("Clear hidden time periods", use_container_width=True):
             st.session_state["num_exclusions"] = 0
         exclusion_mode = st.radio(
@@ -2420,10 +2481,11 @@ if run_clicked:
                 for csv_path in csv_files:
                     try:
                         df_in = pd.read_csv(csv_path)
-                        if processed_columns_exist(df_in, roi_name):
-                            df_out, settings = load_processed_csv_dataframe(df_in, roi_name)
+                        _roi = roi_name if roi_typed else detect_roi(df_in, roi_name)
+                        if processed_columns_exist(df_in, _roi):
+                            df_out, settings = load_processed_csv_dataframe(df_in, _roi)
                         else:
-                            df_out, settings = process_raw_csv_dataframe(df_in, roi_name, settings=PROC_SETTINGS)
+                            df_out, settings = process_raw_csv_dataframe(df_in, _roi, settings=PROC_SETTINGS)
                         all_results.append({"name": csv_path.stem, "df": df_out, "settings": settings})
                     except Exception as e:
                         st.error(f"CSV analysis failed for {csv_path.name}")
@@ -2435,6 +2497,9 @@ if run_clicked:
 # =============================================================================
 
 results = st.session_state.get("results", [])
+# Results made under another ROI label keep their own column prefix.
+if results:
+    roi_name = detect_roi(results[0]["df"], roi_name)
 
 # Apply the physical crop before any figure, metric or download is produced, so
 # the graphs, the summary numbers and the exported CSV all agree.
@@ -2658,8 +2723,11 @@ else:
     max_duration = max(float(r["df"]["time_sec"].max()) for r in results)
     c1.metric("Recordings loaded", len(results))
     c2.metric("Max duration", seconds_to_hms(max_duration))
-    c3.metric("ROI", roi_name)
-    c4.metric("Hidden regions", len(visual_exclusions))
+    c3.metric("ROI", roi_typed or "—", help="The brain-region label typed in the sidebar (optional).")
+    c4.metric("Hidden regions", len(visual_exclusions),
+              help="Hidden regions are stretches of time you choose to hide in the graphs (sidebar → Hidden "
+                   "regions), for example when the cable was being changed or the animal was handled. They are "
+                   "blanked (or cut out) only on screen; the analysis and the downloaded CSV keep every sample.")
 
     with st.expander("Current y-axis limits and visual window"):
         st.json({
@@ -2669,15 +2737,10 @@ else:
             "note": "Visual window affects only webpage display, not downloaded processed CSV files.",
         })
 
-    st.markdown(
-        """
-        <div class="note-box-light">
-        Scroll-wheel zoom is disabled on the graphs. Use <b>Graph display → Graph size</b> or <b>Maximize one graph only</b> for a larger view.
-        Visual crop, hidden regions, and event annotations change only the webpage display, not the downloaded processed CSV.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    th.explain("About the graphs",
+               "Scroll-wheel zoom is turned off so the page scrolls normally. Use **Graph display → Graph size** "
+               "or **Maximize one graph only** for a larger view.\n\nThe visual crop, hidden regions and event "
+               "lines change only what is drawn on this page, not the downloaded processed CSV.")
 
     display_mode = st.radio(
         "Display", ["One recording at a time", "Side-by-side graphs", "Feeding (FED3)", "Group analysis"],
@@ -2707,6 +2770,9 @@ else:
     if display_mode == "Group analysis":
         group_view.render(results, FED_DATA, roi_name, _prepare_view, max_points=MAX_POINTS,
                           height_mult=height_mult, config=PLOTLY_CONFIG)
+
+    if display_mode == "One recording at a time" and results:
+        render_shared_notes(results)
 
     for idx, result in enumerate(results if display_mode == "One recording at a time" else [], start=1):
         full_df = result["df"]
@@ -2846,7 +2912,7 @@ else:
             st.markdown(f"### Maximized view: {focus_graph}")
             render_chart(focus_graph)
             with st.expander("Data preview and downloads"):
-                st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
+                th.explain("About this preview", "Preview of the displayed data window. The downloadable CSV remains the full processed data.")
                 st.dataframe(_preview_12h(view_df.head(500)), use_container_width=True, height=360)
                 st.download_button(
                     label=f"Download full processed CSV for {result['name']}",
@@ -2867,7 +2933,7 @@ else:
             label_visibility="collapsed",
         )
         if view == "Data preview":
-            st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
+            th.explain("About this preview", "Preview of the displayed data window. The downloadable CSV remains the full processed data.")
             st.dataframe(_preview_12h(view_df.head(500)), use_container_width=True, height=360)
             st.download_button(
                 label=f"Download full processed CSV for {result['name']}",

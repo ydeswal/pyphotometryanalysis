@@ -440,34 +440,20 @@ div[data-testid="stDataFrame"], .stDataFrame {
    7. THE AI PANEL - the one place with a second colour
    ========================================================================= */
 .st-key-ai-panel > [data-testid="stLayoutWrapper"] > [data-testid="stExpander"] {
-  border: 1.5px solid transparent !important;
-  background: linear-gradient(#ffffff, #ffffff) padding-box,
-              linear-gradient(90deg, #2563eb, #7c3aed) border-box !important;
-  box-shadow: 0 6px 22px -12px rgba(79,70,229,0.55) !important;
+  border: 1px solid #c7d2fe !important;
+  background: #ffffff !important;
+  box-shadow: none !important;
 }
 .st-key-ai-panel > [data-testid="stLayoutWrapper"] > [data-testid="stExpander"] > details > summary {
-  background: linear-gradient(90deg, #2563eb 0%, #4f46e5 55%, #7c3aed 100%) !important;
-  padding-top: 0.75rem; padding-bottom: 0.75rem;
+  background: #f5f7ff !important;
 }
 .st-key-ai-panel > [data-testid="stLayoutWrapper"] > [data-testid="stExpander"] > details > summary:hover {
-  background: linear-gradient(90deg, #1d4ed8 0%, #4338ca 55%, #6d28d9 100%) !important;
+  background: #eef1ff !important;
 }
 .st-key-ai-panel > [data-testid="stLayoutWrapper"] > [data-testid="stExpander"] > details > summary,
 .st-key-ai-panel > [data-testid="stLayoutWrapper"] > [data-testid="stExpander"] > details > summary p,
 .st-key-ai-panel > [data-testid="stLayoutWrapper"] > [data-testid="stExpander"] > details > summary span {
-  color: #ffffff !important; font-weight: 600; font-size: 0.95rem;
-}
-.st-key-ai-panel > [data-testid="stLayoutWrapper"] > [data-testid="stExpander"] > details > summary p::after {
-  content: "Free · answers from your data, every number checked";
-  margin-left: 0.75rem; padding: 0.12rem 0.55rem; border-radius: 999px;
-  background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.30);
-  font-size: 0.72rem; font-weight: 500; letter-spacing: 0.01em; white-space: nowrap;
-}
-@media (max-width: 640px) {
-  .st-key-ai-panel > [data-testid="stLayoutWrapper"] > [data-testid="stExpander"] > details > summary p::after { display: none; }
-}
-.st-key-ai-panel > [data-testid="stLayoutWrapper"] > [data-testid="stExpander"] > details > [data-testid="stExpanderDetails"] {
-  background: linear-gradient(180deg, #f7f8ff 0%, #ffffff 120px) !important;
+  color: #3730a3 !important; font-weight: 600;
 }
 .st-key-ai-panel [data-testid="stChatInput"] > div {
   border-color: #c7d2fe !important;
@@ -524,6 +510,13 @@ def sidebar_label(text):
 
 def note(text, kind=""):
     st.markdown(f'<div class="pp-note {kind}">{text}</div>', unsafe_allow_html=True)
+
+
+def explain(label, text, container=None, use_container_width=False):
+    """A small button that opens an explanation only when someone asks for it."""
+    where = container if container is not None else st
+    with where.popover(label, use_container_width=use_container_width):
+        st.markdown(text, unsafe_allow_html=True)
 
 
 def style_figure(fig, height=None, showlegend=True):

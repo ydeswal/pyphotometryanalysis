@@ -72,6 +72,21 @@ check("table best first", list(tab["recording"]) == ["m0", "m1", "m2", "m3", "m4
 G = sc.group_summary(A)
 check("group summary: 5 recordings, mean negative", G["n"] == 5 and G["mean"] < -5)
 
+s, u = mouse(0.3)
+wig = 0.05 * np.convolve(rng.standard_normal(t.size), np.ones(40) / 40 * 6, mode="same")
+a = sc.assess(t, s * (1 + wig), u * (1 + wig), 60.0)
+check("405 copying 465's fluctuations: flagged and graded down", "405 follows 465" in a["flags"]
+      and a["r_fast"] > 0.8 and a["tier"] == "Very good", f"r {a['r_fast']:.2f} {a['tier']}")
+a = sc.assess(t, s, u, 60.0)
+check("independent channels: r low, no flag", a["r_fast"] < 0.4 and "405 follows 465" not in a["flags"],
+      f"{a['r_fast']:.2f}")
+s, u = mouse(0.3, onset=45.0)
+a = sc.assess(t, s, u, 60.0)
+check("drop before the marked time is flagged", "changing before the event" in a["flags"], str(a["flags"]))
+brief = 1 - 0.3 * ((t > 62) & (t < 80))
+a = sc.assess(t, 1.5 * brief * (1 + 0.004 * rng.standard_normal(t.size)), 0.75 + 0 * t, 60.0)
+check("brief drop that recovers is flagged", "brief, recovered" in a["flags"], f"{a['deepest']:.1f} {a['change']:.1f}")
+
 print("\n=== sliding-mean recommendation ===")
 check("short recording: off", sc.recommend_smoothing(7 * 60)[0] is False)
 check("1 h: on, 1 min", sc.recommend_smoothing(3600)[:2] == (True, 60.0))

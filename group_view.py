@@ -40,6 +40,7 @@ import fed_view
 import graph_tools as gt
 import group_analysis as ga
 import interpret
+import theme as th
 import signal_check as sc
 
 PALETTE = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#332288", "#882255"]
@@ -581,12 +582,15 @@ def _events_editor(names, clock_starts):
     if "grp_events_base" not in ss:
         ss["grp_events_base"] = pd.DataFrame([], columns=cols)
         ss["grp_events_ver"] = 0
-    with st.expander("📍 Events (food in, injection, stimulus …)", expanded=not len(ss["grp_events_base"])):
-        st.caption("Mark moments in the recordings. Time as **recording time** (`60`, `1:00` or `0:01:00` = one "
-                   "minute after that recording started) or **clock time** (`8:25:30 PM`). One row can apply to "
-                   "every recording or to one. Events show as dashed red lines in every group graph, can be used "
-                   "to line recordings up, are graded in *Event response & signal check*, and the AI can answer "
-                   "questions about them.")
+    with st.expander("Events", expanded=not len(ss["grp_events_base"])):
+        th.explain("How events work",
+                   "Mark moments in the recordings, e.g. food going in or an injection.\n\n"
+                   "* **Recording time**: `60`, `1:00` or `0:01:00` all mean one minute after that recording "
+                   "started.\n* **Clock time**: the time of day, e.g. `8:25:30 PM`; each recording places it on "
+                   "its own timeline.\n* One row can apply to every recording or to one.\n\n"
+                   "Events show as dashed red lines in every group graph, can be used to line recordings up "
+                   "(*Line recordings up by → Time since an event*), are graded in *Event response & signal "
+                   "check*, and the AI can answer questions about them.")
         q = st.columns([1.3, 1.0, 1.1, 1.0])
         lab = q[0].text_input("Event", "Food in", key="grp_q_label")
         when = q[1].text_input("Time", "1:00", key="grp_q_time")
@@ -615,11 +619,11 @@ def _events_editor(names, clock_starts):
         for b in bad:
             st.markdown(f'<div class="pp-note warn">Event {b}</div>', unsafe_allow_html=True)
         if any(ev.values()):
-            st.caption("Resolved: " + "; ".join(
-                f"{r}: " + ", ".join(f"{l} at {gt.fmt_hms(s_, 1)}" + (
+            th.explain("Where each event landed", "\n".join(
+                f"* **{r}**: " + ", ".join(f"{l} at {gt.fmt_hms(s_, 1)}" + (
                     f" ({gt.fmt12(pd.Timestamp(clock_starts[r]) + pd.Timedelta(seconds=s_), 0, date=False)})"
                     if clock_starts.get(r) is not None else "") for s_, l in v)
-                for r, v in list(ev.items())[:4] if v) + (" …" if sum(1 for v in ev.values() if v) > 4 else ""))
+                for r, v in ev.items() if v))
     ss["grp_events"] = ev
     return ev
 
@@ -697,10 +701,10 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     ss = st.session_state
     animals = list(fed.animals) if fed is not None and not fed.events.empty else []
 
-    st.markdown('<div class="pp-note">Analyse several recordings together: the group mean with its spread, '
-                'every recording on the same time axis, heatmaps, responses to events you mark (with a grade for '
-                'each recording), and the meal response with each animal as one data point. ' + REFERENCES
-                + "</div>", unsafe_allow_html=True)
+    th.explain("About this view",
+               "Analyse several recordings together: the group mean with its spread, every recording on the same "
+               "time axis, heatmaps, responses to events you mark (with a grade for each recording), and the meal "
+               "response with each animal as one data point.\n\n" + REFERENCES)
 
     # ---- members --------------------------------------------------------
     rows = []
@@ -771,18 +775,17 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     ev_label = None
     if alignment.startswith("Time since an event"):
         if not ev_labels:
-            st.markdown('<div class="pp-note warn">Add an event above (📍 Events) to line recordings up on it. '
+            st.markdown('<div class="pp-note warn">Add an event above (Events) to line recordings up on it. '
                         'Showing time since recording start meanwhile.</div>', unsafe_allow_html=True)
             alignment = ga.ALIGNMENTS[2]
         else:
             ev_label = st.selectbox("Event to line up on (0 = its first occurrence in each recording)", ev_labels,
                                     key="grp_align_event")
     if starts_differ and alignment.startswith("Clock"):
-        st.markdown(
-            f'<div class="pp-note">These recordings started at different clock times '
-            f'({gt.fmt12(min(cs_known), 0, date=False)} to {gt.fmt12(max(cs_known), 0, date=False)}), so on a clock '
-            f'axis they do not overlap. Choose <b>Time since recording start</b> to put every start at 0.</div>',
-            unsafe_allow_html=True)
+        th.explain("Why don't the recordings overlap?",
+                   f"These recordings started at different clock times ({gt.fmt12(min(cs_known), 0, date=False)} "
+                   f"to {gt.fmt12(max(cs_known), 0, date=False)}), so on a clock axis they sit side by side. "
+                   "Choose **Time since recording start** to put every start at 0.")
     view = st.radio("Group view", VIEWS, horizontal=True, key="grp_view")
 
     span_guess = max(durations) if durations else 3600.0
@@ -923,13 +926,13 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     if sm_on and k <= 1:
         st.caption(f"The sliding mean ({sm_min:g} min) is not longer than one bin ({_bin_label(bin_s)}), so it "
                    "changes nothing; use a smaller bin or a longer window.")
-    st.caption("Sliding mean: " + ((f"on, {sm_min * 60:g} s. " if sm_min < 2 else f"on, {sm_min:g} min. ")
-                                   if sm_on else "off. ") + "Recommended: " + why)
-
     notes = [ga.METHOD_NOTES.get(norm, ""), ga.METHOD_NOTES.get(stat, "")]
     if view == "Combined (group mean)" and animals:
         notes.append(ga.METHOD_NOTES.get(fed_mode, ""))
-    st.caption(" ".join(n for n in notes if n))
+    th.explain("What these settings do",
+               f"**Sliding mean** ({'on' if sm_on else 'off'}). Recommended for these recordings: {why}\n\n"
+               + sc.SMOOTHING_HELP + "\n\n" + f"**{norm}.** {notes[0]}\n\n**{stat}.** {notes[1]}"
+               + (f"\n\n**{fed_mode}.** {notes[2]}" if len(notes) > 2 and notes[2] else ""))
 
     S = ga.signal_matrix(members, alignment, norm, bin_s, k, base_min, ref, per_animal)
     if S is None:
@@ -983,8 +986,9 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         _x_hover(fig, lab)
         gt.chart_block(retitle(fig), key="grp_each_fig", max_points=max_points * 2, clock_start=clock_for_ruler,
                        config=config)
-        st.caption("Dashed red lines: events. Ticks above each trace mark single pellets; shaded areas are the "
-                   "dark phase." + (" Blue: 465, green: 405." if S2 is not None else ""))
+        th.explain("How to read this graph", "Dashed red lines: events. Ticks above each trace mark single "
+                   "pellets; shaded areas are the dark phase." + (" Blue: 465, green: 405." if S2 is not None
+                                                                     else ""))
         _downloads(S, None, stat, lab, "each", S2)
 
     elif view == "Heatmap":
@@ -993,7 +997,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         fig = heatmap_figure(S, F, alignment, ref, lights_on if alignment.startswith("Time of day") else None,
                              sig_label, centred, h, row_events=rev)
         if S2 is not None:
-            st.caption("The heatmap shows the 465 channel; see Each recording for 405.")
+            th.explain("How to read this graph", "The heatmap shows the 465 channel; see *Each recording* for 405.")
         st.plotly_chart(retitle(fig), use_container_width=True, config=config, key="grp_heat")
 
     elif view == "Meal-aligned (group)":
@@ -1009,7 +1013,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         st.dataframe(summ, hide_index=True, use_container_width=True)
         st.markdown("**Each animal**")
         st.dataframe(tab.round(3), hide_index=True, use_container_width=True)
-        st.caption(f"Meals: pellets less than {gap:g} s apart, at least {minp} pellet(s). Satiety ratio: minutes "
+        th.explain("What these columns mean", f"Meals: pellets less than {gap:g} s apart, at least {minp} pellet(s). Satiety ratio: minutes "
                    "without eating after a meal per pellet in that meal. Hours logged excludes times the FED "
                    "was not recording. % pellets in dark uses the lights-off/on hours under More settings.")
         st.download_button("Download feeding pattern (CSV)", tab.to_csv(index=False).encode(),
@@ -1151,7 +1155,7 @@ def signal_check_figure(A, pre, post, layout, height_mult, smooth_s=1.0):
 def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, height_mult, clock_starts):
     ss = st.session_state
     if not ev_labels:
-        st.info("Add an event first (📍 Events above), e.g. 'Food in' at 1:00 in every recording. Each recording "
+        st.info("Add an event first (Events, above), e.g. 'Food in' at 1:00 in every recording. Each recording "
                 "is then graded by how much its signal changes after the event.")
         return
     c = st.columns([1.2, 1.7, 1.5, 1.0, 1.0])
@@ -1202,15 +1206,21 @@ def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, 
                      f'background:{sc.TIER_COLOR[n]};color:white;font-size:0.85rem">{n}: {k}</span>'
                      for n, k in G["counts"].items() if k)
     good = sum(G["counts"][n] for n in ("Excellent", "Very good", "Good"))
-    txt = (f"<b>{label}</b>: {len(A)} recordings graded. {good} of {len(A)} change by at least 10 % in the "
-           f"expected direction (the Deem et al. 2020 cut-off for a hit).")
+    txt = f"<b>{label}</b>: {len(A)} recordings graded"
     if G.get("n", 0) >= 3:
-        txt += (f" Across recordings: mean {G['mean']:+.1f} % ± {G['sem']:.1f} SEM (median {G['median']:+.1f} %); "
-                f"one-sample t-test vs 0 p = {G['t_p']:.2g}")
-        if np.isfinite(G.get("wilcoxon_p", np.nan)):
-            txt += f", Wilcoxon p = {G['wilcoxon_p']:.2g}"
-        txt += ". Each recording counts once."
+        txt += f" · mean change {G['mean']:+.1f} % ± {G['sem']:.1f} SEM"
     st.markdown(f'<div class="pp-note">{chips}<br>{txt}</div>', unsafe_allow_html=True)
+    stats_md = ""
+    if G.get("n", 0) >= 3:
+        stats_md = (f"\n\n#### This group\n\n{good} of {len(A)} recordings change by at least 10 %. Across "
+                    f"recordings the change is {G['mean']:+.1f} % ± {G['sem']:.1f} SEM (median {G['median']:+.1f} %); "
+                    f"one-sample t-test against no change p = {G['t_p']:.2g}"
+                    + (f", Wilcoxon p = {G['wilcoxon_p']:.2g}" if np.isfinite(G.get("wilcoxon_p", np.nan)) else "")
+                    + ". Each recording counts once.")
+    th.explain("Method of classification · why signals look the way they do",
+               sc.CRITERIA_MD.format(b0=base[0], b1=base[1], r0=resp[0], r1=resp[1], signal=signal) + stats_md
+               + f"\n\n**In the graph:** grey = before ({base[0]:+g} to {base[1]:+g} s), blue = after "
+                 f"({resp[0]:+g} to {resp[1]:+g} s), dotted lines at ±10 %.")
 
     lay = st.radio("Graph", ["Overlay, coloured by grade", "Grid: 465 and 405 for each", "Group mean ± SEM"],
                    horizontal=True, key="sc_layout")
@@ -1221,24 +1231,21 @@ def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, 
                            help="Only for drawing; the grades use the full-resolution data.")
     fig = signal_check_figure(A, pre, post, lay, height_mult, sm)
     gt.chart_block(fig, key="sc_fig", max_points=60_000, clock_start=None, config=config, ruler=False)
-    st.caption(f"Grey: baseline {base[0]:+g} to {base[1]:+g} s; blue: response window {resp[0]:+g} to "
-               f"{resp[1]:+g} s; dotted lines at ±10 %.")
 
     show = tab.copy()
     for col_ in ("change %", "deepest 10 s %", "465 %", "405 %", "noise %", "change ÷ noise", "time to half (s)",
-                 "event at (s)"):
-        show[col_] = pd.to_numeric(show[col_], errors="coerce").round(1)
+                 "event at (s)", "405 follows 465 (r)"):
+        show[col_] = pd.to_numeric(show[col_], errors="coerce").round(2 if "(r)" in col_ else 1)
 
     def colour(v):
         return f"background-color:{sc.TIER_COLOR.get(v, '#e2e8f0')};color:white;font-weight:600"
     try:
-        sty = show.style.map(colour, subset=["grade"]).format(precision=1, na_rep="–")
+        sty = show.style.map(colour, subset=["grade"]).format(precision=1, na_rep="–").format(
+            precision=2, subset=["405 follows 465 (r)"], na_rep="–")
     except AttributeError:
         sty = show.style.applymap(colour, subset=["grade"]).format(precision=1, na_rep="–")
     st.dataframe(sty, hide_index=True, use_container_width=True,
                  column_config={"notes": st.column_config.TextColumn(width="large")})
-    with st.expander("How the grades are decided", expanded=False):
-        st.markdown(sc.CRITERIA_MD.format(b0=base[0], b1=base[1], r0=resp[0], r1=resp[1], signal=signal))
     dl = st.columns(2)
     dl[0].download_button("Download grades (CSV)", tab.to_csv(index=False).encode(), "signal_check_grades.csv",
                           "text/csv", key="sc_dl1")
@@ -1291,7 +1298,7 @@ def _aligned_view(members, norm, base_min, alignment, gap, minp, pre, post, base
         return
     fig = aligned_group_figure(G, R, base, resp, show_each, f"{sig_label}, baseline-subtracted", int(520 * h))
     gt.chart_block(fig, key="grp_aligned", max_points=40_000, clock_start=None, config=config, ruler=False)
-    st.caption(f"Grey: baseline {base[0]:g} to {base[1]:g} s; blue: response {resp[0]:g} to {resp[1]:g} s. Each "
+    th.explain("How to read this graph", f"Grey: baseline {base[0]:g} to {base[1]:g} s; blue: response {resp[0]:g} to {resp[1]:g} s. Each "
                "animal's meals are averaged first, then animals are averaged, so every animal counts once.")
 
     for g, v in G.items():

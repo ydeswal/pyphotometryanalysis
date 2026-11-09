@@ -34,6 +34,7 @@ from plotly.subplots import make_subplots
 
 import fed3
 import graph_tools as gt
+import theme as th
 
 _PELLET = "#b45309"
 _MEAL = "rgba(180,83,9,0.13)"
@@ -419,7 +420,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         gt.chart_block(fig, key=key, max_points=max_points, clock_start=cs, config=config,
                        peaks=t is not None, event_counts=counts,
                        time_hover="clock+recording" if t is not None else "clock")
-        st.caption("Grey bands: the FED was not being logged, so intake there is unknown (not zero). "
+        th.explain("How to read this", "Grey bands: the FED was not being logged, so intake there is unknown (not zero). "
                    "Ticks above the trace and shaded bands mark pellets and meals. Hover the bars for "
                    "pellets and grams per bin; use the 📏 ruler to count pellets between any two times.")
     elif view == "One graph: signal + eating":
@@ -436,7 +437,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                              rate_win, h, extra=extra, time_mode=time_mode)
         gt.chart_block(fig, key=key, max_points=max_points, clock_start=cs, config=config,
                        peaks=True, event_counts=counts, time_hover="clock+recording")
-        st.caption("Each orange dot is a pellet taken, placed on the signal at that moment. Dotted line: "
+        th.explain("How to read this", "Each orange dot is a pellet taken, placed on the signal at that moment. Dotted line: "
                    "eating rate. Turn on ▲▼ Peaks to see whether the highest peaks and lowest troughs "
                    "sit near eating; the 📏 ruler gives the time from a pellet to a peak.")
     else:
@@ -561,7 +562,7 @@ def _aligned(t, y, sig_label, pellets_s, meals, cov_s, pel_rows, cs, animal, gra
             f"(95% range {stats['ci95'][0]:+.3g} to {stats['ci95'][1]:+.3g}). "
             f"The signal **{direction}** after eating, **{verdict}** "
             f"(permutation p = {stats['p']:.3g}, 2,000 random sets).")
-        st.caption("Random times are drawn only when the FED was logging and away from real "
+        th.explain("How to read this", "Random times are drawn only when the FED was logging and away from real "
                    "events, so the comparison is fair against slow drifts in the signal.")
         import interpret
         c_eff = c_p = None
@@ -636,5 +637,5 @@ def _all_animals(fed, sessions, grams_each, bin_min, ref, max_points, height_mul
     gt.chart_block(fig, key="fed_all", max_points=max_points, clock_start=ref, config=config,
                    time_hover="clock")
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-    st.caption("Grey: no FED logging for any animal. Meals in this table use the default "
+    th.explain("How to read this", "Grey: no FED logging for any animal. Meals in this table use the default "
                "definition; change it per animal in the other views.")

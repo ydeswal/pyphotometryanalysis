@@ -1147,7 +1147,8 @@ def tool_event_signal_check(ctx, event=None, at=None, recordings=None, signal=No
                      "change_pct": _r(a.get("change"), 3), "deepest_10s_pct": _r(a.get("deepest"), 3),
                      "time_to_half_s": _r(a.get("t_half"), 3), "change_465_pct": _r(a.get("change_465"), 3),
                      "change_405_pct": _r(a.get("change_405"), 3), "baseline_noise_pct": _r(a.get("noise"), 3),
-                     "change_over_noise": _r(a.get("snr"), 3), "flags": a.get("flags", []),
+                     "change_over_noise": _r(a.get("snr"), 3), "r_405_follows_465": _r(a.get("r_fast"), 2),
+                     "flags": a.get("flags", []),
                      "notes": a.get("notes", [])})
     if not rows:
         raise ToolError("None of the recordings has this event.")
@@ -1162,7 +1163,8 @@ def tool_event_signal_check(ctx, event=None, at=None, recordings=None, signal=No
                         "change. Grades on the change in the expected direction: Excellent >= 25 %, Very good "
                         "15-25 %, Good 10-15 % (10 % = Deem et al. 2020 eLife cut-off for AgRP hits after a fast), "
                         "OK 5-10 %, Weak 2-5 %, No response < 2 % or wrong direction. One step lower if the change "
-                        "is < 3x baseline noise, or if 405 moves the SAME way by >= half as much (>= 2 %). A small "
+                        "is < 2x baseline noise, if 405 moves the SAME way by >= half as much (>= 2 %), or if 405 copies 465's fast "
+                        "ups and downs (r >= 0.8). A small "
                         "405 RISE with a 465 fall is expected for real calcium (405 nm is below GCaMP's isosbestic "
                         "point). Grades are a quality screen of one event per recording, not a statistical test."),
            "grades_are_fixed": "Report these grades as given; do not regrade recordings."}
@@ -1809,7 +1811,7 @@ def render_panel(results, fed, roi, ppd_paths=None, view=None, fed_map=None, ses
                  pellet_mg=None, groups=None, events=None):
     """The chat panel. Call once per page run; it reruns on its own (fragment)."""
     with st.container(key="ai-panel"):          # styled in theme.py (.st-key-ai-panel)
-        with st.expander("✨ Ask the data with AI", expanded=bool(st.session_state.get("ai_history"))):
+        with st.expander("Ask AI", expanded=bool(st.session_state.get("ai_history"))):
             _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups, events)
 
 
