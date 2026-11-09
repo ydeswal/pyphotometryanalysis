@@ -363,6 +363,165 @@ def tracking(t, sig, iso, trend_s=15, edge_s=10):
     return float(np.corrcoef(ha, hb)[0, 1])
 
 
+# =============================================================================
+# PLEXON RECORDINGS: response during bouts, as rise / noise of the motion-corrected dF/F
+# =============================================================================
+#
+# Plexon camera systems record raw fluorescence on top of a large camera background (a channel with no
+# indicator, e.g. 560 nm, sits at ~15 counts while 465 sits at ~17-19). Any % change of the raw channels is
+# therefore diluted several-fold and cannot be compared with pyPhotometry percentages. Labs using these
+# systems judge a recording on the z-scored, motion-corrected dF/F during behaviour bouts (eating), as in
+# Tanya's GRAB cohort-4 signal check. The grade here is scale-free: the rise during each bout divided by the
+# recording's own fast noise.
+
+PLX_SIGNAL = "z-scored dF/F, rise ÷ noise (Plexon)"
+PLX_BASELINE = (-20.0, -2.0)
+PLX_POINT_WINDOW = 30.0      # response window for events without an end time
+PLX_MIN_BOUT = 5.0           # bouts shorter than this are scored over their first 5 s
+PLX_TIERS = [("Excellent", 20.0), ("Very good", 15.0), ("Good", 10.0), ("OK", 5.0), ("Weak", 3.0),
+             ("No response", -math.inf)]
+
+PLEXON_CRITERIA_MD = """
+#### How Plexon recordings are graded
+
+Plexon cameras record each channel on top of a large camera background (the unused 560 nm channel sits at about
+15 while 465 sits at about 17-19). A % change of the raw channels is therefore shrunk several-fold and is not
+comparable with pyPhotometry. Plexon recordings are instead judged the way your lab's signal-check slides do:
+on the **motion-corrected dF/F (shown as a z-score)** during each behaviour bout.
+
+1. **Bouts:** each event with a start and an end (e.g. every *eating* bout from the event file). An event with
+   no end time is scored over the {pw:g} s after it; bouts shorter than {mb:g} s are scored over their first {mb:g} s.
+2. **Before:** the mean dF/F from **{b0:g} to {b1:g} s** before each bout starts.
+3. **Rise:** the highest 2-second average during the bout minus *Before*.
+4. **Noise:** how much the dF/F jitters from moment to moment (SD around its own 2-second average), over the
+   whole recording.
+5. **Score = rise ÷ noise**, averaged over the bouts. Being a ratio, it does not depend on the camera background.
+
+| Grade | Rise ÷ noise | What it looks like |
+|---|---|---|
+| Excellent | 20 or more | a smooth trace with a large, obvious rise at every bout |
+| Very good | 15 to 20 | clear rises well above the jitter |
+| Good | 10 to 15 | clear rises |
+| OK | 5 to 10 | visible but small, or only some bouts |
+| Weak | 3 to 5 | barely above the jitter |
+| No response | under 3 | the bouts cannot be told apart from noise |
+
+**Checked against your GRAB cohort-4 slides (13 recordings with event files):** every recording marked *good*
+scored 12 to 26, the *ok / weak / recheck* ones 5 to 7, and every *no / sack* one under 3.
+
+**Flags:** *410 moves too* when the control channel rises during the bouts by at least half as much (movement
+or chewing); *before the bout* when the signal was already half-way up at the bout start (the event time may be
+late). The *405 follows 465 (r)* column is shown for information only; it does not change a Plexon grade
+(8786B, rated good, has r = 0.96).
+"""
+
+
+def _tier_from(score, tiers):
+    if score is None or not math.isfinite(score):
+        return "Not testable"
+    for name, lo in tiers:
+        if score >= lo:
+            return name
+    return tiers[-1][0]
+
+
+def _bout_rise(tt, y, ys, a, b, base, sign):
+    kb = (tt >= a + base[0]) & (tt < a + base[1])
+    kd = (tt >= a) & (tt < max(b, a + PLX_MIN_BOUT))
+    if kb.sum() < 5 or kd.sum() < 5:
+        return None
+    pre = float(np.nanmean(y[kb]))
+    seg = ys[kd]
+    i = int(np.nanargmax(sign * seg))
+    return pre, float(seg[i] - pre), float(tt[kd][i] - a)
+
+
+def assess_bouts(t, dff, bouts, iso=None, sig=None, baseline=PLX_BASELINE, direction=DIRECTIONS[2],
+                 label="event"):
+    """
+    Plexon-style grade of one recording. bouts: [(start, end or None), ...] in seconds since the start.
+    dff in %. Returns a dict shaped like assess() so tables, graphs and the AI use it the same way.
+    """
+    t = np.asarray(t, float)
+    y = np.asarray(dff, float)
+    out = {"method": "plexon", "signal": PLX_SIGNAL, "baseline": tuple(baseline),
+           "response": (0.0, PLX_POINT_WINDOW), "notes": [], "flags": []}
+    wins = []
+    for a, b in bouts:
+        a = float(a)
+        b = float(b) if b is not None and np.isfinite(b) and b > a else a + PLX_POINT_WINDOW
+        wins.append((a, b))
+    wins = [w for w in wins if w[0] + baseline[0] >= t[0] and w[0] < t[-1]]
+    out["event_s"] = wins[0][0] if wins else (float(bouts[0][0]) if bouts else float("nan"))
+    if not wins:
+        out.update(tier="Not testable", score=float("nan"), change=float("nan"))
+        out["notes"].append("Not testable: no bout has its baseline inside the recording.")
+        return out
+    ys = _roll(t, y, 2.0)
+    late = t > t[0] + 20
+    noise = float(np.nanstd((y - ys)[late]))
+    if direction.startswith("Decrease"):
+        sign = -1.0
+    elif direction.startswith("Increase"):
+        sign = 1.0
+    else:
+        up = [_bout_rise(t, y, ys, a, b, baseline, 1.0) for a, b in wins]
+        dn = [_bout_rise(t, y, ys, a, b, baseline, -1.0) for a, b in wins]
+        su = np.nanmean([r[1] for r in up if r]) if any(up) else 0.0
+        sd_ = -np.nanmean([r[1] for r in dn if r]) if any(dn) else 0.0
+        sign = 1.0 if su >= sd_ else -1.0
+    rises, lat = [], []
+    for a, b in wins:
+        r = _bout_rise(t, y, ys, a, b, baseline, sign)
+        if r:
+            rises.append(r[1])
+            lat.append(r[2])
+    if not rises:
+        out.update(tier="Not testable", score=float("nan"), change=float("nan"))
+        out["notes"].append("Not testable: the bouts are too short or too close to the start.")
+        return out
+    rises = np.array(rises)
+    score = float(np.mean(sign * rises) / noise) if noise > 0 else float("nan")
+    per = sign * rises / noise if noise > 0 else rises * np.nan
+    n_up = int((per >= 3).sum())
+    tier = _tier_from(score, PLX_TIERS)
+    raw = tier
+    # control channel, same measure
+    c405 = float("nan")
+    if iso is not None:
+        u = np.asarray(iso, float)
+        us = _roll(t, u, 2.0)
+        un = float(np.nanstd((u - us)[late]))
+        cr = [_bout_rise(t, u, us, a, b, baseline, sign) for a, b in wins]
+        cr = [x[1] for x in cr if x]
+        if cr and un > 0:
+            c405 = float(np.mean(sign * np.array(cr)) / un)
+            if c405 >= 3 and c405 >= 0.5 * score:
+                out["flags"].append("410 moves too")
+                out["notes"].append(f"The control channel also rises during the bouts ({c405:.1f}× its noise vs "
+                                    f"{score:.1f}× for the signal): movement or chewing may be part of it.")
+                if tier not in ("No response", "Not testable"):
+                    tier = _down(tier)
+    # already rising at the bout start?
+    a0, b0 = wins[0]
+    kb = (t >= a0 + baseline[0]) & (t < a0 + baseline[1])
+    k0 = (t >= a0 - 1) & (t < a0 + 1)
+    if kb.sum() and k0.sum() and rises[0] * sign > 0:
+        if sign * (np.nanmean(y[k0]) - np.nanmean(y[kb])) >= 0.5 * sign * rises[0] and per[0] >= 5:
+            out["flags"].append("before the bout")
+            out["notes"].append("The signal was already half-way up when the first bout started: the event time "
+                                "may be late. Check it.")
+    r_fast = tracking(t, sig, iso) if sig is not None and iso is not None else float("nan")
+    out["notes"].insert(0, f"{len(rises)} bout(s) of '{label}'; {n_up} rose at least 3× the noise. Mean rise "
+                           f"{_f(np.mean(rises), 2)} % dF/F; noise {noise:.3f} %.")
+    out.update(score=score, snr=score, change=float(np.mean(rises)), deepest=float(rises[np.argmax(sign * rises)]),
+               deepest_at=float(lat[int(np.argmax(sign * rises))]), t_half=float("nan"), noise=noise,
+               change_465=float("nan"), change_405=float("nan"), control_snr=c405, tier=tier,
+               tier_before_checks=raw, r_fast=r_fast,
+               bouts=len(rises), bouts_up=n_up)
+    return out
+
+
 def summary_sentence(a):
     if a.get("tier") == "Not testable":
         return a["notes"][0] if a.get("notes") else "Not testable."
@@ -382,6 +541,7 @@ def table(assessments):
             "change %": a.get("change"), "deepest 10 s %": a.get("deepest"),
             "time to half (s)": a.get("t_half"), "465 %": a.get("change_465"), "405 %": a.get("change_405"),
             "noise %": a.get("noise"), "change ÷ noise": a.get("snr"), "405 follows 465 (r)": a.get("r_fast"),
+            "method": "Plexon: rise ÷ noise in bouts" if a.get("method") == "plexon" else "% change",
             "event at (s)": a.get("event_s"), "flags": ", ".join(a.get("flags", [])),
             "notes": " ".join(a.get("notes", [])),
         })

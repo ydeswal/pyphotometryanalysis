@@ -1052,9 +1052,16 @@ def _pair(text, default):
         return default
 
 
+def is_plexon(r):
+    return (r.get("settings") or {}).get("input_type") == "plexon_csv"
+
+
 def run_signal_check(recs, roi, event_times, signal=sc.SIGNALS[0], baseline=sc.BASELINE, response=sc.RESPONSE,
-                     direction=sc.DIRECTIONS[0], prepare_df=None):
-    """recs: [(name, animal, result)], event_times: {name: seconds}. -> list of (name, animal, assessment)."""
+                     direction=sc.DIRECTIONS[0], prepare_df=None, bouts=None, plx_baseline=sc.PLX_BASELINE,
+                     label="event"):
+    """recs: [(name, animal, result)], event_times: {name: seconds}. -> list of (name, animal, assessment).
+    Plexon recordings are graded by sc.assess_bouts on `bouts` {name: [(start, end), ...]} (an event
+    without an end is one bout of sc.PLX_POINT_WINDOW s)."""
     out = []
     for name, animal, r in recs:
         if name not in event_times or event_times[name] is None:
@@ -1062,6 +1069,15 @@ def run_signal_check(recs, roi, event_times, signal=sc.SIGNALS[0], baseline=sc.B
         df = prepare_df(r["df"]) if prepare_df else r["df"]
         t, sig, iso, dff = _raw_for_check(df, roi)
         if sig is None:
+            continue
+        if is_plexon(r) and dff is not None:
+            bb = list((bouts or {}).get(name) or [(float(event_times[name]), None)])
+            shift = float(event_times[name]) - bb[0][0]      # the event time was edited in the table
+            bb = [(a_ + shift, (b_ + shift) if b_ is not None else None) for a_, b_ in bb]
+            a = sc.assess_bouts(t, dff, bb, iso=iso, sig=sig, baseline=plx_baseline, direction=direction,
+                                label=label)
+            a["_t"], a["_sig"], a["_iso"], a["_dff"] = t, sig, iso, dff
+            out.append((name, animal, a))
             continue
         a = sc.assess(t, sig, iso, float(event_times[name]), signal=signal, dff=dff, baseline=baseline,
                       response=response, direction=direction)
@@ -1074,6 +1090,14 @@ def _trace_pct(a, which):
     """Event-aligned % change trace of one assessment: 'graded', '465' or '405'."""
     t, sig, iso, dff = a["_t"], a["_sig"], a["_iso"], a["_dff"]
     ev, base = a["event_s"], a["baseline"]
+    if a.get("method") == "plexon":
+        if which == "405" and iso is not None:
+            x, y = sc.diff_trace(t, iso, ev, base)
+            ys = sc._roll(t, iso, 2.0)
+            nz = float(np.nanstd((iso - ys)[t > t[0] + 20])) or 1.0
+            return x, y / nz
+        x, y = sc.diff_trace(t, dff, ev, base)
+        return x, y / (a.get("noise") or 1.0)
     if which == "465":
         return sc.pct_trace(t, sig, ev, base)
     if which == "405":
@@ -1102,6 +1126,8 @@ def _thin(x, y, dt=0.25):
 def signal_check_figure(A, pre, post, layout, height_mult, smooth_s=1.0):
     base, resp = A[0][2]["baseline"], A[0][2]["response"]
     unit = "% change" if not A[0][2]["signal"].startswith("dF/F") else "Δ dF/F (% points)"
+    if all(a.get("method") == "plexon" for _, _, a in A):
+        unit = "change ÷ noise"
     sig_name = A[0][2]["signal"].split(" (")[0]
     if layout == "Grid: 465 and 405 for each":
         n = len(A)
@@ -1109,7 +1135,9 @@ def signal_check_figure(A, pre, post, layout, height_mult, smooth_s=1.0):
         nrow = int(np.ceil(n / ncol))
         fig = make_subplots(rows=nrow, cols=ncol, shared_xaxes=True, shared_yaxes=True,
                             vertical_spacing=min(0.08, 0.5 / nrow), horizontal_spacing=0.04,
-                            subplot_titles=[f"{an or nm} · {a['tier']} ({a.get('change', np.nan):+.1f}%)"
+                            subplot_titles=[f"{an or nm} · {a['tier']} ({a['score']:.1f}× noise)"
+                                            if a.get("method") == "plexon" and np.isfinite(a.get("score", np.nan))
+                                            else f"{an or nm} · {a['tier']} ({a.get('change', np.nan):+.1f}%)"
                                             if np.isfinite(a.get("change", np.nan)) else f"{an or nm} · {a['tier']}"
                                             for nm, an, a in A])
         for i, (nm, _, a) in enumerate(A):
@@ -1128,7 +1156,7 @@ def signal_check_figure(A, pre, post, layout, height_mult, smooth_s=1.0):
             fig.add_vline(x=0, line=dict(color=_EV, width=1.1, dash="dash"), row=r, col=cc)
         fig.update_annotations(font=dict(size=11, color="#334155"))
         fig.update_xaxes(title_text="s from event", row=nrow)
-        fig.update_yaxes(title_text="% change", col=1)
+        fig.update_yaxes(title_text=unit, col=1)
         return _style(fig, int((210 * nrow + 120) * height_mult))
     fig = go.Figure()
     if layout == "Group mean ± SEM":
@@ -1154,8 +1182,9 @@ def signal_check_figure(A, pre, post, layout, height_mult, smooth_s=1.0):
             k = (x >= -pre) & (x <= post)
             x, y = _thin(x[k], y[k], smooth_s)
             col = sc.TIER_COLOR.get(a["tier"], "#64748b")
-            fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=f"{an or nm} · {a['tier']} ({a['change']:+.1f}%)"
-                                     if np.isfinite(a.get("change", np.nan)) else f"{an or nm} · {a['tier']}",
+            val = (f" ({a['score']:.1f}× noise)" if a.get("method") == "plexon" and np.isfinite(a.get("score", np.nan))
+                   else f" ({a['change']:+.1f}%)" if np.isfinite(a.get("change", np.nan)) else "")
+            fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=f"{an or nm} · {a['tier']}{val}",
                                      line=dict(color=col, width=1.3),
                                      hovertemplate=f"{an or nm} ({a['tier']}): %{{y:.1f}}<extra></extra>"))
     fig.add_vrect(x0=base[0], x1=base[1], fillcolor="rgba(100,116,139,0.10)", line_width=0, layer="below")
@@ -1192,6 +1221,23 @@ def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, 
                  sc.RESPONSE)
 
     recs = [(n, a, by_name[n]) for n, a in zip(ed["recording"], ed["animal"])]
+    n_plx = sum(1 for _, _, r in recs if is_plexon(r))
+    plx_base = sc.PLX_BASELINE
+    bouts = {}
+    if n_plx:
+        pc_ = st.columns([1.2, 3.8])
+        plx_base = _pair(pc_[0].text_input("Plexon: before each bout (s)",
+                                           f"{sc.PLX_BASELINE[0]:g}, {sc.PLX_BASELINE[1]:g}", key="sc_plx_base"),
+                         sc.PLX_BASELINE)
+        pc_[1].caption(f"{n_plx} Plexon recording(s): graded on the rise of the motion-corrected dF/F during each "
+                       f"'{label}' bout, divided by the recording's noise (see Method). The settings above apply "
+                       "to the pyPhotometry recordings.")
+        fe = ss.get("file_events") or {}
+        for n, _, r in recs:
+            if not is_plexon(r):
+                continue
+            from_file = [(float(e["start"]), e.get("end")) for e in fe.get(n, []) if str(e["label"]) == label]
+            bouts[n] = from_file or [(s_, None) for s_, l in sorted(events.get(n, [])) if l == label]
     first_ev = {n: min((s_ for s_, l in events.get(n, []) if l == label), default=None) for n, _, _ in recs}
     with st.expander("Event time in each recording (edit if one animal got it at a different moment)",
                      expanded=False):
@@ -1210,7 +1256,8 @@ def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, 
     times = {n: (float(v) if v is not None and np.isfinite(v) else None)
              for n, v in zip(tdf["recording"], tdf["event at (s into recording)"])}
 
-    A = run_signal_check(recs, roi, times, signal, base, resp, direction, prepare_df)
+    A = run_signal_check(recs, roi, times, signal, base, resp, direction, prepare_df, bouts=bouts,
+                         plx_baseline=plx_base, label=label)
     if not A:
         st.warning("No recording has this event inside it.")
         return
@@ -1221,14 +1268,16 @@ def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, 
     ss["sc_last"] = {"event": label, "signal": signal, "direction": direction, "baseline": base, "response": resp,
                      "rows": tab.drop(columns=["notes"]).to_dict("records")}
 
-    G = sc.group_summary(A)
+    all_plx = all(a.get("method") == "plexon" for _, _, a in A)
+    G = sc.group_summary([(n_, an_, dict(a, change=a.get("score"))) for n_, an_, a in A] if all_plx else A)
     chips = " ".join(f'<span style="display:inline-block;padding:2px 10px;margin:2px;border-radius:999px;'
                      f'background:{sc.TIER_COLOR[n]};color:white;font-size:0.85rem">{n}: {k}</span>'
                      for n, k in G["counts"].items() if k)
     good = sum(G["counts"][n] for n in ("Excellent", "Very good", "Good"))
     txt = f"<b>{label}</b>: {len(A)} recordings graded"
     if G.get("n", 0) >= 3:
-        txt += f" · mean change {G['mean']:+.1f} % ± {G['sem']:.1f} SEM"
+        txt += (f" · mean rise ÷ noise {G['mean']:.1f} ± {G['sem']:.1f} SEM" if all_plx
+                else f" · mean change {G['mean']:+.1f} % ± {G['sem']:.1f} SEM")
     st.markdown(f'<div class="pp-note">{chips}<br>{txt}</div>', unsafe_allow_html=True)
     stats_md = ""
     if G.get("n", 0) >= 3:
@@ -1237,8 +1286,14 @@ def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, 
                     f"one-sample t-test against no change p = {G['t_p']:.2g}"
                     + (f", Wilcoxon p = {G['wilcoxon_p']:.2g}" if np.isfinite(G.get("wilcoxon_p", np.nan)) else "")
                     + ". Each recording counts once.")
+    if all_plx:
+        stats_md = stats_md.replace("change by at least 10 %", "score Good or better").replace(" %", "")
+    plx_md = sc.PLEXON_CRITERIA_MD.format(b0=plx_base[0], b1=plx_base[1], pw=sc.PLX_POINT_WINDOW,
+                                          mb=sc.PLX_MIN_BOUT) if n_plx else ""
     th.explain("Method of classification · why signals look the way they do",
-               sc.CRITERIA_MD.format(b0=base[0], b1=base[1], r0=resp[0], r1=resp[1], signal=signal) + stats_md
+               (plx_md if all_plx else plx_md + "\n\n---\n\n**pyPhotometry recordings**\n\n" if n_plx else "")
+               + ("" if all_plx else sc.CRITERIA_MD.format(b0=base[0], b1=base[1], r0=resp[0], r1=resp[1],
+                                                           signal=signal)) + stats_md
                + f"\n\n**In the graph:** grey = before ({base[0]:+g} to {base[1]:+g} s), blue = after "
                  f"({resp[0]:+g} to {resp[1]:+g} s), dotted lines at ±10 %.")
 
@@ -1255,13 +1310,18 @@ def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, 
     show = tab.copy()
     for col_ in ("change %", "deepest 10 s %", "465 %", "405 %", "noise %", "change ÷ noise", "time to half (s)",
                  "event at (s)", "405 follows 465 (r)"):
-        show[col_] = pd.to_numeric(show[col_], errors="coerce").round(2 if "(r)" in col_ else 1)
+        show[col_] = pd.to_numeric(show[col_], errors="coerce").round(
+            2 if "(r)" in col_ else 3 if col_ == "noise %" and all_plx else 1)
+    show = show.dropna(axis=1, how="all")
 
     def colour(v):
         return f"background-color:{sc.TIER_COLOR.get(v, '#e2e8f0')};color:white;font-weight:600"
     try:
-        sty = show.style.map(colour, subset=["grade"]).format(precision=1, na_rep="–").format(
-            precision=2, subset=["405 follows 465 (r)"], na_rep="–")
+        sty = show.style.map(colour, subset=["grade"]).format(precision=1, na_rep="–")
+        if "405 follows 465 (r)" in show.columns:
+            sty = sty.format(precision=2, subset=["405 follows 465 (r)"], na_rep="–")
+        if all_plx and "noise %" in show.columns:
+            sty = sty.format(precision=3, subset=["noise %"], na_rep="–")
     except AttributeError:
         sty = show.style.applymap(colour, subset=["grade"]).format(precision=1, na_rep="–")
     st.dataframe(sty, hide_index=True, use_container_width=True,

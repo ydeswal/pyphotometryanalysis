@@ -35,6 +35,19 @@ allowed.
 
 ---
 
+## 9 November 2026 (d): Plexon recordings graded the Plexon way
+
+* **pyPhotometry first.** .ppd files and CSVs in the app's own format are processed as pyPhotometry with no
+  question. The "These look like Plexon files. Are they?" question appears only when a CSV has Plexon columns
+  (`RawF_<nm>_F<k>`) or is a Plexon event list.
+* **Signal check for Plexon recordings** (pyPhotometry recordings are unchanged). Raw Plexon channels sit on a
+  large camera background (~15 counts of ~17-19), so % changes are shrunk several-fold. Plexon recordings are
+  graded like the lab's GRAB cohort-4 signal-check slides: the rise of the motion-corrected dF/F during each bout
+  (best 2-s mean minus the mean 20 to 2 s before), divided by the recording's fast noise. Excellent ≥ 20, Very
+  good 15-20, Good 10-15, OK 5-10, Weak 3-5, No response < 3. Bouts come from the event files (start-end); an
+  event without an end is scored over the next 30 s. On the 13 cohort-4 recordings with event files, every
+  *good* scored 12-26, *ok / weak / recheck* 5-7, every *no / sack* under 3.
+
 ## 9 November 2026 (c): Plexon files, graphs in AI answers, AM/PM dark cycle
 
 * **Plexon (PMPS) CSV exports.** When CSV files are uploaded the app asks **"Are these Plexon files?"** (it guesses

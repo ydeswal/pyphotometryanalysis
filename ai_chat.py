@@ -472,10 +472,11 @@ class DataContext:
     """Everything the tools may read, plus what the user is looking at."""
 
     def __init__(self, results, fed, roi, ppd_paths=None, view=None, fed_map=None,
-                 sessions=None, allow_raw=True, pellet_mg=None, groups=None, events=None):
+                 sessions=None, allow_raw=True, pellet_mg=None, groups=None, events=None, bouts=None):
         self.results = list(results or [])
         # recording name -> [(seconds since its start, label)]: events the user marked
         self.events = {str(k): [(float(a), str(b)) for a, b in (v or [])] for k, v in (events or {}).items()}
+        self.bouts = dict(bouts or {})            # recording -> [{label, start, end}] from event files
         self.groups = dict(groups or {})          # recording name -> group label (group view)
         self.fed = fed if (fed is not None and not fed.events.empty) else None
         self.roi = roi
@@ -1147,7 +1148,18 @@ def tool_event_signal_check(ctx, event=None, at=None, recordings=None, signal=No
         cdff = col(f"{roi}_dFF_percent")
         if not c465:
             continue
-        a = sc.assess(t, pd.to_numeric(df[c465], errors="coerce").to_numpy(float),
+        if (r.get("settings") or {}).get("input_type") == "plexon_csv" and cdff:
+            lab = str(event or at)
+            bb = [(float(e["start"]), e.get("end")) for e in ctx.bouts.get(nm, [])
+                  if event and str(e["label"]).lower() == str(event).lower()] or [(ev, None)]
+            sh = ev - bb[0][0]
+            bb = [(x + sh, (y + sh) if y is not None else None) for x, y in bb]
+            a = sc.assess_bouts(t, pd.to_numeric(df[cdff], errors="coerce").to_numpy(float), bb,
+                                iso=pd.to_numeric(df[c405], errors="coerce").to_numpy(float) if c405 else None,
+                                sig=pd.to_numeric(df[c465], errors="coerce").to_numpy(float), direction=dirn,
+                                label=lab)
+        else:
+            a = sc.assess(t, pd.to_numeric(df[c465], errors="coerce").to_numpy(float),
                       pd.to_numeric(df[c405], errors="coerce").to_numpy(float) if c405 else None, ev,
                       signal=sig, dff=pd.to_numeric(df[cdff], errors="coerce").to_numpy(float) if cdff else None,
                       baseline=base, response=resp, direction=dirn)
@@ -1160,6 +1172,9 @@ def tool_event_signal_check(ctx, event=None, at=None, recordings=None, signal=No
                      "change_405_pct": _r(a.get("change_405"), 3), "baseline_noise_pct": _r(a.get("noise"), 3),
                      "change_over_noise": _r(a.get("snr"), 3), "r_405_follows_465": _r(a.get("r_fast"), 2),
                      "flags": a.get("flags", []),
+                     "method": ("Plexon: rise of dF/F during each bout ÷ the recording's noise (change_pct = mean "
+                                "rise in % dF/F, change_over_noise = the graded score)") if a.get("method") == "plexon"
+                     else "pyPhotometry: % change after vs before",
                      "notes": a.get("notes", [])})
     if not rows:
         raise ToolError("None of the recordings has this event.")
@@ -1179,6 +1194,12 @@ def tool_event_signal_check(ctx, event=None, at=None, recordings=None, signal=No
                         "405 RISE with a 465 fall is expected for real calcium (405 nm is below GCaMP's isosbestic "
                         "point). Grades are a quality screen of one event per recording, not a statistical test."),
            "grades_are_fixed": "Report these grades as given; do not regrade recordings."}
+    if any(a.get("method") == "plexon" for _, _, a in A):
+        out["plexon_criteria"] = ("Plexon recordings: camera background makes raw % changes meaningless, so the "
+                                  "grade is the rise of the motion-corrected dF/F during each bout (best 2-s mean "
+                                  "minus the mean 20 to 2 s before) divided by the recording's fast noise. "
+                                  "Excellent >= 20, Very good 15-20, Good 10-15, OK 5-10, Weak 3-5, No response < 3. "
+                                  "Calibrated on the lab's GRAB cohort-4 signal-check slides.")
     if G.get("n", 0) >= 3:
         v405 = np.array([a.get("change_405", np.nan) for _, _, a in A], float)
         v405 = v405[np.isfinite(v405)]
@@ -2032,15 +2053,15 @@ def _suggestions(ctx, focus):
 
 
 def render_panel(results, fed, roi, ppd_paths=None, view=None, fed_map=None, sessions=None,
-                 pellet_mg=None, groups=None, events=None):
+                 pellet_mg=None, groups=None, events=None, bouts=None):
     """The chat panel. Call once per page run; it reruns on its own (fragment)."""
     with st.container(key="ai-panel"):          # styled in theme.py (.st-key-ai-panel)
         with st.expander("Ask AI", expanded=bool(st.session_state.get("ai_history"))):
-            _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups, events)
+            _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups, events, bouts)
 
 
 @st.fragment
-def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups=None, events=None):
+def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups=None, events=None, bouts=None):
     pw = _secret("CHAT_PASSWORD")
     if pw and st.session_state.get("ai_unlocked") != pw:
         got = st.text_input("Chat password", type="password", key="ai_pw")
@@ -2084,7 +2105,7 @@ def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, gro
 
     ctx = DataContext(results, fed, roi, ppd_paths, view, fed_map, sessions,
                       allow_raw=st.session_state.get("ai_allow_raw", True), pellet_mg=pellet_mg, groups=groups,
-                      events=events)
+                      events=events, bouts=bouts)
     options = ctx.names() + ([f"FED {a}" for a in ctx.fed.animals] if ctx.fed is not None else [])
     auto = [o for o in options if o in (view or {}).get("focus_default", [])]
     ss = st.session_state

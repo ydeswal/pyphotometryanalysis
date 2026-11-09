@@ -1968,8 +1968,10 @@ with st.sidebar:
         _csv_kind = {p: plexon.sniff(p) for p in uploaded_files if p.suffix.lower() == ".csv"}
         _plx = [p for p, k in _csv_kind.items() if k == "photometry"]
         _evf = [p for p, k in _csv_kind.items() if k == "events"]
-        if _csv_kind:
-            _ans = st.radio("Are these Plexon files?", ["Yes", "No"], index=0 if _plx else 1, horizontal=True,
+        # pyPhotometry (.ppd, or CSV in the app's own format) is assumed; the question appears only
+        # when a CSV has Plexon columns (RawF_<nm>_F<k>) or is a Plexon event list.
+        if _plx or _evf:
+            _ans = st.radio("These look like Plexon files. Are they?", ["Yes", "No"], index=0, horizontal=True,
                             key="plexon_answer",
                             help="Plexon Multi-Wavelength Photometry System CSV exports (columns Frame, timestamp, "
                                  "RawF_465_F1, RawF_410_F1 …) and their event lists (Event, Start Time, End Time).")
@@ -2790,7 +2792,7 @@ def _ai_chat_panel(results, display_mode="(no recordings)"):
         view["signal check on screen"] = {k: ss["sc_last"][k] for k in ("event", "signal", "baseline", "response")}
     ai_chat.render_panel(results, FED_DATA, roi_name, ppd_paths=ppd_paths, view=view, fed_map=fed_map,
                          sessions=ss.get("fed_sessions"), pellet_mg=ss.get("fed_mg"),
-                         groups=ss.get("grp_groups"), events=events)
+                         groups=ss.get("grp_groups"), events=events, bouts=ss.get("file_events"))
 
 
 if not results:

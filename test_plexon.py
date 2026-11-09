@@ -103,6 +103,22 @@ check("automatic graph from a signal question", spec and spec["kind"] == "signal
 spec = ac.auto_graph([{"tool": "event_signal_check", "args": {"event": "drop"}, "result": {}}])
 check("automatic graph from a signal check", spec and spec["kind"] == "signal_check")
 
+print("\n=== Plexon grading: rise during bouts / noise ===")
+import signal_check as sc  # noqa: E402
+tt = np.arange(0, 400, 1 / 30)
+bouts_ = [(150.0, 190.0), (280.0, 320.0)]
+bump = sum(((tt >= a) & (tt < b)) * (1 - np.exp(-(tt - a) / 4)) * np.exp(-np.clip(tt - b, 0, None) / 8)
+           + ((tt >= b) * np.exp(-(tt - b) / 8)) for a, b in bouts_)
+for amp, noise, want in ((1.0, 0.03, "Excellent"), (0.3, 0.03, "Good"), (0.05, 0.03, "No response")):
+    y = amp * bump + noise * rng.standard_normal(tt.size)
+    a = sc.assess_bouts(tt, y, bouts_, direction=sc.DIRECTIONS[2], label="eating")
+    check(f"rise {amp} over noise {noise}: {want}", a["tier"] == want, f"{a['tier']} score {a['score']:.1f}")
+a = sc.assess_bouts(tt, 0.03 * rng.standard_normal(tt.size), [(150.0, None)])
+check("event without an end is scored over the next 30 s", a["response"] == (0.0, 30.0) and a["bouts"] == 1)
+y = bump + 0.03 * rng.standard_normal(tt.size)
+a = sc.assess_bouts(tt, y, bouts_, iso=5 + 0.8 * bump + 0.03 * rng.standard_normal(tt.size))
+check("control rising with the signal: flagged", "410 moves too" in a["flags"], str(a["flags"]))
+
 print("\n=== AM/PM lights ===")
 check("parse 12-hour and 24-hour times", [gt.parse_tod(x) for x in ("7:00 PM", "7pm", "19:00", "6:30 am", "12 am",
                                                                     "12:15 PM")] == [19, 19, 19, 6.5, 0, 12.25])
