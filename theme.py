@@ -458,17 +458,7 @@ div[data-testid="stDataFrame"], .stDataFrame {
 .st-key-ai-panel [data-testid="stChatInput"] > div {
   border-color: #c7d2fe !important;
 }
-.st-key-ai-panel > [data-testid="stLayoutWrapper"] > [data-testid="stExpander"] > details > div {
-  background: #f1f5f9 !important;          /* chat area: soft slate, set apart from the white page cards */
-}
-.st-key-ai-panel [data-testid="stChatMessage"] {
-  background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 0.7rem 0.9rem;
-  margin-bottom: 0.5rem;
-}
-.st-key-ai-panel [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]),
-.st-key-ai-panel [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
-  background: #eef2ff; border-color: #c7d2fe;
-}
+.st-key-ai-panel [data-testid="stChatMessage"] { background: transparent; }
 
 [data-testid="stAlert"] { border-radius: 8px; }
 [data-testid="stNotification"] { background-color: #ffffff !important; }
