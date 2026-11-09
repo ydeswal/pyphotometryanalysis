@@ -470,8 +470,10 @@ class DataContext:
     """Everything the tools may read, plus what the user is looking at."""
 
     def __init__(self, results, fed, roi, ppd_paths=None, view=None, fed_map=None,
-                 sessions=None, allow_raw=True, pellet_mg=None, groups=None):
+                 sessions=None, allow_raw=True, pellet_mg=None, groups=None, events=None):
         self.results = list(results or [])
+        # recording name -> [(seconds since its start, label)]: events the user marked
+        self.events = {str(k): [(float(a), str(b)) for a, b in (v or [])] for k, v in (events or {}).items()}
         self.groups = dict(groups or {})          # recording name -> group label (group view)
         self.fed = fed if (fed is not None and not fed.events.empty) else None
         self.roi = roi
@@ -1067,6 +1069,130 @@ def tool_meal_patterns(ctx, animals=None, groups=None, max_gap_s=60, min_pellets
             "animals": rows, "group_mean_sem": summ.to_dict("records")}
 
 
+# ---- events and signal check -----------------------------------------------
+
+def tool_list_events(ctx):
+    """Events the user marked (food in, injection ...), per recording, as recording and clock time."""
+    if not ctx.events or not any(ctx.events.values()):
+        return {"events": [], "note": "No events are marked. The user can add them under Group analysis → "
+                                      "📍 Events, or in the sidebar under Event lines."}
+    out = []
+    for r in ctx.results:
+        nm = str(r["name"])
+        cs = ctx.clock_start(r)
+        for sec, lab in sorted(ctx.events.get(nm, [])):
+            out.append({"recording": nm, "animal": ctx.rec_animal.get(nm), "event": lab,
+                        "time": ctx.tfmt(cs + pd.Timedelta(seconds=sec), cs) if cs is not None
+                        else "rec " + gt.fmt_hms(sec, 1), "seconds_into_recording": _r(sec, 6)})
+    return {"events": out}
+
+
+def tool_event_signal_check(ctx, event=None, at=None, recordings=None, signal=None, baseline=None, response=None,
+                            direction="decrease"):
+    """Grade every recording's response to an event (signal_check.py) and test the group."""
+    import signal_check as sc
+    from scipy import stats
+    base = _pair(baseline, sc.BASELINE)
+    resp = _pair(response, sc.RESPONSE)
+    sig = next((x for x in sc.SIGNALS if signal and str(signal).lower()[:5] in x.lower()), sc.SIGNALS[0])
+    dirn = {"decrease": sc.DIRECTIONS[0], "increase": sc.DIRECTIONS[1]}.get(str(direction).lower()[:8],
+                                                                          sc.DIRECTIONS[2])
+    recs = ctx.results if not recordings else [ctx.rec(x) for x in recordings]
+    if not recs:
+        raise ToolError("No photometry recording is loaded.")
+    labels = sorted({l for v in ctx.events.values() for _, l in v})
+    if at is None and event is None:
+        if len(labels) == 1:
+            event = labels[0]
+        elif labels:
+            raise ToolError(f"Several events are marked: {labels}. Say which, or give `at`.")
+        else:
+            raise ToolError("No events are marked. Give `at` (e.g. 'rec 00:01:00' or '8:25 PM'), or ask the user "
+                            "to add the event under Group analysis → 📍 Events.")
+    rows, A = [], []
+    for r in recs:
+        nm = str(r["name"])
+        cs = ctx.clock_start(r)
+        if at is not None:
+            try:
+                ts = parse_time(at, cs, ctx.rec_span(r))
+                ev = (ts - cs).total_seconds()
+            except Exception as e:
+                raise ToolError(f"Could not read the time '{at}': {e}") from None
+        else:
+            hits = [sec for sec, l in ctx.events.get(nm, []) if l.lower() == str(event).lower()]
+            if not hits:
+                continue
+            ev = min(hits)
+        df = r["df"]
+        c = df.columns
+        roi = ctx.roi
+
+        def col(*names):
+            return next((x for x in names if x in c), None)
+        t = pd.to_numeric(df["time_sec"], errors="coerce").to_numpy(float)
+        c465 = col(f"{roi}_sig_filt", f"{roi}_sig_filt_10Hz_lowpass", f"{roi}_sig_raw")
+        c405 = col(f"{roi}_uv_filt", f"{roi}_uv_filt_10Hz_lowpass", f"{roi}_uv_raw")
+        cdff = col(f"{roi}_dFF_percent")
+        if not c465:
+            continue
+        a = sc.assess(t, pd.to_numeric(df[c465], errors="coerce").to_numpy(float),
+                      pd.to_numeric(df[c405], errors="coerce").to_numpy(float) if c405 else None, ev,
+                      signal=sig, dff=pd.to_numeric(df[cdff], errors="coerce").to_numpy(float) if cdff else None,
+                      baseline=base, response=resp, direction=dirn)
+        A.append((nm, ctx.rec_animal.get(nm), a))
+        rows.append({"recording": nm, "animal": ctx.rec_animal.get(nm), "grade": a["tier"],
+                     "event_at": ctx.tfmt(cs + pd.Timedelta(seconds=ev), cs) if cs is not None
+                     else "rec " + gt.fmt_hms(ev, 1),
+                     "change_pct": _r(a.get("change"), 3), "deepest_10s_pct": _r(a.get("deepest"), 3),
+                     "time_to_half_s": _r(a.get("t_half"), 3), "change_465_pct": _r(a.get("change_465"), 3),
+                     "change_405_pct": _r(a.get("change_405"), 3), "baseline_noise_pct": _r(a.get("noise"), 3),
+                     "change_over_noise": _r(a.get("snr"), 3), "flags": a.get("flags", []),
+                     "notes": a.get("notes", [])})
+    if not rows:
+        raise ToolError("None of the recordings has this event.")
+    order = {n: i for i, n in enumerate(sc.TIER_NAMES + ["Not testable"])}
+    rows.sort(key=lambda x: (order.get(x["grade"], 99), x["change_pct"] if dirn == sc.DIRECTIONS[0]
+                             else -(x["change_pct"] or 0)))
+    G = sc.group_summary(A)
+    out = {"event": event or at, "signal_graded": sig, "expected_change": dirn,
+           "baseline_window_s": list(base), "response_window_s": list(resp),
+           "grades_best_first": rows, "grade_counts": {k: v for k, v in G["counts"].items() if v},
+           "criteria": ("change = mean of the graded signal in the response window vs the baseline window, % "
+                        "change. Grades on the change in the expected direction: Excellent >= 25 %, Very good "
+                        "15-25 %, Good 10-15 % (10 % = Deem et al. 2020 eLife cut-off for AgRP hits after a fast), "
+                        "OK 5-10 %, Weak 2-5 %, No response < 2 % or wrong direction. One step lower if the change "
+                        "is < 3x baseline noise, or if 405 moves the SAME way by >= half as much (>= 2 %). A small "
+                        "405 RISE with a 465 fall is expected for real calcium (405 nm is below GCaMP's isosbestic "
+                        "point). Grades are a quality screen of one event per recording, not a statistical test."),
+           "grades_are_fixed": "Report these grades as given; do not regrade recordings."}
+    if G.get("n", 0) >= 3:
+        v405 = np.array([a.get("change_405", np.nan) for _, _, a in A], float)
+        v405 = v405[np.isfinite(v405)]
+        cp = float(stats.ttest_1samp(v405, 0.0).pvalue) if v405.size >= 3 else None
+        out["across_recordings"] = {"n_recordings": G["n"], "mean_change_pct": _r(G["mean"], 4),
+                                    "sem": _r(G["sem"], 3), "median": _r(G["median"], 4),
+                                    "t_test_p_vs_0": _r(G["t_p"], 3),
+                                    "wilcoxon_p": _r(G.get("wilcoxon_p"), 3)}
+        out["data_check"] = interpret.assess_response(
+            G["n"], G["mean"], G["t_p"], 0.0, float(np.mean(v405)) if v405.size else None, cp, None,
+            unit="recordings", versus="no change (one value per recording, t-test)", min_n=5)
+    return out
+
+
+def _pair(text, default):
+    if text is None:
+        return default
+    try:
+        if isinstance(text, (list, tuple)):
+            a, b = float(text[0]), float(text[1])
+        else:
+            a, b = (float(v) for v in str(text).replace("to", ",").split(","))
+        return (a, b) if a < b else default
+    except Exception:
+        return default
+
+
 # ---- safe calculator -----------------------------------------------------
 
 _OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
@@ -1211,6 +1337,23 @@ TOOLS = [
         {"animals": {"type": "array", "items": {"type": "string"}},
          "groups": {"type": "array", "items": {"type": "string"}},
          "max_gap_s": {"type": "number"}, "min_pellets": {"type": "integer"}}, []),
+    _fn("list_events", "Events the user marked on the recordings (e.g. 'Food in', an injection), with clock "
+        "and recording times.", {}, []),
+    _fn("event_signal_check", "Grade how strongly each recording responds to an event (e.g. food presented "
+        "to fasted AgRP mice): % change after vs before, deepest 10 s, time to half, 465 and 405 changes, noise, "
+        "a fixed grade per recording (Excellent ... No response) best first, the grading criteria, and a "
+        "test across recordings. Use for 'which mouse has the best signal', signal checks, and any question "
+        "about the response to a marked event.",
+        {"event": {"type": "string", "description": "event label as marked (default: the only one)"},
+         "at": {"type": "string", "description": "instead of a marked event: one time used for every "
+                                                  "recording, e.g. 'rec 00:01:00' or '8:25 PM'"},
+         "recordings": {"type": "array", "items": {"type": "string"}},
+         "signal": {"type": "string", "enum": ["ratio", "465 raw", "dF/F"],
+                    "description": "graded signal, default ratio = raw 465 / 405"},
+         "baseline": {"type": "string", "description": "seconds 'start,end', default -30,-5"},
+         "response": {"type": "string", "description": "seconds 'start,end', default 30,120"},
+         "direction": {"type": "string", "enum": ["decrease", "increase", "either"],
+                       "description": "expected change, default decrease (AgRP to food)"}}, []),
     _fn("time_difference", "How long from one time to another (clock times, dates or recording times). "
         "Use for any time arithmetic.", {"start": _T, "end": _T, "recording": _REC}, ["start", "end"]),
     _fn("calculate", "Arithmetic on numbers from tool results (differences, ratios, percentages, unit "
@@ -1226,6 +1369,7 @@ TOOL_FUNCS = {
     "get_raw_ppd_window": tool_raw_ppd_window, "get_recording_info": tool_recording_info,
     "calculate": tool_calculate, "time_difference": tool_time_difference,
     "group_meal_response": tool_group_meal_response, "meal_patterns": tool_meal_patterns,
+    "list_events": tool_list_events, "event_signal_check": tool_event_signal_check,
 }
 
 
@@ -1233,7 +1377,8 @@ def available_tools(ctx):
     skip = set()
     if not ctx.results:
         skip |= {"get_signal_summary", "get_signal_trace", "find_extremes", "compare_windows",
-                 "event_aligned_response", "signal_vs_intake", "get_raw_ppd_window", "get_recording_info"}
+                 "event_aligned_response", "signal_vs_intake", "get_raw_ppd_window", "get_recording_info",
+                 "list_events", "event_signal_check"}
     if ctx.fed is None:
         skip |= {"get_fed_events", "get_meals", "get_intake", "event_aligned_response", "signal_vs_intake",
                  "group_meal_response", "meal_patterns"}
@@ -1297,6 +1442,10 @@ def catalogue(ctx, focus=None):
             L.append(f"- {an}: {n} pellets in used sessions; FED logging {segs or 'unknown'}")
     else:
         L.append("No FED3 data loaded.")
+    evs = [(n, sec, lab) for n, v in ctx.events.items() for sec, lab in v]
+    if evs:
+        L.append("EVENTS MARKED BY THE USER (recording: label at rec time): " + "; ".join(
+            f"{n}: {lab} at rec {gt.fmt_hms(sec, 1)}" for n, sec, lab in evs[:40]) + (" …" if len(evs) > 40 else ""))
     v = ctx.view
     if v:
         L.append("ON SCREEN NOW: " + "; ".join(f"{k} = {val}" for k, val in v.items() if val not in (None, "", [])))
@@ -1330,6 +1479,9 @@ artifact, low/minimal motion, clearly neural. Never write "proves" or "definitiv
 10. For several animals, the animal is the unit: use group_meal_response, report n as animals, and treat \
 pooled-meal numbers as reference only. With few animals say how small the sample is.
 11. Use `what_these_numbers_mean` from get_recording_info as given; do not reinterpret it.
+12. For responses to a marked event (food in, injection ...) and for "which animal has the best / a good \
+signal", call event_signal_check. Its grades are fixed: report them as given, best first, and state the \
+criteria briefly. A grade is a quality screen of one event per recording, not proof of anything.
 
 Signals: dff = dF/F, z = z-scored dF/F, raw465 / raw405 = raw channels at the app's export rate (the original \
 .ppd at full rate is get_raw_ppd_window), deltaF = 465 - fitted 405, filt465, fit405, F0 = baseline.
@@ -1654,15 +1806,15 @@ def _suggestions(ctx, focus):
 
 
 def render_panel(results, fed, roi, ppd_paths=None, view=None, fed_map=None, sessions=None,
-                 pellet_mg=None, groups=None):
+                 pellet_mg=None, groups=None, events=None):
     """The chat panel. Call once per page run; it reruns on its own (fragment)."""
     with st.container(key="ai-panel"):          # styled in theme.py (.st-key-ai-panel)
         with st.expander("✨ Ask the data with AI", expanded=bool(st.session_state.get("ai_history"))):
-            _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups)
+            _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups, events)
 
 
 @st.fragment
-def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups=None):
+def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, groups=None, events=None):
     pw = _secret("CHAT_PASSWORD")
     if pw and st.session_state.get("ai_unlocked") != pw:
         got = st.text_input("Chat password", type="password", key="ai_pw")
@@ -1705,7 +1857,8 @@ def _panel(results, fed, roi, ppd_paths, view, fed_map, sessions, pellet_mg, gro
         return
 
     ctx = DataContext(results, fed, roi, ppd_paths, view, fed_map, sessions,
-                      allow_raw=st.session_state.get("ai_allow_raw", True), pellet_mg=pellet_mg, groups=groups)
+                      allow_raw=st.session_state.get("ai_allow_raw", True), pellet_mg=pellet_mg, groups=groups,
+                      events=events)
     options = ctx.names() + ([f"FED {a}" for a in ctx.fed.animals] if ctx.fed is not None else [])
     auto = [o for o in options if o in (view or {}).get("focus_default", [])]
     ss = st.session_state

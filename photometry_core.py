@@ -1308,14 +1308,18 @@ def process_photometry(signal_raw, control_raw, fs, settings=None,
 
     if finfo["slope_clamped"]:
         warnings_out.append(
-            f"The 405-to-465 fit gave a NEGATIVE slope ({finfo['raw_slope']:.3g}). A motion "
-            "artefact cannot do that, so the slope was set to 0 and nothing but a constant "
-            "was subtracted. This usually means 465 contains a large real change that 405 "
-            "does not share. Inspect the raw traces for movement artefacts by eye.")
+            f"The 405-to-465 fit gave a NEGATIVE slope ({finfo['raw_slope']:.3g}), so it was set "
+            "to 0 and only a constant was subtracted (no motion correction). Movement and "
+            "bleaching move both channels the same way, so they give a positive slope. A "
+            "negative one usually means 465 has a large real calcium change: 405 nm sits a few "
+            "nm below GCaMP's isosbestic point, so when calcium falls 405 rises slightly (and "
+            "the reverse). Common in strong recordings, e.g. AgRP neurons falling when food "
+            "appears. Still check the raw 405 for movement by eye.")
     elif np.isfinite(finfo["r2"]) and finfo["r2"] < 0.05:
         warnings_out.append(
             f"405 explains only {100 * finfo['r2']:.1f}% of the 465 variance, so motion "
-            "correction removed very little. That is fine if the animal moved little.")
+            "correction removed very little. This does not show that the animal moved little: "
+            "check the raw 405 trace around the events you analyse.")
 
     dff = delta_f / f0
     if cfg["dff_units"] == "percent":

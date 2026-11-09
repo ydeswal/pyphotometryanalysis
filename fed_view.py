@@ -353,7 +353,11 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         kind = sc[0].selectbox("Signal", kinds, key="fed_kind",
                                help="dF/F or z-score, or a raw channel. 'Raw 465 + 405' draws "
                                     "both raw channels, each on its own axis.")
-        smooth = sc[1].number_input("Running-mean window (min)", 0.5, 240.0, 30.0, 1.0, key="fed_smooth") \
+        import signal_check as _sc
+        _on, _w, _why = _sc.recommend_smoothing(float(df["time_sec"].max() - df["time_sec"].min()))
+        smooth = sc[1].number_input("Running-mean window (min)", 0.05, 240.0, float(round(_w / 60.0, 2)), 0.5,
+                                    key=f"fed_smooth_{_w:g}", help="Recommended for this recording: " + _why
+                                    + " " + _sc.SMOOTHING_HELP) \
             if "running" in kind else 30.0
         time_mode = sc[2].radio("Time axis", TIME_AXES, key="fed_time_axis", horizontal=True,
                                 help="Clock time is the PC wall clock that the FED3 and photometry "

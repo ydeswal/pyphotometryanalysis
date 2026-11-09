@@ -63,6 +63,7 @@ import fed3
 import fed_view
 import ai_chat
 import group_view
+import signal_check as sc
 
 
 def _reload_changed_modules():
@@ -78,7 +79,7 @@ def _reload_changed_modules():
     """
     import importlib
     import os
-    order = ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret", "fed_view",
+    order = ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret", "signal_check", "fed_view",
              "group_analysis", "group_view", "ai_chat")
     stamps = sys.__dict__.setdefault("_pp_module_mtimes", {})
     changed = False
@@ -1127,12 +1128,20 @@ def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=No
     return finish_fig(fig, height=height, df=df)
 
 
-def make_main_dff_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=620):
-    """The only dFF graph in the app."""
+def make_main_dff_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=620,
+                         smooth_sec=None):
+    """The only dFF graph in the app. smooth_sec: add a centred sliding mean of that width."""
     fig = make_subplots(rows=1, cols=1, subplot_titles=("dF/F0 = (465 - fitted 405) / F0",))
     x = df["time_sec"]
     if f"{roi}_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[dff_percent_column(df, roi)], mode="lines", name="dF/F0 (%)", line=dict(color=graph_color("dff"))), row=1, col=1)
+        y = df[dff_percent_column(df, roi)]
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="dF/F0 (%)", line=dict(color=graph_color("dff")),
+                                 opacity=0.55 if smooth_sec else 1.0), row=1, col=1)
+        if smooth_sec:
+            sm = sliding_window_mean_by_time(x.to_numpy(float), pd.to_numeric(y, errors="coerce").to_numpy(float),
+                                             window_sec=float(smooth_sec), centered=True)
+            fig.add_trace(go.Scatter(x=x, y=sm, mode="lines", name=f"Sliding mean ({seconds_to_hms(smooth_sec)})",
+                                     line=dict(color=graph_color("z_smooth"), width=2.4)), row=1, col=1)
     fig.update_yaxes(title_text="dF/F0 (%)", row=1, col=1)
     apply_hms_xaxis(fig, df, rows=[1])
     if limits:
@@ -1589,10 +1598,26 @@ def make_zscore_range_analysis_figure(
     return finish_fig(fig, height=height, df=df), stats_df
 
 
-def filter_events_for_context(events, recording_name, graph_kind):
+def resolve_event_clock(ev, clock_start):
+    """An event entered as clock time -> the same event in this recording's seconds (or None)."""
+    if not ev.get("clock_start_text"):
+        return ev
+    st_ = group_view.parse_clock_time(ev["clock_start_text"], clock_start)
+    if st_ is None:
+        return None
+    out = dict(ev, start_sec=float(st_), start_hhmmss=seconds_to_hms(max(st_, 0)))
+    if ev.get("clock_end_text"):
+        en = group_view.parse_clock_time(ev["clock_end_text"], clock_start)
+        out["end_sec"] = float(en) if en is not None and en > st_ else None
+        out["end_hhmmss"] = seconds_to_hms(en) if out["end_sec"] is not None else None
+    return out
+
+
+def filter_events_for_context(events, recording_name, graph_kind, clock_start=None):
     """
     Filter event annotations so events can be applied only to selected recordings
-    and/or selected graph tabs.
+    and/or selected graph tabs. Events given as clock time are converted to this
+    recording's own time (needs its clock start).
     """
     filtered = []
     for ev in events or []:
@@ -1601,13 +1626,17 @@ def filter_events_for_context(events, recording_name, graph_kind):
         recording_ok = (not target_recordings or "All recordings" in target_recordings or recording_name in target_recordings)
         graph_ok = (not target_graphs or "All graphs" in target_graphs or graph_kind in target_graphs)
         if recording_ok and graph_ok:
-            filtered.append(ev)
+            ev = resolve_event_clock(ev, clock_start)
+            if ev is not None:
+                filtered.append(ev)
     return filtered
 
 
-def render_zscore_display_controls(base_key):
-    """Z-score controls shown inside the z-score graph tab/focus window."""
+def render_zscore_display_controls(base_key, duration_sec=None):
+    """Z-score controls shown inside the z-score graph tab/focus window. The sliding
+    mean starts on/off with the window recommended for this recording's length."""
     st.markdown("#### Z-score display settings")
+    rec_on, rec_w, rec_why = sc.recommend_smoothing(duration_sec or 0)
     c1, c2, c3 = st.columns([1.2, 1.0, 1.0])
     with c1:
         z_source = st.selectbox(
@@ -1620,9 +1649,9 @@ def render_zscore_display_controls(base_key):
     with c2:
         z_window_hms = st.text_input(
             "Sliding mean window",
-            value="00:30:00",
+            value=seconds_to_hms(rec_w),
             key=f"{base_key}_z_window_hms",
-            help="Use HH:MM:SS, for example 00:10:00, 00:30:00, or 01:00:00.",
+            help="Use HH:MM:SS, for example 00:00:10, 00:10:00 or 00:30:00. " + sc.SMOOTHING_HELP,
         )
     with c3:
         z_centered_mean = st.checkbox(
@@ -1631,14 +1660,16 @@ def render_zscore_display_controls(base_key):
             key=f"{base_key}_z_centered_mean",
             help="Centered smoothing avoids shifting peaks left/right. Turn off for a trailing running mean.",
         )
-    z_window_sec, z_window_err = parse_hms_to_seconds(z_window_hms, 30 * 60, "sliding mean window")
+    z_window_sec, z_window_err = parse_hms_to_seconds(z_window_hms, rec_w, "sliding mean window")
     if z_window_err:
         st.error(z_window_err)
+    st.caption("Recommended for this recording: " + rec_why)
     c4, c5, c6 = st.columns(3)
     with c4:
         z_show_raw = st.checkbox("Show raw z-score trace", value=True, key=f"{base_key}_z_show_raw")
     with c5:
-        z_show_smooth = st.checkbox("Show sliding mean trace", value=True, key=f"{base_key}_z_show_smooth")
+        z_show_smooth = st.toggle("Sliding mean", value=rec_on, key=f"{base_key}_z_show_smooth",
+                                  help=sc.SMOOTHING_HELP)
     with c6:
         z_show_dark = st.checkbox("Show dark-cycle shading", value=False, key=f"{base_key}_z_show_dark")
     with st.expander("Dark-cycle shading settings", expanded=False):
@@ -2180,14 +2211,26 @@ with st.sidebar:
             with st.container():
                 st.markdown(f"**Event / epoch {i + 1}: name and timing**")
                 name = st.text_input("Event name", value=f"Event {i + 1}", key=f"ev_name_{i}")
-                start_hms = st.text_input("Start time (HH:MM:SS)", value="00:00:00", key=f"ev_start_hms_{i}")
-                start, start_time_err = parse_hms_to_seconds(start_hms, 0.0, f"event {i + 1} start time")
+                ev_clock = st.radio("Time given as", ["Recording time", "Clock time"], horizontal=True,
+                                    key=f"ev_timekind_{i}",
+                                    help="Recording time: HH:MM:SS since the recording started. Clock time: the "
+                                         "time of day, e.g. 8:25:30 PM; each recording places it on its own "
+                                         "timeline.")
+                clock_start_text = clock_end_text = None
+                if ev_clock == "Clock time":
+                    clock_start_text = st.text_input("Clock time (e.g. 8:25:30 PM)", value="", key=f"ev_clock_{i}")
+                    start, start_time_err = 0.0, None
+                else:
+                    start_hms = st.text_input("Start time (HH:MM:SS)", value="00:00:00", key=f"ev_start_hms_{i}")
+                    start, start_time_err = parse_hms_to_seconds(start_hms, 0.0, f"event {i + 1} start time")
                 if start_time_err:
                     st.error(start_time_err)
                 has_duration = st.checkbox("This event lasts for a duration", value=False, key=f"ev_duration_{i}")
                 end = None
                 end_hms = ""
-                if has_duration:
+                if has_duration and ev_clock == "Clock time":
+                    clock_end_text = st.text_input("End clock time", value="", key=f"ev_clock_end_{i}")
+                elif has_duration:
                     end_hms = st.text_input("End time (HH:MM:SS)", value=seconds_to_hms(start + 60.0), key=f"ev_end_hms_{i}")
                     end, end_time_err = parse_hms_to_seconds(end_hms, start + 60.0, f"event {i + 1} end time")
                     if end_time_err:
@@ -2219,7 +2262,11 @@ with st.sidebar:
                 alpha = st.slider("Dotted line transparency", 0.05, 1.0, 0.65, 0.05, key=f"ev_alpha_{i}")
                 shade_alpha = st.slider("Duration shade transparency", 0.02, 0.80, 0.18, 0.02, key=f"ev_shade_alpha_{i}")
 
+            if ev_clock == "Clock time" and not (clock_start_text or "").strip():
+                continue
             event_annotations.append({
+                "clock_start_text": clock_start_text,
+                "clock_end_text": clock_end_text,
                 "name": name,
                 "start_sec": float(start),
                 "end_sec": float(end) if end is not None else None,
@@ -2558,9 +2605,24 @@ def _ai_chat_panel(results, display_mode="(no recordings)"):
                      "signal": ss.get("grp_kind"), "normalisation": ss.get("grp_norm"),
                      "group statistic": ss.get("grp_stat"), "meal definition": ss.get("grp_meal")})
         view["focus_default"] = [str(r["name"]) for r in results]
+    # Events: the group-view event table plus the sidebar event lines (clock times placed per recording).
+    events = {str(r["name"]): list((ss.get("grp_events") or {}).get(str(r["name"]), [])) for r in results}
+    for r in results:
+        cs_ = gt.clock_start_of(r["df"], r.get("settings"))
+        for ev in event_annotations:
+            tr = ev.get("target_recordings") or ["All recordings"]
+            if "All recordings" not in tr and str(r["name"]) not in tr:
+                continue
+            ev2 = resolve_event_clock(ev, cs_)
+            if ev2 is not None and (str(r["name"]), ev2["start_sec"]) not in {
+                    (str(r["name"]), a) for a, _ in events[str(r["name"])]}:
+                events[str(r["name"])].append((float(ev2["start_sec"]), str(ev2.get("name"))))
+    if display_mode == "Group analysis" and ss.get("grp_view") == "Event response & signal check" \
+            and ss.get("sc_last"):
+        view["signal check on screen"] = {k: ss["sc_last"][k] for k in ("event", "signal", "baseline", "response")}
     ai_chat.render_panel(results, FED_DATA, roi_name, ppd_paths=ppd_paths, view=view, fed_map=fed_map,
                          sessions=ss.get("fed_sessions"), pellet_mg=ss.get("fed_mg"),
-                         groups=ss.get("grp_groups"))
+                         groups=ss.get("grp_groups"), events=events)
 
 
 if not results:
@@ -2658,6 +2720,8 @@ else:
         render_diagnostics(result.get("settings", {}))
 
         rec_clock = gt.clock_start_of(view_df, result.get("settings"))
+        _dur = float(pd.to_numeric(full_df["time_sec"], errors="coerce").max()
+                     - pd.to_numeric(full_df["time_sec"], errors="coerce").min())
 
         def show(fig, kind):
             gt.chart_block(
@@ -2672,6 +2736,7 @@ else:
                 event_annotations,
                 str(result["name"]),
                 kind,
+                rec_clock,
             )
             if kind == "Overview":
                 fig = make_overview_figure(
@@ -2692,7 +2757,7 @@ else:
                     height=raw_h,
                 )
             elif kind == "Z-score sliding mean":
-                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zslide")
+                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zslide", _dur)
                 fig = make_zscore_sliding_mean_figure(
                     view_df,
                     roi_name,
@@ -2713,7 +2778,7 @@ else:
                     cycle_sec=zcfg["cycle_sec"],
                 )
             elif kind == "Z-score range analysis":
-                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zrange")
+                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zrange", _dur)
                 zrange_cfg = render_zscore_range_controls(f"{safe_name(result['name'])}_{idx}")
                 fig, z_stats_df = make_zscore_range_analysis_figure(
                     view_df,
@@ -2758,6 +2823,14 @@ else:
                     )
                 return
             else:
+                _on, _w, _why = sc.recommend_smoothing(_dur)
+                _k = f"{safe_name(result['name'])}_{idx}_dff_sm"
+                _c = st.columns([1, 1.2, 3])
+                _sm_on = _c[0].toggle("Sliding mean", value=_on, key=f"{_k}_on", help=sc.SMOOTHING_HELP)
+                _sm_hms = _c[1].text_input("Window (HH:MM:SS)", seconds_to_hms(_w), key=f"{_k}_w",
+                                           disabled=not _sm_on)
+                _sm_sec, _sm_err = parse_hms_to_seconds(_sm_hms, _w, "sliding mean window")
+                _c[2].caption("Recommended for this recording: " + _why)
                 fig = make_main_dff_figure(
                     view_df, roi_name, manual_limits,
                     events=events_for_this_graph,
@@ -2765,6 +2838,7 @@ else:
                     show_exclusions=show_hidden_region_shading,
                     show_event_labels=show_event_labels,
                     height=processed_h,
+                    smooth_sec=_sm_sec if _sm_on and _sm_sec > 0 else None,
                 )
             show(fig, kind)
 

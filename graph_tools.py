@@ -764,7 +764,14 @@ def render_workspace(results, roi, prepare_df, colors=None, max_points=12_000,
                       horizontal=True, key="ws_axis",
                       help="Clock time lines recordings up by time of day; elapsed by "
                            "time since each recording started.")
-    smooth_min = c[3].number_input("Running-mean window (min)", 0.5, 240.0, 30.0, 1.0, key="ws_smooth")
+    import signal_check as _sc
+    _dur = max(float(pd.to_numeric(r["df"]["time_sec"], errors="coerce").max()
+                     - pd.to_numeric(r["df"]["time_sec"], errors="coerce").min()) for r in results)
+    _on, _w, _why = _sc.recommend_smoothing(_dur)
+    smooth_min = c[3].number_input("Running-mean window (min)", 0.05, 240.0, float(round(_w / 60.0, 2)), 0.5,
+                                   key=f"ws_smooth_{_w:g}",
+                                   help="Used by the 'running mean' graph types. Recommended for these "
+                                        "recordings: " + _why + " " + _sc.SMOOTHING_HELP)
 
     o = st.columns([1.2, 1.2, 2])
     link = o[0].checkbox("Same time window in every graph", value=True, key="ws_link")

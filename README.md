@@ -35,6 +35,52 @@ allowed.
 
 ---
 
+## 9 November 2026: events, signal checks, raw traces in groups, sliding-mean guidance
+
+### Events (Group analysis → 📍 Events, and the sidebar event lines)
+Mark moments such as *Food in*, an injection or a stimulus, as **recording time** (`60`, `1:00`, `0:01:00`) or
+**clock time** (`8:25:30 PM`). One row can apply to every recording or to one. Events are dashed red lines in
+every group graph, can be used to line recordings up (**Line recordings up by → Time since an event**), are
+graded in *Event response & signal check*, and the AI can answer questions about them (`list_events`,
+`event_signal_check`). The sidebar event lines also accept clock times now; each recording places them on its
+own timeline.
+
+### Event response & signal check (new group view)
+Each recording is graded on how much its signal changes after the event (built for the AgRP signal check:
+fasted mice, food in the cage). Defaults: graded signal = raw **465 ÷ 405** (cancels bleaching and light-path
+changes), baseline −30 to −5 s, response +30 to +120 s, expected change = decrease.
+
+| Grade | Change | Meaning |
+|---|---|---|
+| Excellent | ≥ 25 % | large, unmistakable |
+| Very good | 15–25 % | clear |
+| Good | 10–15 % | passes the 10 % cut-off Deem et al. 2020 (*eLife*) used to accept AgRP mice |
+| OK | 5–10 % | below that cut-off; use with care |
+| Weak | 2–5 % | barely there |
+| No response | < 2 % or wrong way | likely miss / poor expression |
+
+A grade drops one step if the change is < 3× the baseline noise, or if 405 moves the **same** way as 465 by at
+least half as much (movement / light path). A small 405 **rise** with a 465 fall is expected for real calcium
+(405 nm is a few nm below GCaMP's isosbestic point). Also shown: deepest 10 s, time to half, 465 and 405
+changes, noise, a group test across recordings, and per-recording traces (overlay by grade, 465/405 grid, or
+mean ± SEM). Event times can be edited per recording. Code: `signal_check.py`; tests: `test_signal_check.py`.
+
+### Group analysis
+* Any signal: dF/F, z, **Raw 465 + 405** (both channels, 405 in green), **465 ÷ 405 ratio**, filtered/raw
+  channels. Raw channels default to **% change from baseline mean**.
+* When recordings started at different clock times, the view starts on **Time since recording start**.
+* Bins down to 0.5 s for short recordings; option to hide the mean where only a few animals still have data.
+
+### Sliding mean: on/off everywhere, with a recommended window
+A sliding mean shows slow trends and hides anything shorter than its window. Recommended: **off** for
+recordings under 30 min and for events lasting seconds; otherwise about 1/50 of the recording (1 h → 1 min,
+4 h → 5 min, 12 h → 15 min, ≥ 24 h → 30 min, the Douglass et al. 2024 window). The single-recording dF/F and
+z-score graphs, side-by-side graphs, feeding view and group view all start with this recommendation.
+
+### Clearer pipeline warnings
+A negative 405→465 fit slope is now explained as what it usually is in strong recordings (calcium falls, 405
+rises slightly), and a low fit R² no longer says "fine if the animal moved little".
+
 ## 7 November 2026: Group analysis, a sturdier and faster AI
 
 ### Group analysis (Display → Group analysis)
@@ -417,7 +463,8 @@ recording if it is present.
 | `fed3.py` | Reads FED3 controller output; intake, meals, event alignment, permutation test |
 | `fed_view.py` | The "Feeding (FED3)" view |
 | `ai_chat.py` | The "Ask the data" AI chat: data tools, free providers, answer check |
-| `group_view.py` | The "Group analysis" view |
+| `group_view.py` | The "Group analysis" view (events, signal check) |
+| `signal_check.py` | Event response grades and sliding-mean recommendation |
 | `group_analysis.py` | Group computations (alignment, normalisation, group statistics, FED averaging, meal patterns, group meal response) |
 | `interpret.py` | Fixed rules for how far a result can be trusted (405 control, fit R², n) |
 | `run_local.command` / `.bat` / `.sh` | Start the app on your own computer |
