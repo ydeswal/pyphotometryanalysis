@@ -64,7 +64,6 @@ import fed_view
 import ai_chat
 import group_view
 import signal_check as sc
-import plexon
 
 
 def _reload_changed_modules():
@@ -80,7 +79,7 @@ def _reload_changed_modules():
     """
     import importlib
     import os
-    order = ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret", "signal_check", "plexon", "fed_view",
+    order = ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret", "signal_check", "fed_view",
              "group_analysis", "group_view", "ai_chat")
     stamps = sys.__dict__.setdefault("_pp_module_mtimes", {})
     changed = False
@@ -1648,7 +1647,7 @@ def filter_events_for_context(events, recording_name, graph_kind, clock_start=No
     return filtered
 
 
-def render_zscore_display_controls(base_key, duration_sec=None, clock_start=None):
+def render_zscore_display_controls(base_key, duration_sec=None):
     """Z-score controls shown inside the z-score graph tab/focus window. The sliding
     mean starts on/off with the window recommended for this recording's length."""
     st.markdown("#### Z-score display settings")
@@ -1689,38 +1688,19 @@ def render_zscore_display_controls(base_key, duration_sec=None, clock_start=None
     with c6:
         z_show_dark = st.checkbox("Show dark-cycle shading", value=False, key=f"{base_key}_z_show_dark")
     with st.expander("Dark-cycle shading settings", expanded=False):
-        if clock_start is not None:
-            d1, d2 = st.columns(2)
-            off_t = d1.text_input("Lights off (dark starts)", "7:00 PM", key=f"{base_key}_z_dark_off_t",
-                                  help="Clock time, e.g. 7:00 PM, 6:30 pm or 19:00")
-            on_t = d2.text_input("Lights on (dark ends)", "7:00 AM", key=f"{base_key}_z_dark_on_t",
-                                 help="Clock time, e.g. 7:00 AM")
-            off_h, on_h = gt.parse_tod(off_t), gt.parse_tod(on_t)
-            if off_h is None or on_h is None or off_h == on_h:
-                st.error("Lights on/off not understood (use e.g. 7:00 PM and 7:00 AM); using 7:00 PM to 7:00 AM.")
-                off_h, on_h = 19.0, 7.0
-            cs_ = pd.Timestamp(clock_start)
-            tod0 = (cs_ - cs_.normalize()).total_seconds()
-            z_dark_start_sec = (off_h * 3600.0 - tod0) % 86400.0
-            z_dark_duration_sec = ((on_h - off_h) % 24) * 3600.0
-            z_cycle_sec = 86400.0
-            st.caption(f"Dark from {gt.fmt_tod(off_h)} to {gt.fmt_tod(on_h)} "
-                       f"({z_dark_duration_sec / 3600:g} h), every day.")
-        else:
-            st.caption("This recording has no clock time, so give the dark phase as time into the recording.")
-            d1, d2, d3 = st.columns(3)
-            with d1:
-                z_dark_start_hms = st.text_input("Dark phase start", value="12:00:00", key=f"{base_key}_z_dark_start_hms")
-            with d2:
-                z_dark_duration_hms = st.text_input("Dark phase duration", value="12:00:00", key=f"{base_key}_z_dark_duration_hms")
-            with d3:
-                z_cycle_hms = st.text_input("Cycle length", value="24:00:00", key=f"{base_key}_z_cycle_hms")
-            z_dark_start_sec, z_dark_start_err = parse_hms_to_seconds(z_dark_start_hms, 12 * 3600, "dark phase start")
-            z_dark_duration_sec, z_dark_duration_err = parse_hms_to_seconds(z_dark_duration_hms, 12 * 3600, "dark phase duration")
-            z_cycle_sec, z_cycle_err = parse_hms_to_seconds(z_cycle_hms, 24 * 3600, "cycle length")
-            for err in [z_dark_start_err, z_dark_duration_err, z_cycle_err]:
-                if err:
-                    st.error(err)
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            z_dark_start_hms = st.text_input("Dark phase start", value="12:00:00", key=f"{base_key}_z_dark_start_hms")
+        with d2:
+            z_dark_duration_hms = st.text_input("Dark phase duration", value="12:00:00", key=f"{base_key}_z_dark_duration_hms")
+        with d3:
+            z_cycle_hms = st.text_input("Cycle length", value="24:00:00", key=f"{base_key}_z_cycle_hms")
+        z_dark_start_sec, z_dark_start_err = parse_hms_to_seconds(z_dark_start_hms, 12 * 3600, "dark phase start")
+        z_dark_duration_sec, z_dark_duration_err = parse_hms_to_seconds(z_dark_duration_hms, 12 * 3600, "dark phase duration")
+        z_cycle_sec, z_cycle_err = parse_hms_to_seconds(z_cycle_hms, 24 * 3600, "cycle length")
+        for err in [z_dark_start_err, z_dark_duration_err, z_cycle_err]:
+            if err:
+                st.error(err)
     return {
         "source": z_source,
         "window_sec": z_window_sec,
@@ -1806,13 +1786,10 @@ def render_diagnostics(settings):
     slope_txt = f"{settings['fit_slope_used']:.3g}"
     if settings.get("fit_slope_clamped"):
         slope_txt += f" (raw {settings['fit_slope_unconstrained']:.3g})"
-    _ctl_nm = settings.get("plexon_control_nm") or "405"
-    _unit = "" if settings.get("input_type") == "plexon_csv" else " V"
-    c[1].metric(f"{_ctl_nm}→465 slope a", slope_txt)
+    c[1].metric("405→465 slope a", slope_txt)
     r2 = settings.get("fit_R2")
     c[2].metric("Fit R²", "n/a" if r2 is None or not np.isfinite(r2) else f"{r2:.3f}")
-    c[3].metric("F0 (median)", f"{settings.get('F0_median_volts', float('nan')):.4g}{_unit}",
-                help="Camera counts for Plexon files" if not _unit else None)
+    c[3].metric("F0 (median)", f"{settings.get('F0_median_volts', float('nan')):.4g} V")
     dur = settings.get("duration_sec")
     c[4].metric("Duration", seconds_to_hms(dur) if dur else "n/a")
     if start_local:
@@ -1933,8 +1910,7 @@ with st.sidebar:
             type=["ppd", "csv"],
             accept_multiple_files=True,
             key=f"uploader_{st.session_state['upload_gen']}",
-            help="pyPhotometry .ppd files, Plexon CSV exports (with their event CSVs), or other CSV files "
-                 "(processed directly, or shown as they are if already processed).",
+            help="PPD files are sent to ana.py. CSV files are either processed directly or displayed if already processed.",
         )
         if _new_files:
             if "stage_dir" not in st.session_state or not Path(st.session_state["stage_dir"]).exists():
@@ -1962,48 +1938,6 @@ with st.sidebar:
                 st.session_state["staged"] = {}
                 st.rerun()
         uploaded_files = [Path(v) for v in _staged.values()]
-
-        # ---- Plexon: ask, then pick fibre and wavelengths; pair event files with recordings
-        PLEXON_OPTS = None
-        _csv_kind = {p: plexon.sniff(p) for p in uploaded_files if p.suffix.lower() == ".csv"}
-        _plx = [p for p, k in _csv_kind.items() if k == "photometry"]
-        _evf = [p for p, k in _csv_kind.items() if k == "events"]
-        if _csv_kind:
-            _ans = st.radio("Are these Plexon files?", ["Yes", "No"], index=0 if _plx else 1, horizontal=True,
-                            key="plexon_answer",
-                            help="Plexon Multi-Wavelength Photometry System CSV exports (columns Frame, timestamp, "
-                                 "RawF_465_F1, RawF_410_F1 …) and their event lists (Event, Start Time, End Time).")
-            st.caption(f"Detected: {len(_plx)} Plexon photometry file(s), {len(_evf)} event file(s)"
-                       + (f", {len(_csv_kind) - len(_plx) - len(_evf)} other CSV file(s)"
-                          if len(_csv_kind) - len(_plx) - len(_evf) else "") + ".")
-            if _ans == "Yes":
-                if _plx:
-                    _ch = plexon.channels(plexon._cols(plexon.header_of(_plx[0], 1)[0]))
-                    _fib = list(_ch) or ["F1"]
-                    _c = st.columns(3)
-                    _fibre = _c[0].selectbox("Fibre", _fib, key="plx_fibre")
-                    _waves = _ch.get(_fibre, ["465", "410"])
-                    _sd, _cd = plexon.default_pair(_waves)
-                    _sig_nm = _c[1].selectbox("Signal nm", _waves, index=_waves.index(_sd), key="plx_sig")
-                    _ctl_nm = _c[2].selectbox("Control nm", _waves, index=_waves.index(_cd), key="plx_ctl")
-                    PLEXON_OPTS = {"fibre": _fibre, "signal": _sig_nm, "control": _ctl_nm}
-                elif not _evf:
-                    st.warning("None of the CSV files looks like a Plexon export (no RawF_<nm>_F<k> columns).")
-        _rec_stems = [p.stem for p in uploaded_files if p not in _evf]
-        _match = plexon.match_events([p.name for p in _evf], _rec_stems)
-        file_events = {}
-        for _p in _evf:
-            _r = _match.get(_p.name)
-            if _r:
-                try:
-                    file_events.setdefault(_r, []).extend(plexon.read_events(_p))
-                except Exception as _e:
-                    st.warning(f"Could not read events from {_p.name}: {_e}")
-        _unmatched = [p.name for p in _evf if not _match.get(p.name)]
-        if _unmatched:
-            st.warning("Event files with no recording of the same name: " + ", ".join(_unmatched))
-        st.session_state["file_events"] = file_events
-        EVENT_FILES = set(_evf)
 
         roi_typed = st.text_input("ROI name (optional)", value="", placeholder="e.g. ARC or BLA",
                                   help="Only a label for the brain region, used in column and file names. "
@@ -2406,31 +2340,6 @@ with st.sidebar:
                 "target_graphs": target_graphs,
             })
 
-    if file_events:
-        with st.expander("Events from event files", expanded=False):
-            _show_fe = st.checkbox("Show them on the graphs", True, key="show_file_events")
-            _labels = sorted({e["label"] for v in file_events.values() for e in v})
-            th.explain("What is this?",
-                       f"{sum(len(v) for v in file_events.values())} events ({', '.join(_labels)}) were read from "
-                       f"{len(file_events)} event file(s) and placed on the recording with the same name. Events "
-                       "with an end time are drawn as shaded periods. They also appear in Group analysis → Events, "
-                       "and the AI can use them.")
-        if _show_fe:
-            _lab_i = {l: i for i, l in enumerate(sorted({e["label"] for v in file_events.values() for e in v}))}
-            for _rec, _evs in file_events.items():
-                for _e in _evs:
-                    event_annotations.append({
-                        "clock_start_text": None, "clock_end_text": None, "name": _e["label"],
-                        "start_sec": float(_e["start"]),
-                        "end_sec": float(_e["end"]) if _e["end"] and _e["end"] - _e["start"] >= 1.0 else None,
-                        "start_hhmmss": seconds_to_hms(_e["start"]),
-                        "end_hhmmss": seconds_to_hms(_e["end"]) if _e["end"] else None,
-                        "color": plexon.colour_for(_e["label"], _lab_i[_e["label"]]),
-                        "alpha": 0.9, "shade_alpha": 0.15,
-                        "target_recordings": [_rec], "target_graphs": ["All graphs"],
-                        "from_file": True,
-                    })
-
     with st.expander("Manual y-scales", expanded=False):
         st.caption("Leave blank to use autoscale. Type as: min,max")
         manual_raw = st.text_input("Raw y-scale", value="")
@@ -2570,21 +2479,9 @@ if run_clicked:
 
                 # CSV files: process or display directly
                 for csv_path in csv_files:
-                    if csv_path in EVENT_FILES:
-                        continue
                     try:
                         df_in = pd.read_csv(csv_path)
                         _roi = roi_name if roi_typed else detect_roi(df_in, roi_name)
-                        if PLEXON_OPTS and plexon.looks_like_photometry(df_in.columns):
-                            _two, _pinfo = plexon.to_two_channel(df_in, _roi, PLEXON_OPTS["fibre"],
-                                                                 PLEXON_OPTS["signal"], PLEXON_OPTS["control"])
-                            df_out, settings = process_raw_csv_dataframe(_two, _roi, settings=PROC_SETTINGS)
-                            for _k in [c for c in _two.columns if c.startswith("plexon_R_")]:
-                                df_out[_k] = _two[_k].to_numpy()[: len(df_out)]
-                            settings.update(_pinfo)
-                            settings["notes"] = plexon.notes_for(_pinfo) + list(settings.get("notes") or [])
-                            all_results.append({"name": csv_path.stem, "df": df_out, "settings": settings})
-                            continue
                         if processed_columns_exist(df_in, _roi):
                             df_out, settings = load_processed_csv_dataframe(df_in, _roi)
                         else:
@@ -2926,7 +2823,7 @@ else:
                     height=raw_h,
                 )
             elif kind == "Z-score sliding mean":
-                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zslide", _dur, rec_clock)
+                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zslide", _dur)
                 fig = make_zscore_sliding_mean_figure(
                     view_df,
                     roi_name,
@@ -2947,7 +2844,7 @@ else:
                     cycle_sec=zcfg["cycle_sec"],
                 )
             elif kind == "Z-score range analysis":
-                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zrange", _dur, rec_clock)
+                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zrange", _dur)
                 zrange_cfg = render_zscore_range_controls(f"{safe_name(result['name'])}_{idx}")
                 fig, z_stats_df = make_zscore_range_analysis_figure(
                     view_df,

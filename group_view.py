@@ -616,16 +616,6 @@ def _events_editor(names, clock_starts):
                             })
         ss["grp_events_cur"] = ed
         ev, bad = resolve_events(ed, list(names), clock_starts)
-        fe = ss.get("file_events") or {}
-        if fe and ss.get("show_file_events", True):
-            n_fe = 0
-            for r in names:
-                for e in fe.get(r, []):
-                    ev[r].append((float(e["start"]), str(e["label"])))
-                    n_fe += 1
-                ev[r].sort()
-            if n_fe:
-                st.caption(f"Also included: {n_fe} events from event files (sidebar → Events from event files).")
         for b in bad:
             st.markdown(f'<div class="pp-note warn">Event {b}</div>', unsafe_allow_html=True)
         if any(ev.values()):
@@ -762,8 +752,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     cs_known = [v for v in clock_starts.values() if v is not None]
     spread = (max(cs_known) - min(cs_known)).total_seconds() if len(cs_known) >= 2 else 0.0
     med_dur = float(np.median(durations)) if durations else 0.0
-    no_clock = [n for n, v in clock_starts.items() if v is None]
-    starts_differ = spread > max(60.0, 0.05 * med_dur) or bool(no_clock)
+    starts_differ = spread > max(60.0, 0.05 * med_dur)
     c = st.columns([1.5, 1.3, 1.6, 1.2])
     alignment = c[0].selectbox("Line recordings up by", ga.ALIGNMENTS, index=2 if starts_differ else 0,
                                key="grp_align",
@@ -792,11 +781,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         else:
             ev_label = st.selectbox("Event to line up on (0 = its first occurrence in each recording)", ev_labels,
                                     key="grp_align_event")
-    if no_clock and alignment.startswith(("Clock", "Time of day")):
-        st.markdown(f'<div class="pp-note warn">{len(no_clock)} recording(s) have no clock time (e.g. Plexon '
-                    f'files), so they cannot be placed by clock time or time of day. Choose <b>Time since '
-                    f'recording start</b> or <b>Time since an event</b>.</div>', unsafe_allow_html=True)
-    elif starts_differ and alignment.startswith("Clock"):
+    if starts_differ and alignment.startswith("Clock"):
         th.explain("Why don't the recordings overlap?",
                    f"These recordings started at different clock times ({gt.fmt12(min(cs_known), 0, date=False)} "
                    f"to {gt.fmt12(max(cs_known), 0, date=False)}), so on a clock axis they sit side by side. "
@@ -819,13 +804,8 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             gap, minp = MEAL_PRESETS[preset]
             d[3].caption(f"Meals: pellets less than {gap:g} s apart, at least {minp} pellet(s).")
         e = st.columns(4)
-        _on_t = e[0].text_input("Lights on", "7:00 AM", key="grp_on_t", help="e.g. 7:00 AM, 6:30 am or 07:00")
-        _off_t = e[1].text_input("Lights off (dark starts)", "7:00 PM", key="grp_off_t",
-                                 help="e.g. 7:00 PM, 6:30 pm or 19:00")
-        lights_on, lights_off = gt.parse_tod(_on_t), gt.parse_tod(_off_t)
-        if lights_on is None or lights_off is None:
-            e[0].warning("Times not understood; using 7:00 AM and 7:00 PM.")
-            lights_on, lights_off = 7.0, 19.0
+        lights_on = e[0].number_input("Lights on (hour, 0-23)", 0, 23, 7, 1, key="grp_on")
+        lights_off = e[1].number_input("Lights off (hour)", 0, 23, 19, 1, key="grp_off")
         shade = e[2].checkbox("Shade the dark phase", True, key="grp_shade")
         dflt_base = 30.0 if span_guess >= 2 * 3600 else 0.5
         base_min = e[3].number_input("Baseline period (min)", 0.1, 600.0, dflt_base, 0.1,
@@ -1180,7 +1160,7 @@ def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, 
         return
     c = st.columns([1.2, 1.7, 1.5, 1.0, 1.0])
     label = c[0].selectbox("Event", ev_labels, key="sc_event")
-    direction = c[1].selectbox("Expected change", sc.DIRECTIONS, index=2, key="sc_dir",
+    direction = c[1].selectbox("Expected change", sc.DIRECTIONS, key="sc_dir",
                                help="AgRP neurons fall when food appears; most other responses rise.")
     signal = c[2].selectbox("Signal graded", sc.SIGNALS, key="sc_signal",
                             help="465 ÷ 405 of the raw channels (default) cancels bleaching and light-path changes "
