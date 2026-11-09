@@ -1,5 +1,5 @@
-# Update of 9 November 2026 (v8)
+# Update of 9 November 2026 (v9)
 
-Copy every file in this folder into your clone of `ydeswal/pyphotometryanalysis`, replacing the old ones, then
-commit and push. `signal_check.py` and `test_signal_check.py` are new (if you already copied v7, they are updated).
-Streamlit Cloud redeploys on its own. What changed: README.md, top two sections.
+Copy every file in this folder into your clone of `ydeswal/pyphotometryanalysis`, replacing the old ones,
+then commit and push. New files: `plexon.py`, `test_plexon.py` (and `signal_check.py`, `test_signal_check.py`
+if you did not copy v7/v8). Includes everything from v7 and v8. Details: README.md, top sections.

@@ -35,6 +35,25 @@ allowed.
 
 ---
 
+## 9 November 2026 (c): Plexon files, graphs in AI answers, AM/PM dark cycle
+
+* **Plexon (PMPS) CSV exports.** When CSV files are uploaded the app asks **"Are these Plexon files?"** (it guesses
+  from the columns). For Plexon files you pick the fibre, the signal wavelength (465 nm) and the control
+  (410 nm); the raw fluorescence goes through the same pipeline as pyPhotometry data, and Plexon's own ΔF/F is
+  kept as `plexon_R_<nm>`. Event files (`Event, Start Time (s), End Time (s)`) are paired with the recording of
+  the same name (`8786N-events.csv`, `8781R=events.csv`, `8784Revents.csv` all work), drawn on the graphs (bouts
+  with an end time are shaded), added to Group analysis → Events, and given to the AI. Plexon files have no
+  clock time, so group graphs start on *Time since recording start*. Code: `plexon.py`, tests: `test_plexon.py`.
+* **AI answers with graphs.** The AI can ask the app to draw a graph (`show_graph`: a signal window, raw
+  465/405, each recording around an event, signal-check grades, cumulative intake). The app draws it from the
+  data, never from numbers the AI wrote. When the AI does not ask for one, the app adds the graph matching
+  the main data it used.
+* **Shorter data check.** Under each answer: one line ("Data check: Uncertain") with the full reasons behind a
+  *Details* button. The chat area has its own soft grey background; your questions are tinted blue.
+* **Dark cycle in AM/PM.** Lights on / lights off are typed as clock times (`7:00 PM`, `6:30 am`, `19:00`) in
+  the group view and in the z-score dark-cycle shading.
+* Signal check: *Expected change* now defaults to *Either direction* (choose *Decrease* for AgRP food tests).
+
 ## 9 November 2026 (b): cleaner pages, explanations on request, signal check checked on a 2nd cohort
 
 * **Explanations only when you ask.** Notes that used to sit on the page are now small buttons (*About this view*,
@@ -482,6 +501,7 @@ recording if it is present.
 | `ai_chat.py` | The "Ask the data" AI chat: data tools, free providers, answer check |
 | `group_view.py` | The "Group analysis" view (events, signal check) |
 | `signal_check.py` | Event response grades and sliding-mean recommendation |
+| `plexon.py` | Plexon PMPS CSV and event-file import |
 | `group_analysis.py` | Group computations (alignment, normalisation, group statistics, FED averaging, meal patterns, group meal response) |
 | `interpret.py` | Fixed rules for how far a result can be trusted (405 control, fit R², n) |
 | `run_local.command` / `.bat` / `.sh` | Start the app on your own computer |

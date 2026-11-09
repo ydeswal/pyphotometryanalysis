@@ -143,6 +143,34 @@ def iso_to_12h(values, with_date="md"):
     return out
 
 
+def parse_tod(text):
+    """'7:00 PM', '7pm', '19:00', '7:30 am', '19' -> hours after midnight (float), or None."""
+    import re
+    t = str(text or "").strip().lower().replace(".", "")
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?\s*(am|pm|a|p)?", t)
+    if not m:
+        return None
+    h, mi, se, ap = int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0), m.group(4)
+    if mi > 59 or se > 59:
+        return None
+    if ap:
+        if not 1 <= h <= 12:
+            return None
+        h = h % 12 + (12 if ap.startswith("p") else 0)
+    elif h > 24:
+        return None
+    return (h % 24) + mi / 60 + se / 3600
+
+
+def fmt_tod(hours):
+    """19.5 -> '7:30 PM'."""
+    h = float(hours) % 24
+    hh, mm = int(h), int(round((h - int(h)) * 60))
+    if mm == 60:
+        hh, mm = (hh + 1) % 24, 0
+    return f"{hh % 12 or 12}:{mm:02d} {'AM' if hh < 12 else 'PM'}"
+
+
 def clock_start_of(df, settings=None):
     """Wall-clock time of time_sec = 0 for a processed DataFrame, or None."""
     if df is not None and "clock_time" in df.columns and len(df):
