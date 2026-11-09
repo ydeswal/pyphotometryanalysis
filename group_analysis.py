@@ -37,9 +37,10 @@ import fed3
 import interpret
 
 ALIGNMENTS = ["Clock time (same moment)", "Time of day (overlay days)", "Time since recording start",
-              "Time since first pellet"]
+              "Time since first pellet", "Time since an event"]
 NORMS = ["z-score (whole recording)", "Robust z (median / MAD)", "z-score to a baseline period",
-         "Subtract baseline mean", "As recorded", "Scale 0–1 (1st–99th percentile)"]
+         "Subtract baseline mean", "% change from baseline mean", "As recorded",
+         "Scale 0–1 (1st–99th percentile)"]
 STATS = ["Mean ± SEM", "Mean ± 95% CI (bootstrap)", "Median & IQR", "Mean ± SD"]
 FED_MODES = ["Pellets per bin", "Cumulative intake (g)", "Cumulative, % of own total", "Animals eating (%)",
              "Eating rate (pellets/h, rolling)"]
@@ -52,6 +53,9 @@ METHOD_NOTES = {
                                "transients or artefacts do not inflate the SD. Good default for 12-48 h recordings.",
     "z-score to a baseline period": "Mean and SD taken from a baseline period only (first minutes of each recording, "
                                     "or before the first pellet). Shows change from that state.",
+    "% change from baseline mean": "Each recording divided by its own baseline mean: 100 × (F − F_baseline) / "
+                                   "F_baseline. The usual way to compare RAW channels (465, 405, 465 ÷ 405) between "
+                                   "animals, because raw volts depend on LED power and fibre. Not for z-scores.",
     "Subtract baseline mean": "Keeps the original units (e.g. dF/F %) and removes each recording's baseline offset.",
     "As recorded": "No normalisation. Only meaningful for dF/F; raw volts differ between animals and set-ups.",
     "Scale 0–1 (1st–99th percentile)": "Each recording mapped to its own range. Useful to compare the timing of "
@@ -89,7 +93,8 @@ def make_member(name, animal, group, t, y, clock_start, fed=None, sessions=None,
     """
     m = {"name": str(name), "animal": animal, "group": str(group or "All"), "t": None, "y": None,
          "cs": pd.Timestamp(clock_start) if clock_start is not None else None, "pellets": np.array([]),
-         "cov": [], "fit_r2": fit_r2, "control": control, "grams": float(pellet_grams)}
+         "cov": [], "fit_r2": fit_r2, "control": control, "grams": float(pellet_grams), "events": [],
+         "event_t": None}
     if t is not None:
         t = np.asarray(t, float)
         y = np.asarray(y, float)
@@ -130,6 +135,8 @@ def align_offset(m, alignment, ref_clock=None):
         a, b = window_of(m)
         p = m["pellets"][(m["pellets"] >= a) & (m["pellets"] <= b)]
         return -float(p[0]) if p.size else None
+    if alignment.startswith("Time since an event"):
+        return -float(m["event_t"]) if m.get("event_t") is not None else None
     raise ValueError(alignment)
 
 
@@ -168,14 +175,17 @@ def normalise(t, y, method, baseline_mask=None):
         return (y - np.mean(y[b])) / sd if sd > 0 else y - np.mean(y[b])
     if method.startswith("Subtract baseline"):
         return y - np.mean(y[b])
+    if method.startswith("% change"):
+        mb = np.mean(y[b])
+        return (y / mb - 1.0) * 100.0 if mb != 0 else np.full_like(y, np.nan)
     raise ValueError(method)
 
 
 def baseline_mask(m, alignment, minutes):
     """Baseline samples: the first `minutes` of the recording, or the
-    `minutes` before the first pellet when aligning to the first pellet."""
+    `minutes` before the first pellet / the event when aligning to it."""
     t = m["t"]
-    if alignment.startswith("Time since first pellet"):
+    if alignment.startswith(("Time since first pellet", "Time since an event")):
         off = align_offset(m, alignment)
         if off is None:
             return np.zeros(t.size, bool)

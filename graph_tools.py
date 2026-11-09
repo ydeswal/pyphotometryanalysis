@@ -143,6 +143,34 @@ def iso_to_12h(values, with_date="md"):
     return out
 
 
+def parse_tod(text):
+    """'7:00 PM', '7pm', '19:00', '7:30 am', '19' -> hours after midnight (float), or None."""
+    import re
+    t = str(text or "").strip().lower().replace(".", "")
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?\s*(am|pm|a|p)?", t)
+    if not m:
+        return None
+    h, mi, se, ap = int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0), m.group(4)
+    if mi > 59 or se > 59:
+        return None
+    if ap:
+        if not 1 <= h <= 12:
+            return None
+        h = h % 12 + (12 if ap.startswith("p") else 0)
+    elif h > 24:
+        return None
+    return (h % 24) + mi / 60 + se / 3600
+
+
+def fmt_tod(hours):
+    """19.5 -> '7:30 PM'."""
+    h = float(hours) % 24
+    hh, mm = int(h), int(round((h - int(h)) * 60))
+    if mm == 60:
+        hh, mm = (hh + 1) % 24, 0
+    return f"{hh % 12 or 12}:{mm:02d} {'AM' if hh < 12 else 'PM'}"
+
+
 def clock_start_of(df, settings=None):
     """Wall-clock time of time_sec = 0 for a processed DataFrame, or None."""
     if df is not None and "clock_time" in df.columns and len(df):
@@ -764,7 +792,14 @@ def render_workspace(results, roi, prepare_df, colors=None, max_points=12_000,
                       horizontal=True, key="ws_axis",
                       help="Clock time lines recordings up by time of day; elapsed by "
                            "time since each recording started.")
-    smooth_min = c[3].number_input("Running-mean window (min)", 0.5, 240.0, 30.0, 1.0, key="ws_smooth")
+    import signal_check as _sc
+    _dur = max(float(pd.to_numeric(r["df"]["time_sec"], errors="coerce").max()
+                     - pd.to_numeric(r["df"]["time_sec"], errors="coerce").min()) for r in results)
+    _on, _w, _why = _sc.recommend_smoothing(_dur)
+    smooth_min = c[3].number_input("Running-mean window (min)", 0.05, 240.0, float(round(_w / 60.0, 2)), 0.5,
+                                   key=f"ws_smooth_{_w:g}",
+                                   help="Used by the 'running mean' graph types. Recommended for these "
+                                        "recordings: " + _why + " " + _sc.SMOOTHING_HELP)
 
     o = st.columns([1.2, 1.2, 2])
     link = o[0].checkbox("Same time window in every graph", value=True, key="ws_link")

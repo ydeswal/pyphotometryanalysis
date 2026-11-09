@@ -63,6 +63,8 @@ import fed3
 import fed_view
 import ai_chat
 import group_view
+import signal_check as sc
+import plexon
 
 
 def _reload_changed_modules():
@@ -78,7 +80,7 @@ def _reload_changed_modules():
     """
     import importlib
     import os
-    order = ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret", "fed_view",
+    order = ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret", "signal_check", "plexon", "fed_view",
              "group_analysis", "group_view", "ai_chat")
     stamps = sys.__dict__.setdefault("_pp_module_mtimes", {})
     changed = False
@@ -122,7 +124,6 @@ th.page_header(
     "Fiber Photometry Analysis",
     "pyPhotometry .ppd / .csv  \u00b7  motion correction, dF/F, z-score, feeding and licking on one clock",
     mark="FP",
-    tags=("Photometry", "FED3", "Lickometer", "AI chat"),
 )
 
 # =============================================================================
@@ -447,6 +448,22 @@ def filtered_signal_column(df, roi):
         if c in df.columns:
             return c
     return None
+
+
+ROI_FALLBACK = "ROI"
+
+
+def detect_roi(df, wanted):
+    """The ROI prefix a processed table really uses ('BLA_dFF' -> 'BLA'); `wanted` if present."""
+    cols = list(getattr(df, "columns", []))
+    if any(str(c).startswith(f"{wanted}_") for c in cols):
+        return wanted
+    for suffix in ("_sig_raw", "_dFF", "_z_dFF", "_uv_raw"):
+        hit = next((str(c)[: -len(suffix)] for c in cols if str(c).endswith(suffix)
+                    and not str(c).endswith("_z" + suffix)), None)
+        if hit:
+            return hit
+    return wanted
 
 
 def processed_columns_exist(df, roi):
@@ -1127,12 +1144,20 @@ def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=No
     return finish_fig(fig, height=height, df=df)
 
 
-def make_main_dff_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=620):
-    """The only dFF graph in the app."""
+def make_main_dff_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=620,
+                         smooth_sec=None):
+    """The only dFF graph in the app. smooth_sec: add a centred sliding mean of that width."""
     fig = make_subplots(rows=1, cols=1, subplot_titles=("dF/F0 = (465 - fitted 405) / F0",))
     x = df["time_sec"]
     if f"{roi}_dFF" in df.columns:
-        fig.add_trace(go.Scatter(x=x, y=df[dff_percent_column(df, roi)], mode="lines", name="dF/F0 (%)", line=dict(color=graph_color("dff"))), row=1, col=1)
+        y = df[dff_percent_column(df, roi)]
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="dF/F0 (%)", line=dict(color=graph_color("dff")),
+                                 opacity=0.55 if smooth_sec else 1.0), row=1, col=1)
+        if smooth_sec:
+            sm = sliding_window_mean_by_time(x.to_numpy(float), pd.to_numeric(y, errors="coerce").to_numpy(float),
+                                             window_sec=float(smooth_sec), centered=True)
+            fig.add_trace(go.Scatter(x=x, y=sm, mode="lines", name=f"Sliding mean ({seconds_to_hms(smooth_sec)})",
+                                     line=dict(color=graph_color("z_smooth"), width=2.4)), row=1, col=1)
     fig.update_yaxes(title_text="dF/F0 (%)", row=1, col=1)
     apply_hms_xaxis(fig, df, rows=[1])
     if limits:
@@ -1589,10 +1614,26 @@ def make_zscore_range_analysis_figure(
     return finish_fig(fig, height=height, df=df), stats_df
 
 
-def filter_events_for_context(events, recording_name, graph_kind):
+def resolve_event_clock(ev, clock_start):
+    """An event entered as clock time -> the same event in this recording's seconds (or None)."""
+    if not ev.get("clock_start_text"):
+        return ev
+    st_ = group_view.parse_clock_time(ev["clock_start_text"], clock_start)
+    if st_ is None:
+        return None
+    out = dict(ev, start_sec=float(st_), start_hhmmss=seconds_to_hms(max(st_, 0)))
+    if ev.get("clock_end_text"):
+        en = group_view.parse_clock_time(ev["clock_end_text"], clock_start)
+        out["end_sec"] = float(en) if en is not None and en > st_ else None
+        out["end_hhmmss"] = seconds_to_hms(en) if out["end_sec"] is not None else None
+    return out
+
+
+def filter_events_for_context(events, recording_name, graph_kind, clock_start=None):
     """
     Filter event annotations so events can be applied only to selected recordings
-    and/or selected graph tabs.
+    and/or selected graph tabs. Events given as clock time are converted to this
+    recording's own time (needs its clock start).
     """
     filtered = []
     for ev in events or []:
@@ -1601,13 +1642,17 @@ def filter_events_for_context(events, recording_name, graph_kind):
         recording_ok = (not target_recordings or "All recordings" in target_recordings or recording_name in target_recordings)
         graph_ok = (not target_graphs or "All graphs" in target_graphs or graph_kind in target_graphs)
         if recording_ok and graph_ok:
-            filtered.append(ev)
+            ev = resolve_event_clock(ev, clock_start)
+            if ev is not None:
+                filtered.append(ev)
     return filtered
 
 
-def render_zscore_display_controls(base_key):
-    """Z-score controls shown inside the z-score graph tab/focus window."""
+def render_zscore_display_controls(base_key, duration_sec=None, clock_start=None):
+    """Z-score controls shown inside the z-score graph tab/focus window. The sliding
+    mean starts on/off with the window recommended for this recording's length."""
     st.markdown("#### Z-score display settings")
+    rec_on, rec_w, rec_why = sc.recommend_smoothing(duration_sec or 0)
     c1, c2, c3 = st.columns([1.2, 1.0, 1.0])
     with c1:
         z_source = st.selectbox(
@@ -1620,9 +1665,9 @@ def render_zscore_display_controls(base_key):
     with c2:
         z_window_hms = st.text_input(
             "Sliding mean window",
-            value="00:30:00",
+            value=seconds_to_hms(rec_w),
             key=f"{base_key}_z_window_hms",
-            help="Use HH:MM:SS, for example 00:10:00, 00:30:00, or 01:00:00.",
+            help="Use HH:MM:SS, for example 00:00:10, 00:10:00 or 00:30:00. " + sc.SMOOTHING_HELP,
         )
     with c3:
         z_centered_mean = st.checkbox(
@@ -1631,30 +1676,51 @@ def render_zscore_display_controls(base_key):
             key=f"{base_key}_z_centered_mean",
             help="Centered smoothing avoids shifting peaks left/right. Turn off for a trailing running mean.",
         )
-    z_window_sec, z_window_err = parse_hms_to_seconds(z_window_hms, 30 * 60, "sliding mean window")
+    z_window_sec, z_window_err = parse_hms_to_seconds(z_window_hms, rec_w, "sliding mean window")
     if z_window_err:
         st.error(z_window_err)
+    st.caption("Recommended for this recording: " + rec_why)
     c4, c5, c6 = st.columns(3)
     with c4:
         z_show_raw = st.checkbox("Show raw z-score trace", value=True, key=f"{base_key}_z_show_raw")
     with c5:
-        z_show_smooth = st.checkbox("Show sliding mean trace", value=True, key=f"{base_key}_z_show_smooth")
+        z_show_smooth = st.toggle("Sliding mean", value=rec_on, key=f"{base_key}_z_show_smooth",
+                                  help=sc.SMOOTHING_HELP)
     with c6:
         z_show_dark = st.checkbox("Show dark-cycle shading", value=False, key=f"{base_key}_z_show_dark")
     with st.expander("Dark-cycle shading settings", expanded=False):
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            z_dark_start_hms = st.text_input("Dark phase start", value="12:00:00", key=f"{base_key}_z_dark_start_hms")
-        with d2:
-            z_dark_duration_hms = st.text_input("Dark phase duration", value="12:00:00", key=f"{base_key}_z_dark_duration_hms")
-        with d3:
-            z_cycle_hms = st.text_input("Cycle length", value="24:00:00", key=f"{base_key}_z_cycle_hms")
-        z_dark_start_sec, z_dark_start_err = parse_hms_to_seconds(z_dark_start_hms, 12 * 3600, "dark phase start")
-        z_dark_duration_sec, z_dark_duration_err = parse_hms_to_seconds(z_dark_duration_hms, 12 * 3600, "dark phase duration")
-        z_cycle_sec, z_cycle_err = parse_hms_to_seconds(z_cycle_hms, 24 * 3600, "cycle length")
-        for err in [z_dark_start_err, z_dark_duration_err, z_cycle_err]:
-            if err:
-                st.error(err)
+        if clock_start is not None:
+            d1, d2 = st.columns(2)
+            off_t = d1.text_input("Lights off (dark starts)", "7:00 PM", key=f"{base_key}_z_dark_off_t",
+                                  help="Clock time, e.g. 7:00 PM, 6:30 pm or 19:00")
+            on_t = d2.text_input("Lights on (dark ends)", "7:00 AM", key=f"{base_key}_z_dark_on_t",
+                                 help="Clock time, e.g. 7:00 AM")
+            off_h, on_h = gt.parse_tod(off_t), gt.parse_tod(on_t)
+            if off_h is None or on_h is None or off_h == on_h:
+                st.error("Lights on/off not understood (use e.g. 7:00 PM and 7:00 AM); using 7:00 PM to 7:00 AM.")
+                off_h, on_h = 19.0, 7.0
+            cs_ = pd.Timestamp(clock_start)
+            tod0 = (cs_ - cs_.normalize()).total_seconds()
+            z_dark_start_sec = (off_h * 3600.0 - tod0) % 86400.0
+            z_dark_duration_sec = ((on_h - off_h) % 24) * 3600.0
+            z_cycle_sec = 86400.0
+            st.caption(f"Dark from {gt.fmt_tod(off_h)} to {gt.fmt_tod(on_h)} "
+                       f"({z_dark_duration_sec / 3600:g} h), every day.")
+        else:
+            st.caption("This recording has no clock time, so give the dark phase as time into the recording.")
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                z_dark_start_hms = st.text_input("Dark phase start", value="12:00:00", key=f"{base_key}_z_dark_start_hms")
+            with d2:
+                z_dark_duration_hms = st.text_input("Dark phase duration", value="12:00:00", key=f"{base_key}_z_dark_duration_hms")
+            with d3:
+                z_cycle_hms = st.text_input("Cycle length", value="24:00:00", key=f"{base_key}_z_cycle_hms")
+            z_dark_start_sec, z_dark_start_err = parse_hms_to_seconds(z_dark_start_hms, 12 * 3600, "dark phase start")
+            z_dark_duration_sec, z_dark_duration_err = parse_hms_to_seconds(z_dark_duration_hms, 12 * 3600, "dark phase duration")
+            z_cycle_sec, z_cycle_err = parse_hms_to_seconds(z_cycle_hms, 24 * 3600, "cycle length")
+            for err in [z_dark_start_err, z_dark_duration_err, z_cycle_err]:
+                if err:
+                    st.error(err)
     return {
         "source": z_source,
         "window_sec": z_window_sec,
@@ -1740,10 +1806,13 @@ def render_diagnostics(settings):
     slope_txt = f"{settings['fit_slope_used']:.3g}"
     if settings.get("fit_slope_clamped"):
         slope_txt += f" (raw {settings['fit_slope_unconstrained']:.3g})"
-    c[1].metric("405→465 slope a", slope_txt)
+    _ctl_nm = settings.get("plexon_control_nm") or "405"
+    _unit = "" if settings.get("input_type") == "plexon_csv" else " V"
+    c[1].metric(f"{_ctl_nm}→465 slope a", slope_txt)
     r2 = settings.get("fit_R2")
     c[2].metric("Fit R²", "n/a" if r2 is None or not np.isfinite(r2) else f"{r2:.3f}")
-    c[3].metric("F0 (median)", f"{settings.get('F0_median_volts', float('nan')):.4g} V")
+    c[3].metric("F0 (median)", f"{settings.get('F0_median_volts', float('nan')):.4g}{_unit}",
+                help="Camera counts for Plexon files" if not _unit else None)
     dur = settings.get("duration_sec")
     c[4].metric("Duration", seconds_to_hms(dur) if dur else "n/a")
     if start_local:
@@ -1756,29 +1825,64 @@ def render_diagnostics(settings):
                 end_sec = min(end_sec, float(settings["crop_end_sec_original_timeline"]))
             st_ts = start0 + pd.Timedelta(seconds=offset)
             end_ts = start0 + pd.Timedelta(seconds=end_sec)
-            src = ("PC clock (per-sample timestamps, " +
-                   ("sample-clock time axis" if settings.get("time_axis", "sample") == "sample"
-                    else "PC-timestamp time axis") + ")"
-                   if settings.get("pc_timestamps") else "header start time + sample clock")
-            gaps = (settings.get("clock_check") or {}).get("gaps") or []
             st.caption(
-                f"🕒 **{st_ts:%a %Y-%m-%d} {gt.fmt12(st_ts, 0, date=False)}** → "
+                f"**{st_ts:%a %Y-%m-%d} {gt.fmt12(st_ts, 0, date=False)}** → "
                 f"**{end_ts:%a %Y-%m-%d} {gt.fmt12(end_ts, 0, date=False)}** "
-                f"local time{' (cropped window)' if offset else ''} · {src}"
-                + (f" · {len(gaps)} gap(s) with lost samples" if gaps else " · no lost samples"
-                   if settings.get("pc_timestamps") else "")
-                + ". Hover any trace for its clock time; the CSV has a "
-                "`clock_time` column" + (" and `clock_unix`" if settings.get("start_clock_unix")
-                                         else "") + ".")
+                f"local time{' (cropped window)' if offset else ''}")
         except Exception:
             pass
-    for w in settings.get("warnings", []) or []:
-        th.note(w, kind="warn")
-    notes = settings.get("notes", []) or []
-    if notes:
-        with st.expander("Processing notes"):
-            for n_ in notes:
-                st.write("- " + n_)
+
+
+def _note_items(settings):
+    """Warnings and processing notes of one recording, plus clock facts that used to sit under the times."""
+    s = settings or {}
+    items = [("warning", w) for w in (s.get("warnings") or [])]
+    if s.get("start_clock_local"):
+        src = ("PC clock (per-sample timestamps, " +
+               ("sample-clock time axis" if s.get("time_axis", "sample") == "sample" else "PC-timestamp time axis")
+               + ")" if s.get("pc_timestamps") else "header start time + sample clock")
+        gaps = (s.get("clock_check") or {}).get("gaps") or []
+        items.append(("warning" if gaps else "note",
+                      f"Clock source: {src}. " + (f"{len(gaps)} gap(s) with lost samples." if gaps else
+                                                  "No lost samples." if s.get("pc_timestamps") else "")
+                      + " Hover any trace for its clock time; the CSV has a `clock_time` column."))
+    items += [("note", n_) for n_ in (s.get("notes") or [])]
+    return items
+
+
+def render_shared_notes(results):
+    """Every warning and processing note once, grouped across recordings, behind one click."""
+    import re as _re
+    groups = {}
+    num = r"[-+−]?\d[\d.,:]*"
+    for r in results:
+        for kind, text in _note_items(r.get("settings")):
+            key = (kind, _re.sub(num, "#", str(text)))
+            g = groups.setdefault(key, {"texts": [], "recs": []})
+            g["texts"].append(str(text))
+            g["recs"].append(str(r["name"]))
+    if not groups:
+        return
+
+    def merged(texts):
+        """One text; numbers that differ between recordings become '…' (each recording's own values are in its
+        header and its Settings tab)."""
+        parts = [_re.split(f"({num})", t) for t in texts]
+        out = []
+        for i, piece in enumerate(parts[0]):
+            if i % 2 == 1 and any(len(p_) <= i or p_[i] != piece for p_ in parts[1:]):
+                out.append("…")
+            else:
+                out.append(piece)
+        return "".join(out)
+    n_warn = sum(1 for (k, _) in groups if k == "warning")
+    label = f"Processing notes ({n_warn} warning{'s' if n_warn != 1 else ''})" if n_warn else "Processing notes"
+    with st.expander(label, expanded=False):
+        n = len(results)
+        for (kind, _), g in sorted(groups.items(), key=lambda kv: kv[0][0] != "warning"):
+            who = (f"all {n} recordings" if len(g["recs"]) == n and n > 1 else ", ".join(g["recs"]))
+            th.note(merged(g["texts"]) + f"<br><span style='opacity:.75'>Applies to: {who}</span>",
+                    kind="warn" if kind == "warning" else "")
 
 
 METHODS_DOC = Path(__file__).with_name("METHODS_EXPLAINED.md")
@@ -1829,7 +1933,8 @@ with st.sidebar:
             type=["ppd", "csv"],
             accept_multiple_files=True,
             key=f"uploader_{st.session_state['upload_gen']}",
-            help="PPD files are sent to ana.py. CSV files are either processed directly or displayed if already processed.",
+            help="pyPhotometry .ppd files, Plexon CSV exports (with their event CSVs), or other CSV files "
+                 "(processed directly, or shown as they are if already processed).",
         )
         if _new_files:
             if "stage_dir" not in st.session_state or not Path(st.session_state["stage_dir"]).exists():
@@ -1858,7 +1963,52 @@ with st.sidebar:
                 st.rerun()
         uploaded_files = [Path(v) for v in _staged.values()]
 
-        roi_name = st.text_input("ROI name", value="BLA")
+        # ---- Plexon: ask, then pick fibre and wavelengths; pair event files with recordings
+        PLEXON_OPTS = None
+        _csv_kind = {p: plexon.sniff(p) for p in uploaded_files if p.suffix.lower() == ".csv"}
+        _plx = [p for p, k in _csv_kind.items() if k == "photometry"]
+        _evf = [p for p, k in _csv_kind.items() if k == "events"]
+        if _csv_kind:
+            _ans = st.radio("Are these Plexon files?", ["Yes", "No"], index=0 if _plx else 1, horizontal=True,
+                            key="plexon_answer",
+                            help="Plexon Multi-Wavelength Photometry System CSV exports (columns Frame, timestamp, "
+                                 "RawF_465_F1, RawF_410_F1 …) and their event lists (Event, Start Time, End Time).")
+            st.caption(f"Detected: {len(_plx)} Plexon photometry file(s), {len(_evf)} event file(s)"
+                       + (f", {len(_csv_kind) - len(_plx) - len(_evf)} other CSV file(s)"
+                          if len(_csv_kind) - len(_plx) - len(_evf) else "") + ".")
+            if _ans == "Yes":
+                if _plx:
+                    _ch = plexon.channels(plexon._cols(plexon.header_of(_plx[0], 1)[0]))
+                    _fib = list(_ch) or ["F1"]
+                    _c = st.columns(3)
+                    _fibre = _c[0].selectbox("Fibre", _fib, key="plx_fibre")
+                    _waves = _ch.get(_fibre, ["465", "410"])
+                    _sd, _cd = plexon.default_pair(_waves)
+                    _sig_nm = _c[1].selectbox("Signal nm", _waves, index=_waves.index(_sd), key="plx_sig")
+                    _ctl_nm = _c[2].selectbox("Control nm", _waves, index=_waves.index(_cd), key="plx_ctl")
+                    PLEXON_OPTS = {"fibre": _fibre, "signal": _sig_nm, "control": _ctl_nm}
+                elif not _evf:
+                    st.warning("None of the CSV files looks like a Plexon export (no RawF_<nm>_F<k> columns).")
+        _rec_stems = [p.stem for p in uploaded_files if p not in _evf]
+        _match = plexon.match_events([p.name for p in _evf], _rec_stems)
+        file_events = {}
+        for _p in _evf:
+            _r = _match.get(_p.name)
+            if _r:
+                try:
+                    file_events.setdefault(_r, []).extend(plexon.read_events(_p))
+                except Exception as _e:
+                    st.warning(f"Could not read events from {_p.name}: {_e}")
+        _unmatched = [p.name for p in _evf if not _match.get(p.name)]
+        if _unmatched:
+            st.warning("Event files with no recording of the same name: " + ", ".join(_unmatched))
+        st.session_state["file_events"] = file_events
+        EVENT_FILES = set(_evf)
+
+        roi_typed = st.text_input("ROI name (optional)", value="", placeholder="e.g. ARC or BLA",
+                                  help="Only a label for the brain region, used in column and file names. "
+                                       "Leave empty if you do not need one.").strip()
+        roi_name = roi_typed or ROI_FALLBACK
         scale_mode = st.selectbox("Auto y-axis scaling", ["full", "robust", "none"], index=0)
         save_full = st.checkbox("Save full 20 Hz processed CSV for PPD runs", value=False)
 
@@ -2127,7 +2277,15 @@ with st.sidebar:
             lick_norm = "baseline_z"
 
     with st.expander("Hide/remove time periods visually", expanded=False):
-        st.caption("These controls only affect graph display. They do not alter downloaded processed CSVs.")
+        th.explain("What is a hidden region?",
+                   "A **hidden region** is a stretch of time you choose not to look at, for example while the "
+                   "patch cable was being changed, the animal was picked up, or the signal was clipped.\n\n"
+                   "* **Blank signal but keep true time axis**: the traces have a gap there, and the time axis "
+                   "stays as recorded.\n"
+                   "* **Remove rows from visual display**: those samples are left out of the graphs.\n\n"
+                   "Either way it changes **only what the graphs show**. The motion correction, dF/F, z-scores "
+                   "and the downloaded CSV still use every sample. To really cut the recording, use **Crop** "
+                   "instead.", use_container_width=True)
         if st.button("Clear hidden time periods", use_container_width=True):
             st.session_state["num_exclusions"] = 0
         exclusion_mode = st.radio(
@@ -2180,14 +2338,26 @@ with st.sidebar:
             with st.container():
                 st.markdown(f"**Event / epoch {i + 1}: name and timing**")
                 name = st.text_input("Event name", value=f"Event {i + 1}", key=f"ev_name_{i}")
-                start_hms = st.text_input("Start time (HH:MM:SS)", value="00:00:00", key=f"ev_start_hms_{i}")
-                start, start_time_err = parse_hms_to_seconds(start_hms, 0.0, f"event {i + 1} start time")
+                ev_clock = st.radio("Time given as", ["Recording time", "Clock time"], horizontal=True,
+                                    key=f"ev_timekind_{i}",
+                                    help="Recording time: HH:MM:SS since the recording started. Clock time: the "
+                                         "time of day, e.g. 8:25:30 PM; each recording places it on its own "
+                                         "timeline.")
+                clock_start_text = clock_end_text = None
+                if ev_clock == "Clock time":
+                    clock_start_text = st.text_input("Clock time (e.g. 8:25:30 PM)", value="", key=f"ev_clock_{i}")
+                    start, start_time_err = 0.0, None
+                else:
+                    start_hms = st.text_input("Start time (HH:MM:SS)", value="00:00:00", key=f"ev_start_hms_{i}")
+                    start, start_time_err = parse_hms_to_seconds(start_hms, 0.0, f"event {i + 1} start time")
                 if start_time_err:
                     st.error(start_time_err)
                 has_duration = st.checkbox("This event lasts for a duration", value=False, key=f"ev_duration_{i}")
                 end = None
                 end_hms = ""
-                if has_duration:
+                if has_duration and ev_clock == "Clock time":
+                    clock_end_text = st.text_input("End clock time", value="", key=f"ev_clock_end_{i}")
+                elif has_duration:
                     end_hms = st.text_input("End time (HH:MM:SS)", value=seconds_to_hms(start + 60.0), key=f"ev_end_hms_{i}")
                     end, end_time_err = parse_hms_to_seconds(end_hms, start + 60.0, f"event {i + 1} end time")
                     if end_time_err:
@@ -2219,7 +2389,11 @@ with st.sidebar:
                 alpha = st.slider("Dotted line transparency", 0.05, 1.0, 0.65, 0.05, key=f"ev_alpha_{i}")
                 shade_alpha = st.slider("Duration shade transparency", 0.02, 0.80, 0.18, 0.02, key=f"ev_shade_alpha_{i}")
 
+            if ev_clock == "Clock time" and not (clock_start_text or "").strip():
+                continue
             event_annotations.append({
+                "clock_start_text": clock_start_text,
+                "clock_end_text": clock_end_text,
                 "name": name,
                 "start_sec": float(start),
                 "end_sec": float(end) if end is not None else None,
@@ -2231,6 +2405,31 @@ with st.sidebar:
                 "target_recordings": target_recordings,
                 "target_graphs": target_graphs,
             })
+
+    if file_events:
+        with st.expander("Events from event files", expanded=False):
+            _show_fe = st.checkbox("Show them on the graphs", True, key="show_file_events")
+            _labels = sorted({e["label"] for v in file_events.values() for e in v})
+            th.explain("What is this?",
+                       f"{sum(len(v) for v in file_events.values())} events ({', '.join(_labels)}) were read from "
+                       f"{len(file_events)} event file(s) and placed on the recording with the same name. Events "
+                       "with an end time are drawn as shaded periods. They also appear in Group analysis → Events, "
+                       "and the AI can use them.")
+        if _show_fe:
+            _lab_i = {l: i for i, l in enumerate(sorted({e["label"] for v in file_events.values() for e in v}))}
+            for _rec, _evs in file_events.items():
+                for _e in _evs:
+                    event_annotations.append({
+                        "clock_start_text": None, "clock_end_text": None, "name": _e["label"],
+                        "start_sec": float(_e["start"]),
+                        "end_sec": float(_e["end"]) if _e["end"] and _e["end"] - _e["start"] >= 1.0 else None,
+                        "start_hhmmss": seconds_to_hms(_e["start"]),
+                        "end_hhmmss": seconds_to_hms(_e["end"]) if _e["end"] else None,
+                        "color": plexon.colour_for(_e["label"], _lab_i[_e["label"]]),
+                        "alpha": 0.9, "shade_alpha": 0.15,
+                        "target_recordings": [_rec], "target_graphs": ["All graphs"],
+                        "from_file": True,
+                    })
 
     with st.expander("Manual y-scales", expanded=False):
         st.caption("Leave blank to use autoscale. Type as: min,max")
@@ -2371,12 +2570,25 @@ if run_clicked:
 
                 # CSV files: process or display directly
                 for csv_path in csv_files:
+                    if csv_path in EVENT_FILES:
+                        continue
                     try:
                         df_in = pd.read_csv(csv_path)
-                        if processed_columns_exist(df_in, roi_name):
-                            df_out, settings = load_processed_csv_dataframe(df_in, roi_name)
+                        _roi = roi_name if roi_typed else detect_roi(df_in, roi_name)
+                        if PLEXON_OPTS and plexon.looks_like_photometry(df_in.columns):
+                            _two, _pinfo = plexon.to_two_channel(df_in, _roi, PLEXON_OPTS["fibre"],
+                                                                 PLEXON_OPTS["signal"], PLEXON_OPTS["control"])
+                            df_out, settings = process_raw_csv_dataframe(_two, _roi, settings=PROC_SETTINGS)
+                            for _k in [c for c in _two.columns if c.startswith("plexon_R_")]:
+                                df_out[_k] = _two[_k].to_numpy()[: len(df_out)]
+                            settings.update(_pinfo)
+                            settings["notes"] = plexon.notes_for(_pinfo) + list(settings.get("notes") or [])
+                            all_results.append({"name": csv_path.stem, "df": df_out, "settings": settings})
+                            continue
+                        if processed_columns_exist(df_in, _roi):
+                            df_out, settings = load_processed_csv_dataframe(df_in, _roi)
                         else:
-                            df_out, settings = process_raw_csv_dataframe(df_in, roi_name, settings=PROC_SETTINGS)
+                            df_out, settings = process_raw_csv_dataframe(df_in, _roi, settings=PROC_SETTINGS)
                         all_results.append({"name": csv_path.stem, "df": df_out, "settings": settings})
                     except Exception as e:
                         st.error(f"CSV analysis failed for {csv_path.name}")
@@ -2388,6 +2600,9 @@ if run_clicked:
 # =============================================================================
 
 results = st.session_state.get("results", [])
+# Results made under another ROI label keep their own column prefix.
+if results:
+    roi_name = detect_roi(results[0]["df"], roi_name)
 
 # Apply the physical crop before any figure, metric or download is produced, so
 # the graphs, the summary numbers and the exported CSV all agree.
@@ -2558,9 +2773,24 @@ def _ai_chat_panel(results, display_mode="(no recordings)"):
                      "signal": ss.get("grp_kind"), "normalisation": ss.get("grp_norm"),
                      "group statistic": ss.get("grp_stat"), "meal definition": ss.get("grp_meal")})
         view["focus_default"] = [str(r["name"]) for r in results]
+    # Events: the group-view event table plus the sidebar event lines (clock times placed per recording).
+    events = {str(r["name"]): list((ss.get("grp_events") or {}).get(str(r["name"]), [])) for r in results}
+    for r in results:
+        cs_ = gt.clock_start_of(r["df"], r.get("settings"))
+        for ev in event_annotations:
+            tr = ev.get("target_recordings") or ["All recordings"]
+            if "All recordings" not in tr and str(r["name"]) not in tr:
+                continue
+            ev2 = resolve_event_clock(ev, cs_)
+            if ev2 is not None and (str(r["name"]), ev2["start_sec"]) not in {
+                    (str(r["name"]), a) for a, _ in events[str(r["name"])]}:
+                events[str(r["name"])].append((float(ev2["start_sec"]), str(ev2.get("name"))))
+    if display_mode == "Group analysis" and ss.get("grp_view") == "Event response & signal check" \
+            and ss.get("sc_last"):
+        view["signal check on screen"] = {k: ss["sc_last"][k] for k in ("event", "signal", "baseline", "response")}
     ai_chat.render_panel(results, FED_DATA, roi_name, ppd_paths=ppd_paths, view=view, fed_map=fed_map,
                          sessions=ss.get("fed_sessions"), pellet_mg=ss.get("fed_mg"),
-                         groups=ss.get("grp_groups"))
+                         groups=ss.get("grp_groups"), events=events)
 
 
 if not results:
@@ -2596,8 +2826,11 @@ else:
     max_duration = max(float(r["df"]["time_sec"].max()) for r in results)
     c1.metric("Recordings loaded", len(results))
     c2.metric("Max duration", seconds_to_hms(max_duration))
-    c3.metric("ROI", roi_name)
-    c4.metric("Hidden regions", len(visual_exclusions))
+    c3.metric("ROI", roi_typed or "—", help="The brain-region label typed in the sidebar (optional).")
+    c4.metric("Hidden regions", len(visual_exclusions),
+              help="Hidden regions are stretches of time you choose to hide in the graphs (sidebar → Hidden "
+                   "regions), for example when the cable was being changed or the animal was handled. They are "
+                   "blanked (or cut out) only on screen; the analysis and the downloaded CSV keep every sample.")
 
     with st.expander("Current y-axis limits and visual window"):
         st.json({
@@ -2607,15 +2840,10 @@ else:
             "note": "Visual window affects only webpage display, not downloaded processed CSV files.",
         })
 
-    st.markdown(
-        """
-        <div class="note-box-light">
-        Scroll-wheel zoom is disabled on the graphs. Use <b>Graph display → Graph size</b> or <b>Maximize one graph only</b> for a larger view.
-        Visual crop, hidden regions, and event annotations change only the webpage display, not the downloaded processed CSV.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    th.explain("About the graphs",
+               "Scroll-wheel zoom is turned off so the page scrolls normally. Use **Graph display → Graph size** "
+               "or **Maximize one graph only** for a larger view.\n\nThe visual crop, hidden regions and event "
+               "lines change only what is drawn on this page, not the downloaded processed CSV.")
 
     display_mode = st.radio(
         "Display", ["One recording at a time", "Side-by-side graphs", "Feeding (FED3)", "Group analysis"],
@@ -2646,6 +2874,9 @@ else:
         group_view.render(results, FED_DATA, roi_name, _prepare_view, max_points=MAX_POINTS,
                           height_mult=height_mult, config=PLOTLY_CONFIG)
 
+    if display_mode == "One recording at a time" and results:
+        render_shared_notes(results)
+
     for idx, result in enumerate(results if display_mode == "One recording at a time" else [], start=1):
         full_df = result["df"]
         view_df = filter_visual_window(full_df, start_sec, end_sec) if use_window else full_df
@@ -2658,6 +2889,8 @@ else:
         render_diagnostics(result.get("settings", {}))
 
         rec_clock = gt.clock_start_of(view_df, result.get("settings"))
+        _dur = float(pd.to_numeric(full_df["time_sec"], errors="coerce").max()
+                     - pd.to_numeric(full_df["time_sec"], errors="coerce").min())
 
         def show(fig, kind):
             gt.chart_block(
@@ -2672,6 +2905,7 @@ else:
                 event_annotations,
                 str(result["name"]),
                 kind,
+                rec_clock,
             )
             if kind == "Overview":
                 fig = make_overview_figure(
@@ -2692,7 +2926,7 @@ else:
                     height=raw_h,
                 )
             elif kind == "Z-score sliding mean":
-                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zslide")
+                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zslide", _dur, rec_clock)
                 fig = make_zscore_sliding_mean_figure(
                     view_df,
                     roi_name,
@@ -2713,7 +2947,7 @@ else:
                     cycle_sec=zcfg["cycle_sec"],
                 )
             elif kind == "Z-score range analysis":
-                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zrange")
+                zcfg = render_zscore_display_controls(f"{safe_name(result['name'])}_{idx}_zrange", _dur, rec_clock)
                 zrange_cfg = render_zscore_range_controls(f"{safe_name(result['name'])}_{idx}")
                 fig, z_stats_df = make_zscore_range_analysis_figure(
                     view_df,
@@ -2758,6 +2992,14 @@ else:
                     )
                 return
             else:
+                _on, _w, _why = sc.recommend_smoothing(_dur)
+                _k = f"{safe_name(result['name'])}_{idx}_dff_sm"
+                _c = st.columns([1, 1.2, 3])
+                _sm_on = _c[0].toggle("Sliding mean", value=_on, key=f"{_k}_on", help=sc.SMOOTHING_HELP)
+                _sm_hms = _c[1].text_input("Window (HH:MM:SS)", seconds_to_hms(_w), key=f"{_k}_w",
+                                           disabled=not _sm_on)
+                _sm_sec, _sm_err = parse_hms_to_seconds(_sm_hms, _w, "sliding mean window")
+                _c[2].caption("Recommended for this recording: " + _why)
                 fig = make_main_dff_figure(
                     view_df, roi_name, manual_limits,
                     events=events_for_this_graph,
@@ -2765,6 +3007,7 @@ else:
                     show_exclusions=show_hidden_region_shading,
                     show_event_labels=show_event_labels,
                     height=processed_h,
+                    smooth_sec=_sm_sec if _sm_on and _sm_sec > 0 else None,
                 )
             show(fig, kind)
 
@@ -2772,7 +3015,7 @@ else:
             st.markdown(f"### Maximized view: {focus_graph}")
             render_chart(focus_graph)
             with st.expander("Data preview and downloads"):
-                st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
+                th.explain("About this preview", "Preview of the displayed data window. The downloadable CSV remains the full processed data.")
                 st.dataframe(_preview_12h(view_df.head(500)), use_container_width=True, height=360)
                 st.download_button(
                     label=f"Download full processed CSV for {result['name']}",
@@ -2793,7 +3036,7 @@ else:
             label_visibility="collapsed",
         )
         if view == "Data preview":
-            st.caption("Preview of the displayed data window. The downloadable CSV remains the full processed data.")
+            th.explain("About this preview", "Preview of the displayed data window. The downloadable CSV remains the full processed data.")
             st.dataframe(_preview_12h(view_df.head(500)), use_container_width=True, height=360)
             st.download_button(
                 label=f"Download full processed CSV for {result['name']}",

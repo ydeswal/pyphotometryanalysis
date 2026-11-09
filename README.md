@@ -35,6 +35,88 @@ allowed.
 
 ---
 
+## 9 November 2026 (c): Plexon files, graphs in AI answers, AM/PM dark cycle
+
+* **Plexon (PMPS) CSV exports.** When CSV files are uploaded the app asks **"Are these Plexon files?"** (it guesses
+  from the columns). For Plexon files you pick the fibre, the signal wavelength (465 nm) and the control
+  (410 nm); the raw fluorescence goes through the same pipeline as pyPhotometry data, and Plexon's own ΔF/F is
+  kept as `plexon_R_<nm>`. Event files (`Event, Start Time (s), End Time (s)`) are paired with the recording of
+  the same name (`8786N-events.csv`, `8781R=events.csv`, `8784Revents.csv` all work), drawn on the graphs (bouts
+  with an end time are shaded), added to Group analysis → Events, and given to the AI. Plexon files have no
+  clock time, so group graphs start on *Time since recording start*. Code: `plexon.py`, tests: `test_plexon.py`.
+* **AI answers with graphs.** The AI can ask the app to draw a graph (`show_graph`: a signal window, raw
+  465/405, each recording around an event, signal-check grades, cumulative intake). The app draws it from the
+  data, never from numbers the AI wrote. When the AI does not ask for one, the app adds the graph matching
+  the main data it used.
+* **Shorter data check.** Under each answer: one line ("Data check: Uncertain") with the full reasons behind a
+  *Details* button. The chat area has its own soft grey background; your questions are tinted blue.
+* **Dark cycle in AM/PM.** Lights on / lights off are typed as clock times (`7:00 PM`, `6:30 am`, `19:00`) in
+  the group view and in the z-score dark-cycle shading.
+* Signal check: *Expected change* now defaults to *Either direction* (choose *Decrease* for AgRP food tests).
+
+## 9 November 2026 (b): cleaner pages, explanations on request, signal check checked on a 2nd cohort
+
+* **Explanations only when you ask.** Notes that used to sit on the page are now small buttons (*About this view*,
+  *How to read this graph*, *What these settings do*, *What is a hidden region?* …) that open on a click.
+* **Processing notes once.** Warnings that repeated under every recording (short-recording F0, negative 405 fit
+  slope, clock source …) are listed once, in one collapsed *Processing notes* box, with the recordings each one
+  applies to. Under each recording only its start → end local time is shown.
+* **Signal check:** the coloured grade chips stay; the explanation moved to **Method of classification · why
+  signals look the way they do**, written in plain language. New checks: *405 follows 465* (r of the fast ups and
+  downs; ≥ 0.8 lowers the grade), *changing before the event* (the animal noticed the food before the marked
+  time), *brief, recovered* (a short dip that came back). The noise check now needs the change to be 2× (not 3×)
+  the baseline wobble, because active AgRP baselines wobble a lot.
+* **Checked on two cohorts (28 mice):** the app's ranking matches hand ratings with rank correlation 0.93; every
+  "bad / no signal" mouse is *No response*; every "questionable" mouse is *Weak* or *No response*.
+* **ROI name is optional** (no more "BLA" by default). Old CSVs keep their own ROI prefix automatically.
+* Header badges removed; the AI panel is now simply **Ask AI**, in a calmer colour. "Events" has no emoji.
+
+## 9 November 2026: events, signal checks, raw traces in groups, sliding-mean guidance
+
+### Events (Group analysis → 📍 Events, and the sidebar event lines)
+Mark moments such as *Food in*, an injection or a stimulus, as **recording time** (`60`, `1:00`, `0:01:00`) or
+**clock time** (`8:25:30 PM`). One row can apply to every recording or to one. Events are dashed red lines in
+every group graph, can be used to line recordings up (**Line recordings up by → Time since an event**), are
+graded in *Event response & signal check*, and the AI can answer questions about them (`list_events`,
+`event_signal_check`). The sidebar event lines also accept clock times now; each recording places them on its
+own timeline.
+
+### Event response & signal check (new group view)
+Each recording is graded on how much its signal changes after the event (built for the AgRP signal check:
+fasted mice, food in the cage). Defaults: graded signal = raw **465 ÷ 405** (cancels bleaching and light-path
+changes), baseline −30 to −5 s, response +30 to +120 s, expected change = decrease.
+
+| Grade | Change | Meaning |
+|---|---|---|
+| Excellent | ≥ 25 % | large, unmistakable |
+| Very good | 15–25 % | clear |
+| Good | 10–15 % | passes the 10 % cut-off Deem et al. 2020 (*eLife*) used to accept AgRP mice |
+| OK | 5–10 % | below that cut-off; use with care |
+| Weak | 2–5 % | barely there |
+| No response | < 2 % or wrong way | likely miss / poor expression |
+
+A grade drops one step if the change is < 3× the baseline noise, or if 405 moves the **same** way as 465 by at
+least half as much (movement / light path). A small 405 **rise** with a 465 fall is expected for real calcium
+(405 nm is a few nm below GCaMP's isosbestic point). Also shown: deepest 10 s, time to half, 465 and 405
+changes, noise, a group test across recordings, and per-recording traces (overlay by grade, 465/405 grid, or
+mean ± SEM). Event times can be edited per recording. Code: `signal_check.py`; tests: `test_signal_check.py`.
+
+### Group analysis
+* Any signal: dF/F, z, **Raw 465 + 405** (both channels, 405 in green), **465 ÷ 405 ratio**, filtered/raw
+  channels. Raw channels default to **% change from baseline mean**.
+* When recordings started at different clock times, the view starts on **Time since recording start**.
+* Bins down to 0.5 s for short recordings; option to hide the mean where only a few animals still have data.
+
+### Sliding mean: on/off everywhere, with a recommended window
+A sliding mean shows slow trends and hides anything shorter than its window. Recommended: **off** for
+recordings under 30 min and for events lasting seconds; otherwise about 1/50 of the recording (1 h → 1 min,
+4 h → 5 min, 12 h → 15 min, ≥ 24 h → 30 min, the Douglass et al. 2024 window). The single-recording dF/F and
+z-score graphs, side-by-side graphs, feeding view and group view all start with this recommendation.
+
+### Clearer pipeline warnings
+A negative 405→465 fit slope is now explained as what it usually is in strong recordings (calcium falls, 405
+rises slightly), and a low fit R² no longer says "fine if the animal moved little".
+
 ## 7 November 2026: Group analysis, a sturdier and faster AI
 
 ### Group analysis (Display → Group analysis)
@@ -125,7 +207,7 @@ because the app and other software read it back.
 
 ## 6 November 2026: "Ask the data" AI chat
 
-Under the **Display** buttons, **✨ Ask the data with AI** answers questions
+Under the **Display** buttons, **Ask AI** answers questions
 about one or more graphs, the raw recordings and the FED3 data, for free.
 Set up the keys once (see `DEPLOY.md`).
 
@@ -417,7 +499,9 @@ recording if it is present.
 | `fed3.py` | Reads FED3 controller output; intake, meals, event alignment, permutation test |
 | `fed_view.py` | The "Feeding (FED3)" view |
 | `ai_chat.py` | The "Ask the data" AI chat: data tools, free providers, answer check |
-| `group_view.py` | The "Group analysis" view |
+| `group_view.py` | The "Group analysis" view (events, signal check) |
+| `signal_check.py` | Event response grades and sliding-mean recommendation |
+| `plexon.py` | Plexon PMPS CSV and event-file import |
 | `group_analysis.py` | Group computations (alignment, normalisation, group statistics, FED averaging, meal patterns, group meal response) |
 | `interpret.py` | Fixed rules for how far a result can be trusted (405 control, fit R², n) |
 | `run_local.command` / `.bat` / `.sh` | Start the app on your own computer |
