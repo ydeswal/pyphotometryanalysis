@@ -2859,7 +2859,10 @@ else:
         _v = filter_visual_window(_df, start_sec, end_sec) if use_window else _df
         return apply_visual_exclusions(_v, roi_name, visual_exclusions, mode=exclusion_mode_code)
 
-    _ai_chat_panel(results, display_mode)
+    # The AI panel sits here on the page but is filled at the END of the run, after every view has
+    # updated its events, groups and signal-check settings; filled here it saw the previous run's state
+    # (e.g. "no events marked" right after an event was added).
+    _ai_slot = st.container()
 
     if display_mode == "Side-by-side graphs":
         gt.render_workspace(
@@ -3447,6 +3450,9 @@ else:
         mime="application/zip",
         use_container_width=True,
     )
+
+    with _ai_slot:
+        _ai_chat_panel(results, display_mode)
 
 
 # Credit line, shown on every page and view.

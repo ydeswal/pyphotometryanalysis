@@ -35,6 +35,14 @@ allowed.
 
 ---
 
+## 9 November 2026 (e): AI sees events added a moment ago
+
+* Fixed: right after adding an event in Group analysis, the AI could answer "no events are marked". The chat
+  panel was built before the group view had saved the new event, and later questions reused that stale copy.
+  The panel now stays in the same place on the page but is filled after every view has run.
+* The AI no longer ranks signal quality by the 405→465 fit R² (that only says how much the control explained).
+* AI graphs for Plexon recordings use rise ÷ noise, like the Plexon signal check.
+
 ## 9 November 2026 (d): Plexon recordings graded the Plexon way
 
 * **pyPhotometry first.** .ppd files and CSVs in the app's own format are processed as pyPhotometry with no

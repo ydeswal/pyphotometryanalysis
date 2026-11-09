@@ -1120,7 +1120,7 @@ def tool_event_signal_check(ctx, event=None, at=None, recordings=None, signal=No
             raise ToolError(f"Several events are marked: {labels}. Say which, or give `at`.")
         else:
             raise ToolError("No events are marked. Give `at` (e.g. 'rec 00:01:00' or '8:25 PM'), or ask the user "
-                            "to add the event under Group analysis → 📍 Events.")
+                            "to add the event under Group analysis → Events.")
     rows, A = [], []
     for r in recs:
         nm = str(r["name"])
@@ -1315,15 +1315,18 @@ def build_figure(ctx, spec):
                                       recordings=spec.get("recordings") or None,
                                       baseline=spec.get("baseline"), response=spec.get("response"))
         rows = out["grades_best_first"]
+        plx = all(str(r.get("method", "")).startswith("Plexon") for r in rows)
         if kind == "signal_check":
             fig = go.Figure(go.Bar(
-                x=[r["animal"] or r["recording"] for r in rows], y=[r["change_pct"] for r in rows],
+                x=[r["animal"] or r["recording"] for r in rows],
+                y=[r["change_over_noise"] if plx else r["change_pct"] for r in rows],
                 marker_color=[sc.TIER_COLOR.get(r["grade"], "#64748b") for r in rows],
                 text=[r["grade"] for r in rows], textposition="outside",
-                hovertemplate="%{x}: %{y:.1f}% (%{text})<extra></extra>"))
-            fig.add_hline(y=-10, line=dict(color="#94a3b8", dash="dot"))
+                hovertemplate="%{x}: %{y:.1f}" + ("× noise" if plx else "%") + " (%{text})<extra></extra>"))
+            if not plx:
+                fig.add_hline(y=-10, line=dict(color="#94a3b8", dash="dot"))
             fig.add_hline(y=10, line=dict(color="#94a3b8", dash="dot"))
-            fig.update_yaxes(title_text="Change after the event (%)")
+            fig.update_yaxes(title_text="Rise during the bouts ÷ noise" if plx else "Change after the event (%)")
             fig.update_layout(**layout, title=dict(text=f"Response to '{out['event']}' per recording (best first)",
                                                    font=dict(size=13)))
             return fig, f"bar chart of each recording's % change after '{out['event']}', coloured by grade"
@@ -1349,14 +1352,24 @@ def build_figure(ctx, spec):
             s465 = pd.to_numeric(df[col(f"{ctx.roi}_sig_filt", f"{ctx.roi}_sig_raw")], errors="coerce").to_numpy(float)
             s405 = pd.to_numeric(df[col(f"{ctx.roi}_uv_filt", f"{ctx.roi}_uv_raw")], errors="coerce").to_numpy(float)
             t = pd.to_numeric(df["time_sec"], errors="coerce").to_numpy(float)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                x, y = sc.pct_trace(t, s465 / s405, ev, sc.BASELINE)
+            cdff = col(f"{ctx.roi}_dFF_percent")
+            if (res.get("settings") or {}).get("input_type") == "plexon_csv" and cdff:
+                d = pd.to_numeric(df[cdff], errors="coerce").to_numpy(float)
+                ds = sc._roll(t, d, 2.0)
+                nz = float(np.nanstd((d - ds)[t > t[0] + 20])) or 1.0
+                x, y = sc.diff_trace(t, d, ev, sc.PLX_BASELINE)
+                y = y / nz
+                ylab = "dF/F change ÷ noise"
+            else:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    x, y = sc.pct_trace(t, s465 / s405, ev, sc.BASELINE)
+                ylab = "465 ÷ 405, % change"
             g, v = sc.aligned(x, y, 0.0, pre, post, step=0.5)
             fig.add_trace(go.Scatter(x=g, y=v, mode="lines", name=f"{r['animal'] or r['recording']} ({r['grade']})",
                                      line=dict(width=1.3, color=sc.TIER_COLOR.get(r["grade"], pal[i % len(pal)]))))
         fig.add_vline(x=0, line=dict(color="#dc2626", dash="dash"))
         fig.update_xaxes(title_text="Seconds from the event")
-        fig.update_yaxes(title_text="465 ÷ 405, % change")
+        fig.update_yaxes(title_text=ylab)
         fig.update_layout(**layout, title=dict(text=f"Around '{out['event']}'", font=dict(size=13)))
         return fig, f"465/405 % change around '{out['event']}' for each recording, coloured by grade"
 
@@ -1716,6 +1729,9 @@ pooled-meal numbers as reference only. With few animals say how small the sample
 12. For responses to a marked event (food in, injection ...) and for "which animal has the best / a good \
 signal", call event_signal_check. Its grades are fixed: report them as given, best first, and state the \
 criteria briefly. A grade is a quality screen of one event per recording, not proof of anything.
+14. Never rank or judge how good an animal's signal is by the 405->465 fit R² or slope: they only say how \
+much the control channel explained, not whether the signal responds. If no event is marked and the user asks \
+which animal has the best signal, say that grading needs an event and ask for one (or offer a time to use).
 13. When the user asks to see, plot or graph something, or a picture would make the answer clearer, call \
 show_graph (at most 2 per answer) and refer to it as "the graph below". Never read values off a graph that no \
 tool returned.
