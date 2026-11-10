@@ -759,6 +759,36 @@ def tool_fed_events(ctx, animal=None, kind="pellet", start=None, end=None, limit
     return out
 
 
+def tool_fed_health(ctx, animal=None, start=None, end=None):
+    animals = [ctx.animal(animal)] if animal else list(ctx.fed.animals)
+    out = {"animals": {}}
+    summ = fed3.health_summary(ctx.fed, ctx.sessions or None, animals)
+    for an in animals:
+        notes = []
+        a, b, cs = ctx.window(start, end, animal=an, notes=notes)
+        iv = fed3.health_intervals(ctx.fed, an, ctx.sessions or None)
+        iv = iv[(iv["stop"] >= a) & (iv["start"] <= b)] if len(iv) else iv
+        pts = fed3.health_points(ctx.fed, an, ctx.sessions or None)
+        pts = pts[(pts["time"] >= a) & (pts["time"] <= b)] if len(pts) else pts
+        row = summ[summ["animal"] == an]
+        out["animals"][an] = {
+            "window": [ctx.tfmt(a, cs), ctx.tfmt(b, cs)],
+            "totals_all_sessions": ({k: (v.item() if hasattr(v, "item") else v) for k, v in row.iloc[0].items()
+                                     if k != "animal"} if len(row) else {}),
+            "periods": [{"what": r.label, "start": ctx.tfmt(r.start, cs), "end": ctx.tfmt(r.stop, cs),
+                         "duration_s": _r(r.duration_s), "still_going_at_end": bool(r.open)}
+                        for r in iv.head(60).itertuples()],
+            "events": [{"what": r.label, "time": ctx.tfmt(r.time, cs), "detail": r.detail}
+                       for r in pts.head(60).itertuples()],
+            **({"notes": notes} if notes else {}),
+        }
+    out["how_to_read"] = ("JAMMED: the FED could not deliver food, so no eating then is not the animal's choice. "
+                          "USB disconnected: nothing reached the PC files, so that time is unknown, not zero. "
+                          "Blocked poke: the beam was broken > 30 s (bedding or the mouse resting in it). "
+                          "Restart_Watchdog: the FED froze and restarted itself within 16 s, continuing the same file.")
+    return out
+
+
 def tool_meals(ctx, animal=None, start=None, end=None, max_gap_s=60, min_pellets=2, limit=40):
     an = ctx.animal(animal)
     a, b, cs0 = ctx.window(start, end, animal=an)
@@ -1520,11 +1550,16 @@ TOOLS = [
         {"recording": _REC, "signal": _SIG, "windows": {"type": "array", "items": {
             "type": "object", "properties": {"label": {"type": "string"}, "start": _T, "end": _T}}}},
         ["signal", "windows"]),
-    _fn("get_fed_events", "FED3 events of one animal in a window: pellets taken, pokes, dispenses; with times "
-        "and counts.",
-        {"animal": _AN, "kind": {"type": "string", "enum": ["pellet", "poke", "dispensed", "all"]},
+    _fn("get_fed_events", "FED3 events of one animal in a window: pellets taken, pokes, dispenses, FED status "
+        "rows ('health': JamClearing, Jammed, LeftBlocked, SDError, Restart_<cause> ...); with times and counts.",
+        {"animal": _AN, "kind": {"type": "string", "enum": ["pellet", "poke", "dispensed", "health", "all"]},
          "start": _T, "end": _T, "limit": {"type": "integer", "description": "max rows, default 40"}},
         ["animal"]),
+    _fn("get_fed_health", "Problems with one animal's FED (or every animal's if animal is omitted): jams, "
+        "JAMMED periods (no food could be delivered), USB disconnects (nothing logged), blocked pokes, SD-card "
+        "errors, restarts with cause, email alerts; each with start, end and duration, plus totals. Use it "
+        "before reading a pause in eating as the animal's choice.",
+        {"animal": _AN, "start": _T, "end": _T}, []),
     _fn("get_meals", "Meals of one animal (pellets grouped by the gap between them) with onset times, pellets, "
         "grams and duration.",
         {"animal": _AN, "start": _T, "end": _T,
@@ -1610,7 +1645,7 @@ TOOLS = [
 TOOL_FUNCS = {
     "get_signal_summary": tool_signal_summary, "get_signal_trace": tool_signal_trace,
     "find_extremes": tool_find_extremes, "compare_windows": tool_compare_windows,
-    "get_fed_events": tool_fed_events, "get_meals": tool_meals, "get_intake": tool_intake,
+    "get_fed_events": tool_fed_events, "get_fed_health": tool_fed_health, "get_meals": tool_meals, "get_intake": tool_intake,
     "event_aligned_response": tool_event_aligned_response, "signal_vs_intake": tool_signal_vs_intake,
     "get_raw_ppd_window": tool_raw_ppd_window, "get_recording_info": tool_recording_info,
     "calculate": tool_calculate, "time_difference": tool_time_difference,
@@ -1627,7 +1662,8 @@ def available_tools(ctx):
                  "event_aligned_response", "signal_vs_intake", "get_raw_ppd_window", "get_recording_info",
                  "list_events", "event_signal_check"}
     if ctx.fed is None:
-        skip |= {"get_fed_events", "get_meals", "get_intake", "event_aligned_response", "signal_vs_intake",
+        skip |= {"get_fed_events", "get_fed_health", "get_meals", "get_intake", "event_aligned_response",
+                 "signal_vs_intake",
                  "group_meal_response", "meal_patterns"}
     if len(ctx.results) < 2:
         skip.add("group_meal_response")
@@ -1687,6 +1723,22 @@ def catalogue(ctx, focus=None):
             segs = "; ".join(f"{r.start:%m-%d} {gt.fmt12(r.start, 0, False, False)} to "
                              f"{r.stop:%m-%d} {gt.fmt12(r.stop, 0, False, False)}" for r in cov.itertuples())
             L.append(f"- {an}: {n} pellets in used sessions; FED logging {segs or 'unknown'}")
+            try:
+                hs = fed3.health_summary(ctx.fed, ctx.sessions or None, [an])
+                if len(hs):
+                    h = hs.iloc[0]
+                    bits = [f"{int(h[k])} {lab}" for k, lab in (("jams", "jams"), ("JAMMED", "JAMMED"),
+                                                                 ("disconnects", "USB disconnects"),
+                                                                 ("restarts", "restarts"),
+                                                                 ("pokes blocked", "blocked pokes"),
+                                                                 ("SD errors", "SD errors"),
+                                                                 ("email alerts", "email alerts")) if h[k]]
+                    if bits:
+                        L.append(f"  FED problems for {an}: " + ", ".join(bits)
+                                 + " (get_fed_health gives the times; account for them before interpreting "
+                                   "gaps in eating)")
+            except Exception:
+                pass
     else:
         L.append("No FED3 data loaded.")
     evs = [(n, sec, lab) for n, v in ctx.events.items() for sec, lab in v]

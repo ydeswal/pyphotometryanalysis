@@ -16,6 +16,13 @@ shared PC clock.
                                     random times
   4. All animals                    cumulative intake of every animal together,
                                     plus a summary table
+  5. FED health                     when each FED was jammed, disconnected, had a
+                                    blocked poke or an SD-card error, restarted,
+                                    or sent an email alert (FED3 controller 2.0)
+
+FED problems are also drawn on views 1 and 2: a "FED status" lane under the
+food panel, and jam / disconnect bands on the signal, so a pause in eating
+can be told apart from a FED that could not deliver food.
 
 The signal can be dF/F, z-score, or a raw channel (465 and 405 together on
 their own axes, or one at a time). The time axis shows the wall clock and the
@@ -42,6 +49,27 @@ _GAP = "rgba(148,163,184,0.22)"
 _CUM = "#7c3aed"
 _SIG = "#0072B2"
 _UV = "#009E73"
+
+# FED health colours (one per problem kind) and lanes
+HEALTH_COLORS = {
+    "jam": "rgba(234,88,12,0.55)",
+    "jammed": "rgba(220,38,38,0.85)",
+    "disconnected": "rgba(71,85,105,0.65)",
+    "blocked_left": "rgba(202,138,4,0.70)",
+    "blocked_right": "rgba(161,98,7,0.70)",
+    "sd_error": "rgba(124,58,237,0.70)",
+}
+HEALTH_LANE = {"jam": "Jam", "jammed": "Jam", "disconnected": "USB", "blocked_left": "Pokes",
+               "blocked_right": "Pokes", "sd_error": "SD card"}
+POINT_STYLE = {
+    "restart": dict(symbol="x-thin-open", size=13, color="#dc2626", line=dict(width=2.5, color="#dc2626")),
+    "reboot_seen": dict(symbol="x-thin-open", size=9, color="#f87171", line=dict(width=1.5, color="#f87171")),
+    "aborted": dict(symbol="triangle-down", size=10, color="#ea580c"),
+    "error": dict(symbol="square", size=8, color="#64748b"),
+    "alert": dict(symbol="diamond", size=11, color="#be123c", line=dict(width=1, color="#fff")),
+    "alert_ok": dict(symbol="circle", size=9, color="#16a34a", line=dict(width=1, color="#fff")),
+}
+LANES = ["Events", "SD card", "Pokes", "USB", "Jam"]
 
 RAW_BOTH = "Raw 465 + 405"
 TIME_AXES = ["Clock + recording time", "Clock time", "Recording time"]
@@ -102,6 +130,105 @@ def _band(x0, x1, lo, hi):
     return bx, by
 
 
+def _health_sec(fed, animal, sessions, cs):
+    """FED problems of one animal in seconds on this clock: (intervals, points)."""
+    iv = fed3.health_intervals(fed, animal, sessions)
+    pts = fed3.health_points(fed, animal, sessions)
+    if len(iv):
+        iv = iv.assign(a=fed3.to_seconds(iv["start"], cs), b=fed3.to_seconds(iv["stop"], cs))
+    if len(pts):
+        pts = pts.assign(x=fed3.to_seconds(pts["time"], cs))
+    return iv, pts
+
+
+def _hover_span(cs, a, b):
+    return f"{gt.fmt_clock(cs, a, date=False, decimals=0)} → {gt.fmt_clock(cs, b, date=False, decimals=0)}" \
+        if cs is not None else f"{gt.fmt_hms(a, 0)} → {gt.fmt_hms(b, 0)}"
+
+
+def _health_lane(fig, iv, pts, cs, row=None, col=1, lane_prefix="", legend=True, t0=None, t1=None):
+    """Draw FED problems as horizontal bars (one lane per kind) plus event markers."""
+    kw = dict(row=row, col=col) if row else {}
+    shown = set()
+    if len(iv):
+        for kind, g in iv.groupby("kind", sort=False):
+            a, b = g["a"].to_numpy(float), g["b"].to_numpy(float)
+            if t0 is not None:
+                a, b = np.maximum(a, t0), np.minimum(b, t1)
+            keep = b > a
+            if not keep.any():
+                continue
+            g, a, b = g[keep], a[keep], b[keep]
+            dur = np.maximum(b - a, 1.0)
+            txt = [f"<b>{lab}</b><br>{_hover_span(cs, x0, x1)} ({gt.fmt_hms(d, 0)})"
+                   + (" · still going when logging stopped" if o else "")
+                   for lab, x0, x1, d, o in zip(g["label"], a, b, g["duration_s"], g["open"])]
+            fig.add_trace(go.Bar(x=dur, base=a, y=[lane_prefix + HEALTH_LANE[kind]] * len(a), orientation="h",
+                                 marker=dict(color=HEALTH_COLORS[kind], line_width=0), width=0.7,
+                                 name=fed3.HEALTH_LABELS[kind], legendgroup="h_" + kind,
+                                 showlegend=legend and kind not in shown, text=txt,
+                                 hovertemplate="%{text}<extra></extra>", textposition="none"), **kw)
+            shown.add(kind)
+    if len(pts):
+        p = pts if t0 is None else pts[(pts["x"] >= t0) & (pts["x"] <= t1)]
+        for kind, g in p.groupby("kind", sort=False):
+            txt = [f"<b>{lab}</b><br>{gt.fmt_clock(cs, x, date=False, decimals=0) if cs is not None else gt.fmt_hms(x, 0)}"
+                   + (f"<br>{d}" if d and d != "nan" else "") for lab, x, d in zip(g["label"], g["x"], g["detail"])]
+            name = {"restart": "FED restart", "reboot_seen": "restart seen by PC", "aborted": "dispense aborted",
+                    "error": "FED error", "alert": "email alert", "alert_ok": "'OK' email"}[kind]
+            fig.add_trace(go.Scatter(x=g["x"], y=[lane_prefix + "Events"] * len(g), mode="markers",
+                                     marker=POINT_STYLE[kind], name=name, legendgroup="p_" + kind,
+                                     showlegend=legend, text=txt, hovertemplate="%{text}<extra></extra>"), **kw)
+
+
+def _health_bands(fig, iv, pts, rows=None, t0=None, t1=None):
+    """Jam / JAMMED / disconnect periods as light bands across the signal and food
+    panels, and restarts as dashed lines, so they can be seen against the trace."""
+    band = {"jam": "rgba(234,88,12,0.10)", "jammed": "rgba(220,38,38,0.16)",
+            "disconnected": "rgba(71,85,105,0.14)"}
+    for r in (iv.itertuples() if len(iv) else []):
+        if r.kind not in band:
+            continue
+        a, b = (max(r.a, t0), min(r.b, t1)) if t0 is not None else (r.a, r.b)
+        if b <= a:
+            continue
+        for rr in (rows or [None]):
+            k = dict(row=rr, col=1) if rr else {}
+            fig.add_vrect(x0=a, x1=b, fillcolor=band[r.kind], line_width=0, layer="below", **k)
+    for r in (pts.itertuples() if len(pts) else []):
+        if r.kind != "restart" or (t0 is not None and not (t0 <= r.x <= t1)):
+            continue
+        for rr in (rows or [None]):
+            k = dict(row=rr, col=1) if rr else {}
+            fig.add_vline(x=r.x, line=dict(color="#dc2626", width=1.2, dash="dash"), **k)
+
+
+def _health_note(iv, pts, animal):
+    """One line under the summary when this FED had problems in the shown window."""
+    if not len(iv) and not len(pts):
+        return
+    parts = []
+    for kind, name in (("jammed", "JAMMED"), ("jam", "jam"), ("disconnected", "USB disconnect"),
+                       ("blocked_left", "left poke blocked"), ("blocked_right", "right poke blocked"),
+                       ("sd_error", "SD card error")):
+        g = iv[iv["kind"] == kind] if len(iv) else iv
+        if len(g):
+            parts.append(f"{len(g)} {name}{'s' if len(g) > 1 and not name.endswith('d') else ''} "
+                         f"({gt.fmt_hms(float(g['duration_s'].sum()), 0)})")
+    if len(pts):
+        n_r = int((pts["kind"] == "restart").sum())
+        n_a = int((pts["kind"] == "alert").sum())
+        if n_r:
+            parts.append(f"{n_r} restart{'s' if n_r > 1 else ''}")
+        if n_a:
+            parts.append(f"{n_a} email alert{'s' if n_a > 1 else ''}")
+    if parts:
+        st.markdown(f'<div class="pp-note warn">🛠 <b>{animal}\'s FED</b>: ' + " · ".join(parts)
+                    + ". Shown in the <b>FED status</b> lane and as bands; details in the <b>FED health</b> "
+                    "view. Food could not be delivered while jammed, and nothing was logged while "
+                    "disconnected (grey).</div>", unsafe_allow_html=True)
+
+
 def _axis_title(cs, mode, has_recording=True):
     if cs is None or mode == "Recording time":
         return "Time into recording (HH:MM:SS)" if has_recording else "Elapsed"
@@ -145,12 +272,16 @@ def _style(fig, height):
 
 def stacked_figure(t, y, sig_label, pellets_s, meals, bins, gaps, t0, t1, cs,
                    grams_each, bin_min, height, extra=None, time_mode="Clock time",
-                   has_recording=True):
+                   has_recording=True, health=None):
     title = sig_label + (f" and {extra[1]}" if extra is not None else "")
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                        row_heights=[0.58, 0.42],
-                        specs=[[{"secondary_y": extra is not None}], [{"secondary_y": True}]],
-                        subplot_titles=(title, f"Food: pellets per {bin_min:g} min and cumulative"))
+    has_h = health is not None and (len(health[0]) or len(health[1]))
+    nrows = 3 if has_h else 2
+    fig = make_subplots(rows=nrows, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        row_heights=[0.52, 0.34, 0.14] if has_h else [0.58, 0.42],
+                        specs=[[{"secondary_y": extra is not None}], [{"secondary_y": True}]]
+                        + ([[{}]] if has_h else []),
+                        subplot_titles=(title, f"Food: pellets per {bin_min:g} min and cumulative")
+                        + (("FED status",) if has_h else ()))
     if t is not None:
         fig.add_trace(go.Scatter(x=t, y=y, mode="lines", name=sig_label,
                                  line=dict(color=_SIG, width=1.1)), row=1, col=1)
@@ -181,9 +312,16 @@ def stacked_figure(t, y, sig_label, pellets_s, meals, bins, gaps, t0, t1, cs,
                              line=dict(color=_CUM, width=2, shape="hv"), name="cumulative food (g)",
                              hovertemplate="%{y:.2f} g eaten so far<extra></extra>"),
                   row=2, col=1, secondary_y=True)
-    _add_gaps(fig, gaps, rows=[1, 2])
-    _clock_axis(fig, t0, t1, cs, rows=[1, 2], mode=time_mode, has_recording=has_recording)
-    fig.update_xaxes(title_text=_axis_title(cs, time_mode, has_recording), row=2, col=1)
+    rows = list(range(1, nrows + 1))
+    _add_gaps(fig, gaps, rows=rows)
+    if has_h:
+        _health_bands(fig, health[0], health[1], rows=[1, 2], t0=t0, t1=t1)
+        _health_lane(fig, health[0], health[1], cs, row=3, t0=t0, t1=t1)
+        fig.update_yaxes(row=3, col=1, categoryorder="array", categoryarray=LANES, showgrid=False,
+                         fixedrange=True)
+        fig.update_layout(barmode="overlay")
+    _clock_axis(fig, t0, t1, cs, rows=rows, mode=time_mode, has_recording=has_recording)
+    fig.update_xaxes(title_text=_axis_title(cs, time_mode, has_recording), row=nrows, col=1)
     if extra is not None:
         fig.update_yaxes(title_text=sig_label, row=1, col=1, title_font=dict(color=_SIG))
         fig.update_yaxes(title_text=extra[1], row=1, col=1, secondary_y=True, showgrid=False,
@@ -197,7 +335,8 @@ def stacked_figure(t, y, sig_label, pellets_s, meals, bins, gaps, t0, t1, cs,
 
 
 def overlay_figure(t, y, sig_label, pellets_s, retrieval_s, meals, rate_grid, rate,
-                   gaps, t0, t1, cs, rate_win_min, height, extra=None, time_mode="Clock time"):
+                   gaps, t0, t1, cs, rate_win_min, height, extra=None, time_mode="Clock time",
+                   health=None):
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(x=t, y=y, mode="lines", name=sig_label,
                              line=dict(color=_SIG, width=1.1)), secondary_y=False)
@@ -233,6 +372,18 @@ def overlay_figure(t, y, sig_label, pellets_s, retrieval_s, meals, rate_grid, ra
         fig.update_yaxes(title_text=extra[1], secondary_y=True, showgrid=False,
                          title_font=dict(color=_UV), tickformat=".4g")
     _add_gaps(fig, gaps)
+    if health is not None:
+        _health_bands(fig, health[0], health[1], t0=t0, t1=t1)
+        if len(health[1]):
+            # restarts and alerts as markers along the top of the signal
+            p = health[1][(health[1]["x"] >= t0) & (health[1]["x"] <= t1)]
+            good = np.isfinite(y)
+            top = float(np.nanmax(y)) if good.any() else 1.0
+            for kind, g in p.groupby("kind", sort=False):
+                fig.add_trace(go.Scatter(x=g["x"], y=np.full(len(g), top), mode="markers",
+                                         marker=POINT_STYLE[kind], name=str(g["label"].iloc[0]).split(":")[0],
+                                         text=g["label"], hovertemplate="%{text}<extra></extra>"),
+                              secondary_y=False)
     _clock_axis(fig, t0, t1, cs, mode=time_mode)
     fig.update_xaxes(title_text=_axis_title(cs, time_mode))
     fig.update_yaxes(title_text=sig_label, secondary_y=False,
@@ -325,8 +476,10 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         st.caption("No photometry loaded; showing food intake only.")
 
     view = st.radio("Feeding view", ["Photometry above, food below", "One graph: signal + eating",
-                                     "Aligned to eating", "All animals"],
-                    horizontal=True, key="fed_view")
+                                     "Aligned to eating", "All animals", "FED health"],
+                    horizontal=True, key="fed_view",
+                    help="FED health: when each FED was jammed, disconnected, had a blocked poke or an "
+                         "SD-card error, restarted, or sent an email alert (FED3 controller 2.0).")
 
     ref_clock = None
     if rec_of:
@@ -337,6 +490,9 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
 
     if view == "All animals":
         _all_animals(fed, sessions, grams_each, bin_min, ref_clock, max_points, height_mult, config, results, rec_of, roi, prepare_df)
+        return
+    if view == "FED health":
+        _fed_health(fed, sessions, ref_clock, max_points, height_mult, config, results, rec_of, prepare_df)
         return
 
     animal = st.selectbox("Animal", animals, key="fed_animal")
@@ -399,6 +555,12 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     meals = fed3.find_meals(pellets_s, gap_s, int(min_p))
 
     _times_strip(res, cs, t0, t1, cov_s)
+    hiv, hpts = _health_sec(fed, animal, sessions, cs)
+    if len(hiv):
+        hiv = hiv[(hiv["b"] >= t0) & (hiv["a"] <= t1)]
+    if len(hpts):
+        hpts = hpts[(hpts["x"] >= t0) & (hpts["x"] <= t1)]
+    health = (hiv, hpts) if (len(hiv) or len(hpts)) else None
 
     # Summary line
     logged_h = sum(max(0.0, min(b, t1) - max(a, t0)) for a, b in cov_s) / 3600.0
@@ -407,6 +569,8 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         f"in {logged_h:.1f} h of FED logging ({pellets_s.size / logged_h if logged_h else 0:.1f} pellets/h) · "
         f"{len(meals)} meals, median {np.median(meals['n_pellets']) if len(meals) else 0:.0f} pellets"
         + (f" · {n_out} pellet(s) fall outside the photometry recording and are not shown" if n_out else ""))
+    if health is not None:
+        _health_note(hiv, hpts, animal)
 
     h = int(height_mult * 640)
     key = f"fed_{animal}_{view[:6]}"
@@ -415,14 +579,18 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     if view == "Photometry above, food below":
         bins = fed3.intake_bins(pellets_s, t0, t1, bin_min * 60.0, cov_s)
         fig = stacked_figure(t, y, sig_label, pellets_s, meals, bins, gaps, t0, t1, cs,
-                             grams_each, bin_min, int(height_mult * 760), extra=extra,
-                             time_mode=time_mode, has_recording=t is not None)
+                             grams_each, bin_min, int(height_mult * (860 if health else 760)), extra=extra,
+                             time_mode=time_mode, has_recording=t is not None, health=health)
         gt.chart_block(fig, key=key, max_points=max_points, clock_start=cs, config=config,
                        peaks=t is not None, event_counts=counts,
                        time_hover="clock+recording" if t is not None else "clock")
         th.explain("How to read this", "Grey bands: the FED was not being logged, so intake there is unknown (not zero). "
                    "Ticks above the trace and shaded bands mark pellets and meals. Hover the bars for "
-                   "pellets and grams per bin; use the 📏 ruler to count pellets between any two times.")
+                   "pellets and grams per bin; use the 📏 ruler to count pellets between any two times."
+                   + (" <b>FED status</b> lane: orange = clearing a jam, red = JAMMED (no food could be "
+                      "delivered), slate = USB disconnected, yellow = poke blocked, purple = SD-card "
+                      "error; ✕ = FED restart (also a dashed red line), ◆ = email alert, ● = 'OK' email. "
+                      "Hover any of them for the exact times." if health else ""))
     elif view == "One graph: signal + eating":
         if t is None:
             st.info("Match a photometry recording to this animal to see the signal.")
@@ -434,7 +602,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             cov_mask |= (grid >= a) & (grid <= b)
         rate = np.where(cov_mask, rate, np.nan)
         fig = overlay_figure(t, y, sig_label, pellets_s, retrieval, meals, grid, rate, gaps, t0, t1, cs,
-                             rate_win, h, extra=extra, time_mode=time_mode)
+                             rate_win, h, extra=extra, time_mode=time_mode, health=health)
         gt.chart_block(fig, key=key, max_points=max_points, clock_start=cs, config=config,
                        peaks=True, event_counts=counts, time_hover="clock+recording")
         th.explain("How to read this", "Each orange dot is a pellet taken, placed on the signal at that moment. Dotted line: "
@@ -636,6 +804,129 @@ def _all_animals(fed, sessions, grams_each, bin_min, ref, max_points, height_mul
     _style(fig, int(height_mult * 520))
     gt.chart_block(fig, key="fed_all", max_points=max_points, clock_start=ref, config=config,
                    time_hover="clock")
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    tbl = pd.DataFrame(rows)
+    hs = fed3.health_summary(fed, sessions, [r["animal"] for r in rows])
+    if len(hs) and (hs.drop(columns="animal").to_numpy(dtype=object) != 0).any():
+        tbl = tbl.merge(hs[["animal", "jams", "JAMMED", "jam time (min)", "disconnects", "disconnected (min)",
+                            "restarts", "email alerts"]], on="animal", how="left")
+    st.dataframe(tbl, hide_index=True, use_container_width=True)
     th.explain("How to read this", "Grey: no FED logging for any animal. Meals in this table use the default "
-               "definition; change it per animal in the other views.")
+               "definition; change it per animal in the other views. Jam / disconnect / restart columns come "
+               "from the FED3 controller 2.0 status rows; see the FED health view.")
+
+
+def _fed_health(fed, sessions, ref, max_points, height_mult, config, results, rec_of, prepare_df):
+    """Timeline of every FED problem for every animal, with tables."""
+    animals = fed.animals
+    summ = fed3.health_summary(fed, sessions)
+    has_any = len(fed.health) > 0 or len(fed.alerts) > 0
+    if not has_any:
+        st.info("No FED status information in these files. It is written by FED3 controller 2.0 with "
+                "firmware PCCtrl-2.0 (jams, blocked pokes, SD card, restarts), by the controller "
+                "(USB connects/disconnects) and by the email-alert program (alerts_log.csv).")
+    c = st.columns([1.4, 1, 3])
+    lane_mode = c[0].radio("Show", ["All animals", "One animal"], horizontal=True, key="fed_h_mode")
+    show = animals if lane_mode == "All animals" else [c[1].selectbox("Animal", animals, key="fed_h_an")]
+
+    # time range: everything logged for the shown animals
+    lo, hi = [], []
+    for a in show:
+        cov = fed.coverage_of(a, sessions)
+        if len(cov):
+            lo.append(cov["start"].min())
+            hi.append(cov["stop"].max())
+        ev = fed.events[(fed.events["animal"] == a) & fed.events["session"].isin(sessions)]
+        if len(ev):
+            lo.append(ev["time"].min())
+            hi.append(ev["time"].max())
+    lo = [x for x in lo if pd.notna(x)]
+    hi = [x for x in hi if pd.notna(x)]
+    if not lo:
+        st.info("Nothing logged for the selected sessions.")
+        return
+    t0, t1 = fed3.to_seconds([min(lo)], ref)[0], fed3.to_seconds([max(hi)], ref)[0]
+
+    fig = go.Figure()
+    cats = []
+    shown_legend = set()
+    for a in show:
+        pre = f"{a} · " if len(show) > 1 else ""
+        # logged time (green) and pellets (ticks) give the context
+        cov = fed.coverage_of(a, sessions)
+        cs_ = list(zip(fed3.to_seconds(cov["start"], ref), fed3.to_seconds(cov["stop"], ref)))
+        cs_ = [(x, y) for x, y in cs_ if np.isfinite(x) and np.isfinite(y) and y > x]
+        if cs_:
+            xa = np.array([x for x, _ in cs_])
+            xb = np.array([y for _, y in cs_])
+            fig.add_trace(go.Bar(x=xb - xa, base=xa, y=[pre + "Logging"] * len(xa), orientation="h",
+                                 marker=dict(color="rgba(22,163,74,0.30)", line_width=0), width=0.7,
+                                 name="FED logged by the PC", legendgroup="cov",
+                                 showlegend="cov" not in shown_legend,
+                                 text=[_hover_span(ref, x, y) for x, y in cs_], textposition="none",
+                                 hovertemplate="<b>logged</b><br>%{text}<extra></extra>"))
+            shown_legend.add("cov")
+        ps = fed3.to_seconds(fed.times(a, "pellet", sessions), ref)
+        if ps.size:
+            fig.add_trace(go.Scatter(x=ps, y=[pre + "Pellets"] * ps.size, mode="markers",
+                                     marker=dict(symbol="line-ns-open", size=11, color=_PELLET,
+                                                 line=dict(width=1.3, color=_PELLET)),
+                                     name="pellet taken", legendgroup="pel",
+                                     showlegend="pel" not in shown_legend,
+                                     hovertemplate="pellet<extra></extra>"))
+            shown_legend.add("pel")
+        iv, pts = _health_sec(fed, a, sessions, ref)
+        _health_lane(fig, iv, pts, ref, lane_prefix=pre, legend=True)
+        cats += [pre + k for k in ["Events", "SD card", "Pokes", "USB", "Jam", "Pellets", "Logging"]]
+    # one legend entry per kind, even with several animals
+    seen = set()
+    for tr in fig.data:
+        key = tr.legendgroup or tr.name
+        if key in seen:
+            tr.showlegend = False
+        elif tr.showlegend is not False:
+            seen.add(key)
+    fig.update_layout(barmode="overlay")
+    fig.update_yaxes(categoryorder="array", categoryarray=cats, showgrid=False, fixedrange=True,
+                     autorange="reversed")
+    _clock_axis(fig, t0, t1, ref)
+    fig.update_xaxes(title_text="Clock time")
+    _style(fig, int(height_mult * max(360, 150 + 24 * 7 * len(show))))
+    fig.update_layout(hovermode="closest")
+    gt.chart_block(fig, key="fed_health", max_points=max_points, clock_start=ref, config=config,
+                   time_hover="clock")
+    th.explain("How to read this",
+               "Green: the PC was logging the FED. Ticks: pellets taken. Orange: clearing a jam; red: JAMMED "
+               "(no pellet after 100 motor turns, so no food could be delivered); slate: USB disconnected "
+               "(the FED kept running and saving to its SD card, but nothing reached the PC, so that time "
+               "counts as not logged); yellow: a poke beam broken for over 30 s; purple: SD card error "
+               "(the PC still recorded everything). ✕ red: the FED restarted (hover for the cause); "
+               "◆ email alert sent; ● 'problem fixed' email. Use the 📏 ruler to measure any period.")
+
+    st.markdown("**Per animal**")
+    st.dataframe(summ[summ["animal"].isin(show)], hide_index=True, use_container_width=True)
+
+    # every problem as one list
+    rows = []
+    for a in show:
+        iv = fed3.health_intervals(fed, a, sessions)
+        for r in iv.itertuples():
+            rows.append({"animal": a, "what": r.label, "start": gt.fmt12(r.start, decimals=0),
+                         "end": gt.fmt12(r.stop, decimals=0) + (" (still going)" if r.open else ""),
+                         "duration": gt.fmt_hms(float(r.duration_s), 0), "session": r.session,
+                         "_t": r.start, "detail": ""})
+        for r in fed3.health_points(fed, a, sessions).itertuples():
+            rows.append({"animal": a, "what": r.label, "start": gt.fmt12(r.time, decimals=0), "end": "",
+                         "duration": "", "session": "", "_t": r.time,
+                         "detail": r.detail if r.detail and r.detail != "nan" else ""})
+    if rows:
+        lst = pd.DataFrame(rows).sort_values("_t").drop(columns="_t")
+        st.markdown(f"**Every FED problem and alert** ({len(lst)})")
+        st.dataframe(lst, hide_index=True, use_container_width=True, height=min(460, 40 + 35 * len(lst)))
+        st.download_button("Download this list (CSV)", data=lambda: lst.to_csv(index=False).encode(),
+                           file_name="fed_health_events.csv", mime="text/csv", key="fed_h_dl")
+    else:
+        st.success("No FED problems recorded for the selected sessions.")
+    fb = int(summ["rows timed by PC receive"].sum()) if len(summ) else 0
+    if fb:
+        st.caption(f"{fb} row(s) had no PC_Timestamp (the FED had just restarted and was not yet re-synced); "
+                   "they are timed by when the PC received them, normally within a few milliseconds.")

@@ -567,6 +567,8 @@ def add_time_hover(fig, clock_start=None, show_recording=True):
             continue
         if tr.type != "bar" and tr.fill not in (None, "none"):
             continue
+        if tr.type == "bar" and tr.orientation == "h":
+            continue                       # timeline bars: x holds durations, not times
         ax = tr.xaxis or "x"
         if ax in done:
             continue

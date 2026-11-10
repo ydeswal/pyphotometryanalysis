@@ -144,6 +144,82 @@ check("m1 does not take m11", fed3.guess_animal("k_M11_day2", A) == "k_m11")
 check("plain ID still works", fed3.guess_animal("m1_fasted-2026", A) == "m1")
 check("no match -> None", fed3.guess_animal("rat3_session", A) is None)
 
+print("\n=== FED health (controller 2.0 / firmware PCCtrl-2.0) ===")
+HT0 = pd.Timestamp("2026-11-10 09:00:00")
+hs = tmp / "H" / "health_20261110_090000"
+hs.mkdir(parents=True)
+
+
+def hrow(sec, event, L=0, P=0, poke="nan", nan_ts=False, v="4.15"):
+    t = HT0 + pd.Timedelta(seconds=sec)
+    rec = t + pd.Timedelta(milliseconds=2)
+    ts = "NaN" if nan_ts else f"{t:%Y-%m-%d %H:%M:%S.%f}"[:-3]
+    return (f"{t:%m/%d/%Y %H:%M:%S},1.17.3,PC_Free,3,{v},nan,0,{event},Left,{L},0,{P},0,nan,nan,{poke},"
+            f"{ts},{rec:%Y-%m-%d %H:%M:%S.%f}"[:-3] + f",{rec.timestamp():.3f}")
+
+
+def pcl(sec, ev, det=""):
+    t = HT0 + pd.Timedelta(seconds=sec)
+    return f"{t:%Y-%m-%d %H:%M:%S.%f}"[:-3] + f",{t.timestamp():.3f},{ev},{det},"
+
+
+data = [hrow(30, "Pellet", P=1), hrow(600, "JamClearing", P=1), hrow(900, "JamCleared", P=1),
+        hrow(905, "Pellet", P=2), hrow(1200, "JamClearing", P=2), hrow(1800, "Jammed", P=2),
+        hrow(2400, "Left", L=1, P=2, poke="30.0"), hrow(2400.5, "LeftBlocked", L=1, P=2),
+        hrow(3000, "LeftUnblocked", L=1, P=2), hrow(3300, "JamCleared", P=2), hrow(3305, "Pellet", P=3),
+        hrow(4000, "Restart_Watchdog", L=1, P=3, nan_ts=True), hrow(4002, "Left", L=2, P=3, poke="0.2", nan_ts=True),
+        hrow(5000, "SDError", L=2, P=3), hrow(5600, "SDRecovered", L=2, P=3), hrow(6000, "FeedAborted", L=2, P=3)]
+(hs / "FED003_m20_data.csv").write_text(HDR + "\n" + "\n".join(data) + "\n")
+(hs / "FED003_m20_pc_events.csv").write_text(
+    "PC_Time,PC_Time_Unix,Event,Detail,FED_PC_Timestamp\n" + "\n".join([
+        pcl(0, "RECORDING_START", "port=COM5"), pcl(0, "CONNECTED", "COM5"), pcl(3999, "DISCONNECTED", "COM5"),
+        pcl(4003, "CONNECTED", "COM5"), pcl(4004, "FED_REBOOT", "reset=Watchdog"), pcl(4100, "TTL_PULSE", "x"),
+        pcl(4200, "FED_ERROR", "unknown command"), pcl(7200, "RECORDING_STOP")]) + "\n")
+# second FED: port-suffixed file name and a long disconnect
+(hs / "FED005_m21_COM7_data.csv").write_text(HDR + "\n" + "\n".join([hrow(100, "Pellet", P=1),
+                                                                       hrow(5000, "Pellet", P=2)]) + "\n")
+(hs / "FED005_m21_COM7_pc_events.csv").write_text(
+    "PC_Time,PC_Time_Unix,Event,Detail,FED_PC_Timestamp\n" + "\n".join([
+        pcl(0, "RECORDING_START"), pcl(1000, "DISCONNECTED", "COM7"), pcl(2800, "CONNECTED", "COM7"),
+        pcl(7200, "RECORDING_STOP")]) + "\n")
+(hs / "alerts_log.csv").write_text(
+    "PC_Time,PC_Time_Unix,FED,Animal,Rule,Message,FED_PC_Timestamp\n"
+    + f"{HT0 + pd.Timedelta(seconds=1800):%Y-%m-%d %H:%M:%S}.000,0,FED003,m20,jammed,JAMMED,\n"
+    + f"{HT0 + pd.Timedelta(seconds=3305):%Y-%m-%d %H:%M:%S}.000,0,FED003,m20,jammed_ok,jam cleared,\n")
+fh = fed3.load_fed([hs], tmp / "work_h")
+check("health: animals incl. port-suffixed file", fh.animals == ["m20", "m21"], str(fh.animals))
+check("health: no false 'damaged line' warnings", not fh.warnings, str(fh.warnings))
+e20 = fh.events[fh.events["animal"] == "m20"]
+check("health rows are not pokes", int((e20["kind"] == "poke").sum()) == 2,
+      str(e20.groupby("kind").size().to_dict()))
+check("health rows have kind 'health'", int((e20["kind"] == "health").sum()) == 11)
+check("rows without PC_Timestamp kept (PC_Received)", int((e20["time_source"] == "PC_Received").sum()) == 2)
+iv = fed3.health_intervals(fh, "m20")
+jam = iv[iv["kind"] == "jam"]
+check("two jams", len(jam) == 2, str(len(jam)))
+check("first jam 600->900 s", abs(jam["duration_s"].iloc[0] - 300) < 1, str(jam["duration_s"].tolist()))
+check("second jam 1200->3300 s", abs(jam["duration_s"].iloc[1] - 2100) < 1)
+jm = iv[iv["kind"] == "jammed"]
+check("JAMMED 1800->3300 s", len(jm) == 1 and abs(jm["duration_s"].iloc[0] - 1500) < 1)
+bl = iv[iv["kind"] == "blocked_left"]
+check("blocked poke starts Poke_Time before the row", len(bl) == 1 and abs(bl["duration_s"].iloc[0] - 630.0) < 1,
+      str(bl["duration_s"].tolist()))
+check("SD error 600 s", abs(iv.loc[iv["kind"] == "sd_error", "duration_s"].iloc[0] - 600) < 1)
+pts = fed3.health_points(fh, "m20")
+check("restart with cause", (pts["label"] == "Restart (Watchdog)").sum() == 1, str(pts["label"].tolist()))
+check("alerts read", (pts["kind"] == "alert").sum() == 1 and (pts["kind"] == "alert_ok").sum() == 1)
+check("dispense aborted", (pts["kind"] == "aborted").sum() == 1)
+cov21 = fh.coverage_of("m21")
+check("disconnect cut out of coverage", len(cov21) == 2
+      and abs((cov21["stop"] - cov21["start"]).dt.total_seconds().sum() - (7200 - 1800)) < 1,
+      str(cov21[["start", "stop"]].values.tolist()))
+smm = fed3.health_summary(fh).set_index("animal")
+check("summary counts", smm.loc["m20", "jams"] == 2 and smm.loc["m20", "JAMMED"] == 1
+      and smm.loc["m21", "disconnects"] == 1 and smm.loc["m21", "disconnected (min)"] == 30.0,
+      smm[["jams", "JAMMED", "disconnects", "disconnected (min)"]].to_dict())
+check("pellets unchanged", fh.times("m20", "pellet").size == 3 and fh.times("m21", "pellet").size == 2)
+check("old data: no health rows", (fr.events["kind"] == "health").sum() == 0 if "fr" in dir() else True)
+
 print("\n" + "=" * 60)
 print("RESULT: " + ("ALL TESTS PASSED" if not fails else f"{len(fails)} FAILURES: " + ", ".join(fails)))
 raise SystemExit(1 if fails else 0)

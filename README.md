@@ -256,6 +256,55 @@ Set up the keys once (see `DEPLOY.md`).
 
 ---
 
+## 9 November 2026: FED health (FED3 controller 2.0) in the Feeding (FED3) view
+
+FED3 controller 2.0 with firmware PCCtrl-2.0 records when a FED had problems.
+The app now reads all of it and shows it:
+
+- **New view: Feeding view → FED health.** One timeline per animal (or all
+  animals stacked) with lanes for *Logging* (green), *Pellets*, *Jam*
+  (orange = clearing a jam, red = JAMMED: no pellet after 100 motor turns,
+  so no food could be delivered), *USB* (disconnected), *Pokes* (beam
+  blocked > 30 s), *SD card* (error) and *Events* (✕ restart with its cause,
+  ◆ email alert, ● "problem fixed" email, ▼ dispense aborted). Hover gives
+  exact times; the ruler measures any period. Below: a per-animal summary
+  (jams, jam time, longest jam, JAMMED, disconnects and minutes, restarts by
+  cause, blocked pokes, SD errors, email alerts) and a downloadable list of
+  every problem.
+- **Photometry above, food below** gets a *FED status* lane under the food
+  panel, and jam / JAMMED / disconnect periods are shaded on the signal and
+  food panels; restarts are dashed red lines. **One graph** shows the same
+  bands plus restart / alert markers. A note under the summary line lists the
+  FED's problems in the window shown.
+- **All animals** table gains jam, JAMMED, disconnect, restart and alert columns.
+- **AI chat**: new `get_fed_health` tool; `get_fed_events` accepts
+  `kind="health"`; the data summary tells the AI about each FED's problems so
+  it does not read a jam as the animal not eating.
+
+Reading fixes for controller 2.0 files:
+
+- FED status rows (`JamClearing`, `JamCleared`, `Jammed`, `FeedAborted`,
+  `LeftBlocked`/`RightBlocked`, `LeftUnblocked`/`RightUnblocked`, `SDError`,
+  `SDRecovered`, `Restart_<cause>`) are their own kind, **never counted as
+  pokes** (the old rule "event contains Left/Right = poke" would have counted
+  `LeftBlocked`).
+- **USB disconnects are cut out of the FED coverage** (nothing reached the PC
+  then), so they show as "FED not logging" and are excluded from rates and
+  from the random times of the permutation test.
+- Rows with `PC_Timestamp = NaN` (the first seconds after a FED restart,
+  before the PC re-sends its clock) were skipped; they are now kept and timed
+  by `PC_Received`.
+- `FED_REBOOT`, `FED_ERROR` and `TTL_PULSE` lines in `_pc_events.csv` are no
+  longer reported as damaged lines.
+- `alerts_log.csv` (written by the email-alert program into each session
+  folder) is read; alerts appear on the timelines.
+- `FED003_m10_COM5_data.csv` (the controller adds the port when two FEDs share
+  a number and ID) is read as animal m10.
+
+Older FED files without any of this still read exactly as before.
+
+---
+
 ## 6 November 2026: raw signal and recording time in the Feeding (FED3) view
 
 - **Signal** now also offers the raw channels: **Raw 465 + 405** (both raw
