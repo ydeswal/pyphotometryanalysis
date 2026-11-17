@@ -9,7 +9,8 @@ import zipfile
 # (loaded by an earlier run, possibly from older files). See
 # _reload_changed_modules() below.
 _PP_PRELOADED = {n for n in ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret",
-                             "fed_view", "group_analysis", "group_view", "ai_chat") if n in sys.modules}
+                             "signal_check", "plexon", "intake", "baseline", "fed_view", "group_analysis",
+                             "longitudinal", "group_view", "baseline_view", "ai_chat") if n in sys.modules}
 import io
 import json
 
@@ -65,6 +66,8 @@ import ai_chat
 import group_view
 import signal_check as sc
 import plexon
+import intake
+import baseline_view
 
 
 def _reload_changed_modules():
@@ -80,8 +83,9 @@ def _reload_changed_modules():
     """
     import importlib
     import os
-    order = ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret", "signal_check", "plexon", "fed_view",
-             "group_analysis", "group_view", "ai_chat")
+    order = ("photometry_core", "lickometer", "theme", "graph_tools", "fed3", "interpret", "signal_check", "plexon",
+             "intake", "baseline", "fed_view", "group_analysis", "longitudinal", "group_view", "baseline_view",
+             "ai_chat")
     stamps = sys.__dict__.setdefault("_pp_module_mtimes", {})
     changed = False
     for name in order:
@@ -564,6 +568,11 @@ def process_raw_csv_dataframe(df, roi, settings=None):
         "fit_intercept_used": res["intercept"],
         "fit_slope_unconstrained": finfo["raw_slope"],
         "fit_slope_clamped": finfo["slope_clamped"],
+        "control_used": finfo.get("control_used"),
+        "control_agreement_r": finfo.get("control_agreement_r"),
+        "baseline_method": finfo.get("baseline_method"),
+        "signal_background": cfg.get("signal_background", 0.0),
+        "control_background": cfg.get("control_background", 0.0),
         "fit_R2": finfo["r2"],
         "pearson_r_405_vs_465": finfo["pearson_r_405_465"],
         "f0_method": cfg["f0_method"],
@@ -1147,7 +1156,7 @@ def make_raw_independent_figure(df, roi, limits=None, events=None, exclusions=No
 def make_main_dff_figure(df, roi, limits=None, events=None, exclusions=None, show_exclusions=True, show_event_labels=True, height=620,
                          smooth_sec=None):
     """The only dFF graph in the app. smooth_sec: add a centred sliding mean of that width."""
-    fig = make_subplots(rows=1, cols=1, subplot_titles=("dF/F0 = (465 - fitted 405) / F0",))
+    fig = make_subplots(rows=1, cols=1, subplot_titles=("dF/F (motion- and bleaching-corrected)",))
     x = df["time_sec"]
     if f"{roi}_dFF" in df.columns:
         y = df[dff_percent_column(df, roi)]
@@ -1687,18 +1696,23 @@ def render_zscore_display_controls(base_key, duration_sec=None, clock_start=None
         z_show_smooth = st.toggle("Sliding mean", value=rec_on, key=f"{base_key}_z_show_smooth",
                                   help=sc.SMOOTHING_HELP)
     with c6:
-        z_show_dark = st.checkbox("Show dark-cycle shading", value=False, key=f"{base_key}_z_show_dark")
+        z_show_dark = st.checkbox("Show dark-cycle shading",
+                                  value=bool(clock_start is not None and (duration_sec or 0) >= 2 * 3600),
+                                  key=f"{base_key}_z_show_dark",
+                                  help="Default cycle: lights off 10:00 AM to 10:00 PM (change it below).")
     with st.expander("Dark-cycle shading settings", expanded=False):
         if clock_start is not None:
             d1, d2 = st.columns(2)
-            off_t = d1.text_input("Lights off (dark starts)", "7:00 PM", key=f"{base_key}_z_dark_off_t",
-                                  help="Clock time, e.g. 7:00 PM, 6:30 pm or 19:00")
-            on_t = d2.text_input("Lights on (dark ends)", "7:00 AM", key=f"{base_key}_z_dark_on_t",
-                                 help="Clock time, e.g. 7:00 AM")
+            off_t = d1.text_input("Lights off (dark starts)", "10:00 AM", key=f"{base_key}_z_dark_off_t",
+                                  help="Clock time, e.g. 10:00 AM, 7:00 pm or 19:00. Default: reversed cycle, "
+                                       "lights off 10 AM to 10 PM.")
+            on_t = d2.text_input("Lights on (dark ends)", "10:00 PM", key=f"{base_key}_z_dark_on_t",
+                                 help="Clock time, e.g. 10:00 PM")
             off_h, on_h = gt.parse_tod(off_t), gt.parse_tod(on_t)
             if off_h is None or on_h is None or off_h == on_h:
-                st.error("Lights on/off not understood (use e.g. 7:00 PM and 7:00 AM); using 7:00 PM to 7:00 AM.")
-                off_h, on_h = 19.0, 7.0
+                st.error("Lights on/off not understood (use e.g. 10:00 AM and 10:00 PM); using lights off "
+                         "10:00 AM to 10:00 PM.")
+                off_h, on_h = 10.0, 22.0
             cs_ = pd.Timestamp(clock_start)
             tod0 = (cs_ - cs_.normalize()).total_seconds()
             z_dark_start_sec = (off_h * 3600.0 - tod0) % 86400.0
@@ -1802,15 +1816,25 @@ def render_diagnostics(settings):
         return
     start_local = settings.get("start_clock_local")
     c = st.columns(5)
-    c[0].metric("Pipeline", "Douglass 2025" if settings.get("pipeline") == "douglass2025" else "pyPhotometry")
+    c[0].metric("Pipeline", {"douglass2025": "Douglass 2025", "robust2025": "Robust"}.get(
+        settings.get("pipeline"), "pyPhotometry"))
     slope_txt = f"{settings['fit_slope_used']:.3g}"
     if settings.get("fit_slope_clamped"):
         slope_txt += f" (raw {settings['fit_slope_unconstrained']:.3g})"
     _ctl_nm = settings.get("plexon_control_nm") or "405"
     _unit = "" if settings.get("input_type") == "plexon_csv" else " V"
-    c[1].metric(f"{_ctl_nm}→465 slope a", slope_txt)
+    if settings.get("control_used") is False:
+        slope_txt = "not used"
+    c[1].metric(f"{_ctl_nm}→465 slope a", slope_txt,
+                help="'not used': the control moved against the signal (or was switched off), so it was not "
+                     "subtracted; see Processing notes." if settings.get("control_used") is False else None)
     r2 = settings.get("fit_R2")
-    c[2].metric("Fit R²", "n/a" if r2 is None or not np.isfinite(r2) else f"{r2:.3f}")
+    c[2].metric("Fit R²", "n/a" if r2 is None or not np.isfinite(r2) or settings.get("control_used") is False
+                else ("< 0" if r2 < 0 else f"{r2:.3f}"),
+                help="How much of the 465 trace the fitted control explains. With the robust fit it can be "
+                     "below 0: the fit follows the artefacts shared by both channels and deliberately ignores "
+                     "large real responses, so over the whole trace it can do worse than a flat line. That is "
+                     "expected in recordings with a big response and is not a fault.")
     c[3].metric("F0 (median)", f"{settings.get('F0_median_volts', float('nan')):.4g}{_unit}",
                 help="Camera counts for Plexon files" if not _unit else None)
     dur = settings.get("duration_sec")
@@ -1929,30 +1953,57 @@ with st.sidebar:
         st.session_state.setdefault("upload_gen", 0)
         st.session_state.setdefault("staged", {})
         _new_files = st.file_uploader(
-            "Upload .ppd or .csv file(s)",
-            type=["ppd", "csv"],
+            "Upload files or one ZIP",
+            type=["ppd", "csv", "zip", "json"],
             accept_multiple_files=True,
             key=f"uploader_{st.session_state['upload_gen']}",
-            help="pyPhotometry .ppd files, Plexon CSV exports (with their event CSVs), or other CSV files "
-                 "(processed directly, or shown as they are if already processed).",
+            help="pyPhotometry .ppd files (or CSV recordings with their .json), Plexon CSV exports with their "
+                 "event CSVs, FED3 controller files, or ONE ZIP holding any of these (a zipped FED3_data folder "
+                 "inside it is fine). Everything is sorted automatically: FED3 files go to the feeding data, "
+                 "snapshots are used only when the finished recording is missing.",
         )
         if _new_files:
             if "stage_dir" not in st.session_state or not Path(st.session_state["stage_dir"]).exists():
                 st.session_state["stage_dir"] = tempfile.mkdtemp(prefix="pyphot_")
+            _had_zip = False
             for _f in _new_files:
                 _dst = Path(st.session_state["stage_dir"]) / safe_name(_f.name)
                 with open(_dst, "wb") as _fh:
                     _fh.write(_f.getbuffer())
-                st.session_state["staged"][_f.name] = str(_dst)
+                if _dst.suffix.lower() == ".zip":
+                    _had_zip = True
+                    _unz = Path(st.session_state["stage_dir"]) / "unzipped"
+                    _unz.mkdir(exist_ok=True)
+                    for _x in intake.expand([_dst], _unz):
+                        _rel = _x.relative_to(_unz).as_posix() if _unz in _x.parents else _x.name
+                        st.session_state["staged"][_rel] = str(_x)
+                    try:
+                        _dst.unlink()            # the unpacked copy is what is used
+                    except OSError:
+                        pass
+                else:
+                    st.session_state["staged"][_f.name] = str(_dst)
             del _new_files, _f
             st.session_state["upload_gen"] += 1
+            if _had_zip or st.session_state.get("auto_run_on", True):
+                st.session_state["auto_run"] = True
             st.rerun()
         _staged = {k: v for k, v in st.session_state["staged"].items() if Path(v).exists()}
         st.session_state["staged"] = _staged
+        INTAKE = intake.classify([Path(v) for v in _staged.values()])
         if _staged:
-            st.caption("Files ready for analysis:")
-            for _name, _path in _staged.items():
-                st.caption(f"• `{_name}` ({Path(_path).stat().st_size / 1e6:.1f} MB)")
+            _shown = INTAKE["photometry"] + INTAKE["csv"]
+            st.caption("Ready for analysis:")
+            for _path in _shown[:12]:
+                st.caption(f"• `{_path.name}` ({_path.stat().st_size / 1e6:.1f} MB)")
+            if len(_shown) > 12:
+                st.caption(f"… and {len(_shown) - 12} more.")
+            if INTAKE["fed"]:
+                st.caption(f"FED3 files: {len(INTAKE['fed'])} (added to *FED3 feeding data* automatically).")
+            if INTAKE["skipped"]:
+                with st.popover(f"{len(INTAKE['skipped'])} file(s) not used", use_container_width=True):
+                    for _n, _why in INTAKE["skipped"]:
+                        st.markdown(f"- `{_n}`: {_why}")
             if st.button("Remove these files", key="clear_staged"):
                 for _path in _staged.values():
                     try:
@@ -1960,12 +2011,19 @@ with st.sidebar:
                     except OSError:
                         pass
                 st.session_state["staged"] = {}
+                st.session_state.pop("fed_data", None)
                 st.rerun()
-        uploaded_files = [Path(v) for v in _staged.values()]
+        st.toggle("Run automatically when files are added", value=True, key="auto_run_on",
+                  help="Starts the analysis as soon as files (or a ZIP) are uploaded. Turn off to change "
+                       "settings first and then press Run.")
+        uploaded_files = INTAKE["photometry"] + INTAKE["csv"]
+        PYPHOT_CSV = {p for p in INTAKE["photometry"] if p.suffix.lower() == ".csv"}
+        AUTO_FED_FILES = [str(p) for p in INTAKE["fed"]]
 
         # ---- Plexon: ask, then pick fibre and wavelengths; pair event files with recordings
         PLEXON_OPTS = None
-        _csv_kind = {p: plexon.sniff(p) for p in uploaded_files if p.suffix.lower() == ".csv"}
+        _csv_kind = {p: plexon.sniff(p) for p in uploaded_files
+                     if p.suffix.lower() == ".csv" and p not in PYPHOT_CSV}
         _plx = [p for p, k in _csv_kind.items() if k == "photometry"]
         _evf = [p for p, k in _csv_kind.items() if k == "events"]
         # pyPhotometry (.ppd, or CSV in the app's own format) is assumed; the question appears only
@@ -1988,7 +2046,12 @@ with st.sidebar:
                     _sd, _cd = plexon.default_pair(_waves)
                     _sig_nm = _c[1].selectbox("Signal nm", _waves, index=_waves.index(_sd), key="plx_sig")
                     _ctl_nm = _c[2].selectbox("Control nm", _waves, index=_waves.index(_cd), key="plx_ctl")
-                    PLEXON_OPTS = {"fibre": _fibre, "signal": _sig_nm, "control": _ctl_nm}
+                    _bg_on = st.checkbox("Subtract the camera dark level", True, key="plx_bg",
+                                         help="Plexon cameras read about 15 with no fluorescence at all (the "
+                                              "level of an unused, flat channel). Left in, it makes every dF/F "
+                                              "several times too small. The level is read from each file; if "
+                                              "no flat unused channel exists, nothing is subtracted.")
+                    PLEXON_OPTS = {"fibre": _fibre, "signal": _sig_nm, "control": _ctl_nm, "background": _bg_on}
                 elif not _evf:
                     st.warning("None of the CSV files looks like a Plexon export (no RawF_<nm>_F<k> columns).")
         _rec_stems = [p.stem for p in uploaded_files if p not in _evf]
@@ -2037,16 +2100,29 @@ with st.sidebar:
             st.session_state["fed_gen"] += 1
             st.rerun()
         _fed_files = {k: v for k, v in st.session_state["fed_staged"].items() if Path(v).exists()}
+        for _p in AUTO_FED_FILES:                     # FED3 files found among the main uploads / ZIP
+            _fed_files.setdefault(f"{Path(_p).parent.name}/{Path(_p).name}", _p)
         if _fed_files:
+            _sig = tuple(sorted(_fed_files.values()))
+            if st.session_state.get("fed_sig") != _sig:
+                st.session_state.pop("fed_data", None)
             if "fed_data" not in st.session_state:
-                _work = Path(st.session_state["fed_dir"]) / f"read_{len(_fed_files)}"
+                if "fed_dir" not in st.session_state or not Path(st.session_state["fed_dir"]).exists():
+                    st.session_state["fed_dir"] = tempfile.mkdtemp(prefix="pyphot_fed_")
+                _work = Path(st.session_state["fed_dir"]) / f"read_{abs(hash(_sig)) % 10**8}"
                 st.session_state["fed_data"] = fed3.load_fed(list(_fed_files.values()), _work)
+                st.session_state["fed_sig"] = _sig
             _fd = st.session_state["fed_data"]
-            st.caption(f"{len(_fed_files)} file(s): " + ", ".join(f"`{k}`" for k in _fed_files)
+            _names = list(_fed_files)
+            st.caption(f"{len(_fed_files)} file(s): " + ", ".join(f"`{k}`" for k in _names[:6])
+                       + (f" and {len(_names) - 6} more" if len(_names) > 6 else "")
                        + f" → {', '.join(_fd.animals) or 'no animals found'}")
             if st.button("Remove FED3 files", key="fed_clear"):
                 st.session_state["fed_staged"] = {}
                 st.session_state.pop("fed_data", None)
+                st.session_state.pop("fed_sig", None)
+                if AUTO_FED_FILES:
+                    st.caption("FED3 files that came with the main upload stay until those are removed.")
                 st.rerun()
     FED_DATA = st.session_state.get("fed_data")
 
@@ -2057,11 +2133,29 @@ with st.sidebar:
         )
         pipeline_label = st.selectbox(
             "Pipeline",
-            ["Douglass et al. 2025 (paper, default)", "pyPhotometry / Akam & Walton (bleaching-corrected)"],
+            ["Robust isosbestic (recommended)", "Douglass et al. 2025 (paper)",
+             "pyPhotometry / Akam & Walton (bleaching-corrected)"],
             index=0,
-            help=("Paper: dF/F0 = (465 - fitted 405) / F0, F0 = 0.001 Hz low-pass of 465. "
+            help=("Robust: the control is fitted to the signal with a robust (Tukey bisquare) fit and "
+                  "dF/F = (signal - fitted control) / fitted control (Lerner 2015; Keevers & "
+                  "Jean-Richard-dit-Bressel 2025; Simpson et al. 2024). If the control moves against the "
+                  "signal it is not a valid control, so it is not subtracted and only bleaching is removed. "
+                  "Paper: dF/F0 = (465 - fitted 405) / F0, F0 = 0.001 Hz low-pass of 465. "
                   "pyPhotometry: double-exponential bleaching fit removed first, then the same "
                   "405 regression, dF/F = corrected / bleaching curve."),
+        )
+        control_use_label = st.selectbox(
+            "Use the control channel (robust pipeline)",
+            ["Automatic (recommended)", "Always", "Never"], index=0,
+            help=("Automatic: the control is subtracted only when it behaves like a control (positive "
+                  "fit, and its fast changes do not run opposite to the signal's). 'Never' analyses the "
+                  "signal alone, e.g. for sensors with no usable isosbestic wavelength."),
+        )
+        bg_volts = st.number_input(
+            "Background to subtract (pyPhotometry, V)", 0.0, 10.0, 0.0, 0.001, format="%.4f",
+            help=("Light that is not fluorescence, e.g. the detector reading with the LEDs on and the "
+                  "patch cord in the dark. pyPhotometry's pulsed modes already subtract ambient light, so "
+                  "leave 0 unless you measured one. Plexon camera files are handled separately."),
         )
         fit_label = st.selectbox(
             "405 → 465 fit",
@@ -2092,20 +2186,25 @@ with st.sidebar:
         )
         clock_label = st.selectbox(
             "Time axis for PC-timestamped .ppd files",
-            ["Sample clock, anchored to PC start time (recommended)",
+            ["Automatic (recommended)",
+             "Sample clock, anchored to PC start time",
              "Per-sample PC timestamps"],
             index=0,
-            help=("Both start at the PC clock time of the first sample. The sample clock "
-                  "then counts samples at the sampling rate; it matches the PC wall clock "
-                  "(what FED3 PC_Timestamp and LIQ HD pc_clock use) to within a fraction "
-                  "of a second over a day. The per-sample stamps come from the Windows "
-                  "performance counter and drifted 2.4 s/day from the wall clock on the "
-                  "first file tested. Lost samples are detected either way. Files without "
-                  "PC timestamps always use the sample clock and the header start time."),
+            help=("Automatic: files from the new acquisition build (16 Nov 2026 on) stamp every "
+                  "sample with the Windows system clock, the same clock as FED3 PC_Timestamp, so the "
+                  "time axis follows those stamps. Older files stamped samples with the performance "
+                  "counter, which drifted 2.4 s/day from the wall clock, so for them the sample clock "
+                  "(anchored to the PC time of the first sample) is used. Lost samples are detected "
+                  "either way. Files without PC timestamps use the sample clock and the header start time."),
         )
     PROC_SETTINGS = {
-        "clock_source": "pc" if clock_label.startswith("Per-sample") else "sample",
-        "pipeline": "pyphotometry" if pipeline_label.startswith("pyPhotometry") else "douglass2025",
+        "clock_source": ("pc" if clock_label.startswith("Per-sample") else
+                         "sample" if clock_label.startswith("Sample") else "auto"),
+        "pipeline": ("pyphotometry" if pipeline_label.startswith("pyPhotometry") else
+                     "robust2025" if pipeline_label.startswith("Robust") else "douglass2025"),
+        "control_use": {"Automatic (recommended)": "auto", "Always": "always", "Never": "never"}[control_use_label],
+        "signal_background": float(bg_volts),
+        "control_background": float(bg_volts),
         "fit_method": "irls" if fit_label.startswith("IRLS") else "ols",
         "negative_slope_policy": "zero" if slope_guard else "allow",
         "median_kernel_samples": int(med_k),
@@ -2455,6 +2554,8 @@ if "num_z_ranges" not in st.session_state:
     st.session_state["num_z_ranges"] = 0
 
 run_clicked = st.button("Run / refresh analysis", type="primary", use_container_width=True)
+if st.session_state.pop("auto_run", False) and uploaded_files:
+    run_clicked = True
 
 if run_clicked:
     if not uploaded_files:
@@ -2481,7 +2582,7 @@ if run_clicked:
                         if p.suffix.lower() != ".ppd":
                             continue
                         with open(p, "rb") as fh:
-                            hdr = json.loads(fh.read(int.from_bytes(fh.read(2), "little")))
+                            hdr = pc.parse_header_bytes(fh.read(int.from_bytes(fh.read(2), "little")))
                         bps = float(hdr.get("bytes_per_sample") or 8)
                         approx_hours += p.stat().st_size / (bps * float(hdr.get("sampling_rate", 130)) * 3600)
                     except Exception:
@@ -2504,8 +2605,8 @@ if run_clicked:
                         kind="warn",
                     )
 
-                ppd_files = [p for p in saved_files if p.suffix.lower() == ".ppd"]
-                csv_files = [p for p in saved_files if p.suffix.lower() == ".csv"]
+                ppd_files = [p for p in saved_files if p.suffix.lower() == ".ppd" or p in PYPHOT_CSV]
+                csv_files = [p for p in saved_files if p.suffix.lower() == ".csv" and p not in PYPHOT_CSV]
 
                 # PPD files: run your existing ana.py
                 if ppd_files:
@@ -2580,7 +2681,10 @@ if run_clicked:
                         if PLEXON_OPTS and plexon.looks_like_photometry(df_in.columns):
                             _two, _pinfo = plexon.to_two_channel(df_in, _roi, PLEXON_OPTS["fibre"],
                                                                  PLEXON_OPTS["signal"], PLEXON_OPTS["control"])
-                            df_out, settings = process_raw_csv_dataframe(_two, _roi, settings=PROC_SETTINGS)
+                            _ps = dict(PROC_SETTINGS)
+                            _dark = _pinfo.get("plexon_dark_level") if PLEXON_OPTS.get("background") else None
+                            _ps["signal_background"] = _ps["control_background"] = float(_dark or 0.0)
+                            df_out, settings = process_raw_csv_dataframe(_two, _roi, settings=_ps)
                             for _k in [c for c in _two.columns if c.startswith("plexon_R_")]:
                                 df_out[_k] = _two[_k].to_numpy()[: len(df_out)]
                             settings.update(_pinfo)
@@ -2894,15 +2998,42 @@ else:
         render_diagnostics(result.get("settings", {}))
 
         rec_clock = gt.clock_start_of(view_df, result.get("settings"))
-        _dur = float(pd.to_numeric(full_df["time_sec"], errors="coerce").max()
-                     - pd.to_numeric(full_df["time_sec"], errors="coerce").min())
+        _t_full = pd.to_numeric(full_df["time_sec"], errors="coerce")
+        _dur = float(_t_full.max() - _t_full.min())
+
+        # ---- optional: normalise to a baseline period chosen on the graph ----------------
+        _bkey = f"bl{idx}_{safe_name(result['name'])}"
+        bl_cfg = baseline_view.controls(_bkey, float(_t_full.min()), float(_t_full.max()), rec_clock)
+        rec_limits = manual_limits
+        if bl_cfg["on"]:
+            _base_df = apply_visual_exclusions(full_df, roi_name, visual_exclusions, mode=exclusion_mode_code)
+            _bl_stats = baseline_view.stats_for(_base_df, roi_name, bl_cfg)
+            if _bl_stats is None or not _bl_stats.get("ok"):
+                st.warning("The baseline period has no data (it must lie inside the recording); the whole "
+                           "recording is used instead.")
+                bl_cfg["on"] = False
+            elif not _bl_stats["sd"] > 0:
+                st.warning("The signal is flat during the baseline period (SD 0); choose another period.")
+                bl_cfg["on"] = False
+            else:
+                view_df = baseline_view.apply(view_df, roi_name, bl_cfg, _bl_stats)
+                rec_limits = dict(manual_limits)
+                if not str(manual_z).strip() and f"{roi_name}_z_dFF" in view_df:
+                    rec_limits["z_dFF"] = finite_limits(view_df[f"{roi_name}_z_dFF"])
+                if bl_cfg["dff_too"] and not str(manual_dff).strip() and f"{roi_name}_dFF_percent" in view_df:
+                    rec_limits["dFF"] = finite_limits(view_df[f"{roi_name}_dFF_percent"])
+                with st.expander("Response after the baseline: peak, z and return to baseline", expanded=True):
+                    baseline_view.response_panel(_base_df, roi_name, bl_cfg, _bkey, rec_clock,
+                                                 height=int(430 * height_mult))
 
         def show(fig, kind):
+            baseline_view.shade(fig, bl_cfg)
             gt.chart_block(
                 fig, key=f"rec{idx}_{safe_name(result['name'])}_{safe_name(kind)}",
                 max_points=MAX_POINTS, clock_start=rec_clock, config=PLOTLY_CONFIG,
                 peaks=kind in ("Main dFF", "Z-score sliding mean", "Z-score range analysis"),
                 peak_default_on=False,
+                pick_key=baseline_view.pick_key(_bkey) if bl_cfg.get("wanted") else None,
             )
 
         def render_chart(kind):
@@ -2914,7 +3045,7 @@ else:
             )
             if kind == "Overview":
                 fig = make_overview_figure(
-                    view_df, roi_name, manual_limits,
+                    view_df, roi_name, rec_limits,
                     events=events_for_this_graph,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
@@ -2923,7 +3054,7 @@ else:
                 )
             elif kind == "Raw channels":
                 fig = make_raw_independent_figure(
-                    view_df, roi_name, manual_limits,
+                    view_df, roi_name, rec_limits,
                     events=events_for_this_graph,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
@@ -2935,7 +3066,7 @@ else:
                 fig = make_zscore_sliding_mean_figure(
                     view_df,
                     roi_name,
-                    manual_limits,
+                    rec_limits,
                     events=events_for_this_graph,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
@@ -2957,7 +3088,7 @@ else:
                 fig, z_stats_df = make_zscore_range_analysis_figure(
                     view_df,
                     roi_name,
-                    manual_limits,
+                    rec_limits,
                     events=events_for_this_graph,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
@@ -3006,7 +3137,7 @@ else:
                 _sm_sec, _sm_err = parse_hms_to_seconds(_sm_hms, _w, "sliding mean window")
                 _c[2].caption("Recommended for this recording: " + _why)
                 fig = make_main_dff_figure(
-                    view_df, roi_name, manual_limits,
+                    view_df, roi_name, rec_limits,
                     events=events_for_this_graph,
                     exclusions=visual_exclusions,
                     show_exclusions=show_hidden_region_shading,
@@ -3022,7 +3153,7 @@ else:
             with st.expander("Data preview and downloads"):
                 th.explain("About this preview", "Preview of the displayed data window. The downloadable CSV remains the full processed data.")
                 st.dataframe(_preview_12h(view_df.head(500)), use_container_width=True, height=360)
-                st.download_button(
+                gt.download_button(
                     label=f"Download full processed CSV for {result['name']}",
                     data=lambda _d=full_df: _d.to_csv(index=False).encode("utf-8"),
                     file_name=f"{safe_name(result['name'])}_processed_output.csv",
@@ -3043,7 +3174,7 @@ else:
         if view == "Data preview":
             th.explain("About this preview", "Preview of the displayed data window. The downloadable CSV remains the full processed data.")
             st.dataframe(_preview_12h(view_df.head(500)), use_container_width=True, height=360)
-            st.download_button(
+            gt.download_button(
                 label=f"Download full processed CSV for {result['name']}",
                 data=lambda _d=full_df: _d.to_csv(index=False).encode("utf-8"),
                 file_name=f"{safe_name(result['name'])}_processed_output.csv",
@@ -3392,8 +3523,9 @@ else:
                             x=taxis, y=mean, mode="lines", name="Mean",
                             line=dict(width=2, color=th.TRACE_COLORS["dff"]),
                         ), row=1, col=1)
+                        _hx, _hz = gt.heatmap_arrays(taxis, mat)
                         pf.add_trace(go.Heatmap(
-                            z=mat, x=taxis, y=np.arange(1, mat.shape[0] + 1),
+                            z=_hz, x=_hx, y=list(range(1, mat.shape[0] + 1)),
                             colorscale="RdBu_r", zmid=0,
                             colorbar=dict(title=unit, len=0.5, y=0.22),
                         ), row=2, col=1)
@@ -3443,7 +3575,7 @@ else:
                 )
 
     st.divider()
-    st.download_button(
+    gt.download_button(
         label="Download all full processed outputs as ZIP",
         data=lambda: make_zip_from_results(results, roi_name),
         file_name="photometry_analysis_outputs.zip",

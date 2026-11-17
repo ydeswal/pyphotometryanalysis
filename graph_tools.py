@@ -257,6 +257,39 @@ def minmax_indices(y, max_points):
     return idx[idx < n]
 
 
+def heatmap_arrays(x, z, max_cols=2000, decimals=4):
+    """
+    x and z for a go.Heatmap that every Plotly / Streamlit version draws the same way:
+    at most `max_cols` columns (neighbouring columns averaged), +/-inf replaced by gaps,
+    values rounded, and both sent as plain lists rather than binary-encoded numpy arrays
+    (plotly 6 encodes 2-D arrays in a form older Plotly.js builds do not read, which
+    leaves an empty heatmap with no error).
+    """
+    z = np.asarray(z, dtype=float)
+    if z.ndim == 1:
+        z = z[None, :]
+    x = np.asarray(x, dtype=float) if x is not None else np.arange(z.shape[1], dtype=float)
+    z = np.where(np.isfinite(z), z, np.nan)
+    ncol = z.shape[1]
+    if max_cols and ncol > max_cols:
+        k = int(np.ceil(ncol / max_cols))
+        m = (ncol // k) * k
+        with np.errstate(invalid="ignore"):
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.simplefilter("ignore", RuntimeWarning)
+                zz = np.nanmean(z[:, :m].reshape(z.shape[0], -1, k), axis=2)
+        xx = x[:m].reshape(-1, k).mean(axis=1)
+        if m < ncol:
+            with _w.catch_warnings():
+                _w.simplefilter("ignore", RuntimeWarning)
+                zz = np.hstack([zz, np.nanmean(z[:, m:], axis=1, keepdims=True)])
+            xx = np.r_[xx, x[m:].mean()]
+        z, x = zz, xx
+    zl = [[None if not np.isfinite(v) else round(float(v), decimals) for v in row] for row in z]
+    return x.tolist(), zl
+
+
 def lighten_figure(fig, max_points):
     """Decimate every long line trace in place. Marker-only traces (lick
     rasters) and filled shapes (bout bands) are left alone."""
@@ -603,14 +636,40 @@ def add_time_hover(fig, clock_start=None, show_recording=True):
         tr.update(customdata=cd, hovertemplate=" · ".join(head) + "<br>" + body + "<extra></extra>")
         done.add(ax)
     if done:
-        fig.update_xaxes(unifiedhovertitle=dict(text=" "))
+        hide_unified_title(fig)
     return fig
+
+
+def hide_unified_title(fig):
+    """Blank the x value plotly puts on top of a unified hover box (we show our own time).
+    Needs plotly >= 6.1; older versions do not know the property and simply keep it."""
+    try:
+        fig.update_xaxes(unifiedhovertitle=dict(text=" "))
+    except (ValueError, TypeError):
+        pass
+    return fig
+
+
+def _streamlit_version():
+    try:
+        return tuple(int(p) for p in st.__version__.split(".")[:2])
+    except (ValueError, AttributeError):
+        return (0, 0)
+
+
+def download_button(label, data, *args, **kwargs):
+    """st.download_button that builds the file only when it is clicked (Streamlit >= 1.52 takes
+    a function) and on older Streamlit builds it straight away instead of failing with
+    'Invalid binary data format: function'."""
+    if callable(data) and _streamlit_version() < (1, 52):
+        data = data()
+    return st.download_button(label, data=data, *args, **kwargs)
 
 
 @st.fragment
 def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0,
                 peaks=False, peak_default_on=False, config=None, ruler=True, compact=False,
-                event_counts=None, time_hover=None):
+                event_counts=None, time_hover=None, pick_key=None, pick_label="📍 Set baseline end"):
     """
     Show one Plotly figure with an optional peaks panel and two-click time
     ruler. event_counts: optional list of (label, times_sec, grams_each or
@@ -619,14 +678,26 @@ def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0
     "clock+recording" / "clock" to put those times at the top of the hover
     box (x must be seconds). Runs as a fragment: clicking the graph or changing these controls
     reruns only this block, not the whole app.
+    pick_key: when given, a "Set baseline end" switch is added; with it on, a click on the
+    graph stores that time (seconds) in st.session_state[pick_key] and reruns the whole app,
+    so every graph can be re-normalised to the baseline that ends there.
     """
     fig = go.Figure(fig)                 # never mutate the caller's figure
     st.session_state.setdefault(f"{key}_pts", [])
 
-    bar = st.columns([1, 1] if compact else [1, 1, 3])
+    bar = st.columns(([1, 1] if compact else [1, 1, 3]) if not pick_key else
+                     ([1, 1, 1.4] if compact else [1, 1, 1.5, 2]))
+    if st.session_state.pop(f"{key}_pick_reset", False):
+        st.session_state[f"{key}_pick"] = False
+    pick_on = bar[2].toggle(pick_label, key=f"{key}_pick",
+                            help="Then click the graph at the moment the baseline should END (e.g. just "
+                                 "before an event). The baseline is the period of the chosen length before "
+                                 "it, and every graph is normalised to it.") if pick_key else False
     ruler_on = bar[0].toggle("📏 Ruler", key=f"{key}_ruler",
-                             help="Click two points on the graph to measure the time between them.") \
+                             help="Click two points on the graph to measure the time between them.",
+                             disabled=pick_on) \
         if ruler else False
+    ruler_on = ruler_on and not pick_on
     peaks_on = bar[1].toggle("▲▼ Peaks", value=bool(peak_default_on), key=f"{key}_peaks",
                              help="Highest peaks and lowest troughs; remove them one by one.") \
         if peaks else False
@@ -670,6 +741,31 @@ def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0
     if time_hover and x_unit_sec == 1.0:
         add_time_hover(fig, clock_start, show_recording="recording" in str(time_hover))
     cfg = dict(config or _CONFIG)
+    if pick_on:
+        st.caption("Click the graph where the baseline should end.")
+        for k in _line_traces(fig, min_points=2):
+            fig.data[k].update(mode="lines+markers", marker=dict(size=6, opacity=0),
+                               selected=dict(marker=dict(opacity=0)),
+                               unselected=dict(marker=dict(opacity=0)))
+        fig.update_layout(clickmode="event+select", dragmode="pan")
+        ev = st.plotly_chart(fig, use_container_width=True, config=cfg, key=f"{key}_pickchart",
+                             on_select="rerun", selection_mode="points")
+        sel = getattr(getattr(ev, "selection", None), "points", None) or \
+            (ev.get("selection", {}).get("points", []) if isinstance(ev, dict) else [])
+        if sel:
+            p0 = sel[0]
+            fp = (p0.get("curve_number"), p0.get("point_index"), p0.get("x"))
+            if fp != st.session_state.get(f"{key}_picklast"):
+                st.session_state[f"{key}_picklast"] = fp
+                try:
+                    xv = float(p0["x"]) * x_unit_sec
+                except (KeyError, TypeError, ValueError):
+                    xv = None
+                if xv is not None and np.isfinite(xv):
+                    st.session_state[pick_key] = xv
+                    st.session_state[f"{key}_pick_reset"] = True     # switch the toggle off next run
+                    st.rerun()
+        return
     if ruler_on:
         # Plotly only reports clicks on MARKERS, never on a bare line. Give
         # every line invisible markers so a click on the graph registers;

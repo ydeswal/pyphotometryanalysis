@@ -408,7 +408,8 @@ def aligned_figure(mat, tax, unit_label, base, resp, title, height):
         fig.add_vrect(x0=a, x1=b, fillcolor=col, line_width=0, row=1, col=1,
                       annotation_text=lab, annotation_position="top left",
                       annotation_font_size=10)
-    fig.add_trace(go.Heatmap(z=mat, x=tax, y=np.arange(1, mat.shape[0] + 1), colorscale="RdBu_r",
+    _hx, _hz = gt.heatmap_arrays(tax, mat)
+    fig.add_trace(go.Heatmap(z=_hz, x=_hx, y=list(range(1, mat.shape[0] + 1)), colorscale="RdBu_r",
                              zmid=0, colorbar=dict(title=unit_label, len=0.45, y=0.22)), row=2, col=1)
     for r in (1, 2):
         fig.add_vline(x=0, line=dict(color="#111827", width=1.3, dash="dash"), row=r, col=1)
@@ -474,6 +475,27 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             rec_of[a] = i
     if not results:
         st.caption("No photometry loaded; showing food intake only.")
+    elif rec_of:
+        rows = []
+        for a, i in rec_of.items():
+            r = results[i]
+            cs = gt.clock_start_of(r["df"], r.get("settings"))
+            if cs is None:
+                continue
+            tt = pd.to_numeric(r["df"]["time_sec"], errors="coerce")
+            p = fed3.to_seconds(fed.times(a, "pellet", sessions), cs)
+            inside = int(((p >= tt.min()) & (p <= tt.max())).sum())
+            rows.append({"recording": rec_names[i], "animal": a, "pellets (FED)": int(p.size),
+                         "during the recording": inside, "before it started": int((p < tt.min()).sum()),
+                         "after it ended": int((p > tt.max()).sum())})
+        if rows:
+            cov_tab = pd.DataFrame(rows)
+            outside = int(cov_tab["before it started"].sum() + cov_tab["after it ended"].sum())
+            with st.expander("Pellets during each recording" + (f" ({outside} outside the recordings)"
+                                                                 if outside else ""), expanded=False):
+                st.dataframe(cov_tab, hide_index=True, use_container_width=True)
+                st.caption("Pellets taken before the photometry started or after it stopped have no signal to "
+                           "go with them; they still count in the intake graphs.")
 
     view = st.radio("Feeding view", ["Photometry above, food below", "One graph: signal + eating",
                                      "Aligned to eating", "All animals", "FED health"],
@@ -761,7 +783,7 @@ def _aligned(t, y, sig_label, pellets_s, meals, cov_s, pel_rows, cs, animal, gra
         tbl.insert(4, "meal (g)", np.round(mm["n_pellets"].to_numpy() * grams_each, 3))
         tbl.insert(5, "meal length (s)", np.round(mm["duration_s"].to_numpy(), 1))
     st.dataframe(tbl, hide_index=True, use_container_width=True, height=min(420, 40 + 35 * len(tbl)))
-    st.download_button("Download this table (CSV)", data=lambda: tbl.to_csv(index=False).encode(),
+    gt.download_button("Download this table (CSV)", data=lambda: tbl.to_csv(index=False).encode(),
                        file_name=f"{animal}_{'meals' if meal_mode else 'pellets'}_aligned.csv",
                        mime="text/csv", key=f"fed_dl_{animal}_{meal_mode}")
 
@@ -922,7 +944,7 @@ def _fed_health(fed, sessions, ref, max_points, height_mult, config, results, re
         lst = pd.DataFrame(rows).sort_values("_t").drop(columns="_t")
         st.markdown(f"**Every FED problem and alert** ({len(lst)})")
         st.dataframe(lst, hide_index=True, use_container_width=True, height=min(460, 40 + 35 * len(lst)))
-        st.download_button("Download this list (CSV)", data=lambda: lst.to_csv(index=False).encode(),
+        gt.download_button("Download this list (CSV)", data=lambda: lst.to_csv(index=False).encode(),
                            file_name="fed_health_events.csv", mime="text/csv", key="fed_h_dl")
     else:
         st.success("No FED problems recorded for the selected sessions.")

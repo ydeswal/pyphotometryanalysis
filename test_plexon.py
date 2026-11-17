@@ -47,6 +47,17 @@ check("Plexon's own R kept", "plexon_R_465" in two.columns)
 check("frame rate", abs(info["plexon_fs"] - 30) < 0.01 and info["plexon_frame_gaps"] == 0)
 check("notes mention no clock time and 410 nm", any("not the clock time" in n for n in plexon.notes_for(info))
       and any("410" in n for n in plexon.notes_for(info)))
+check("flat channel ABOVE the signal is not taken as dark level (465 falls to 14 here)",
+      info.get("plexon_dark_level") is None)
+df_hi = df.copy()
+df_hi["RawF_465_F1"] = df_hi["RawF_465_F1"] + 5.0
+info_hi = plexon.to_two_channel(df_hi, "BLA")[1]
+check("camera dark level found from the flat unused channel", abs((info_hi.get("plexon_dark_level") or 0) - 15.0) < 0.01
+      and str(info_hi.get("plexon_dark_nm")) == "560", str(info_hi.get("plexon_dark_level")))
+df_live = df_hi.copy()
+df_live["RawF_560_F1"] = 15.0 + 2.0 * np.sin(t / 20.0)
+check("a channel that carries a signal is not taken as dark level",
+      plexon.to_two_channel(df_live, "BLA")[1].get("plexon_dark_level") is None)
 try:
     plexon.to_two_channel(df, "BLA", fibre="F2")
     check("unknown fibre raises", False)

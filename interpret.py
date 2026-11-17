@@ -194,6 +194,17 @@ def recording_notes(settings):
             out.append(f"fit R² {r2:.2f}: 405 explains part of the 465 signal; correction removed some shared changes.")
         else:
             out.append(f"fit R² {r2:.2f}: 405 and 465 share much of their changes; correction matters a lot here.")
+    if s.get("control_used") is False:
+        out.append("The control channel was NOT subtracted for this recording (it moved against the signal, or "
+                   "was switched off): only bleaching was removed"
+                   + (f", using the {s['baseline_method']}" if s.get("baseline_method") else "")
+                   + ". Movement artefacts are therefore still in the signal.")
+    elif s.get("pipeline") == "robust2025":
+        out.append("dF/F = (signal - fitted control) / fitted control, with a robust (Tukey bisquare) fit of "
+                   "the control to the signal.")
+    if s.get("signal_background"):
+        out.append(f"A non-fluorescence background of {s['signal_background']:g} was subtracted from the raw "
+                   "channels first (camera dark level / detector offset).")
     if s.get("fit_slope_clamped"):
         out.append("The 405 fit slope came out negative and was clamped, so the 405 channel was not used to correct.")
     cc = s.get("clock_check") or {}

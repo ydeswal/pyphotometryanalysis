@@ -53,13 +53,13 @@ def _hms(seconds):
     return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
 
 
-def convert(path, outdir=None, write_timestamps=True, clock_source="sample"):
+def convert(path, outdir=None, write_timestamps=True, clock_source="auto"):
     path = Path(path)
     outdir = Path(outdir) if outdir else path.parent
     outdir.mkdir(parents=True, exist_ok=True)
 
     with open(path, "rb") as f:
-        header = json.loads(f.read(int.from_bytes(f.read(2), "little")).decode("utf-8"))
+        header = pc.parse_header_bytes(f.read(int.from_bytes(f.read(2), "little")))
         buf = f.read()
 
     fs = float(header["sampling_rate"])

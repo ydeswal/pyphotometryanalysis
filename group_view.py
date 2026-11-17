@@ -21,6 +21,10 @@ animals, or the same animals on several days) analysed together.
                     fixed 405 / motion-correction data check
   Feeding pattern   meals, meal size, inter-meal interval, satiety ratio ...
                     per animal and group mean +/- SEM
+  Actogram          each day a row, double-plotted (0-48 h), signal as colour,
+                    pellets as ticks, dark phase marked (longitudinal.py)
+  Meal size vs      the signal change at every meal against the meal's size,
+  response          slope per animal, animals as the unit (longitudinal.py)
 
 All numbers come from group_analysis.py (also used by the AI chat).
 """
@@ -48,8 +52,8 @@ _SIG = "#0072B2"
 _FED = "#b45309"
 _DARK = "rgba(15,23,42,0.055)"
 
-VIEWS = ["Combined (group mean)", "Each recording", "Heatmap", "Event response & signal check",
-         "Meal-aligned (group)", "Feeding pattern table"]
+VIEWS = ["Combined (group mean)", "Each recording", "Heatmap", "Actogram (days, double-plotted)",
+         "Meal size vs response", "Event response & signal check", "Meal-aligned (group)", "Feeding pattern table"]
 RATIO = "465 ÷ 405 ratio (raw)"
 RAW_KINDS = (fed_view.RAW_BOTH, RATIO, "465 raw", "405 raw", "465 filtered")
 _UV = "#009E73"
@@ -199,7 +203,7 @@ def _x_hover(fig, labeler):
                   + "<extra></extra>")
         done.add(ax)
     if done:
-        fig.update_xaxes(unifiedhovertitle=dict(text=" "))
+        gt.hide_unified_title(fig)
 
 
 def _style(fig, height):
@@ -422,7 +426,8 @@ def heatmap_figure(S, F, alignment, ref, lights_on, sig_label, centred, height_m
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.08,
                         subplot_titles=[sig_label, "Pellets per bin"][:rows])
     zmax = np.nanpercentile(np.abs(S["M"]), 98) if np.isfinite(S["M"]).any() else 1
-    fig.add_trace(go.Heatmap(x=S["x"], y=labels, z=S["M"], colorscale="RdBu_r" if centred else "Viridis",
+    _hx, _hz = gt.heatmap_arrays(S["x"], S["M"])
+    fig.add_trace(go.Heatmap(x=_hx, y=labels, z=_hz, colorscale="RdBu_r" if centred else "Viridis",
                              zmid=0 if centred else None, zmin=-zmax if centred else None,
                              zmax=zmax if centred else None,
                              colorbar=dict(title=dict(text=sig_label, side="right"), len=0.55 if rows > 1 else 1,
@@ -440,7 +445,8 @@ def heatmap_figure(S, F, alignment, ref, lights_on, sig_label, centred, height_m
                                  showlegend=False, hovertemplate="%{y}: %{text}<extra></extra>"), row=1, col=1)
     if F is not None:
         fl = [f"{a} · {g}" if len(set(F["groups"])) > 1 else a for a, g in zip(F["animals"], F["groups"])]
-        fig.add_trace(go.Heatmap(x=F["x"], y=fl, z=F["M"], colorscale=[[0, "#fff7ed"], [1, "#9a3412"]],
+        _fx, _fz = gt.heatmap_arrays(F["x"], F["M"], decimals=3)
+        fig.add_trace(go.Heatmap(x=_fx, y=fl, z=_fz, colorscale=[[0, "#fff7ed"], [1, "#9a3412"]],
                                  colorbar=dict(title=dict(text="pellets", side="right"), len=0.4, y=0,
                                                yanchor="bottom", thickness=12),
                                  hovertemplate="%{y}<br>%{z:.0f} pellets<extra></extra>"), row=2, col=1)
@@ -783,6 +789,34 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                           help="Raw channels are in volts that depend on LED power and fibre, so compare them as "
                                "% change from a baseline.")
     stat = c[3].selectbox("Group line and band", ga.STATS, key="grp_stat")
+    span0 = max(durations) if durations else 3600.0
+    bl_end_text, bl_choose = None, False
+    if "baseline" in norm.lower():
+        _bc = st.columns([0.7, 0.7, 1.6, 2.0])
+        dflt_h, dflt_m = (0, 30.0) if span0 >= 2 * 3600 else (0, 0.5)
+        bl_h = _bc[0].number_input("Baseline: hours", 0, 96, dflt_h, 1, key="grp_bl_h")
+        bl_m = _bc[1].number_input("minutes", 0.0, 59.99, dflt_m, 0.5, key=f"grp_bl_m_{dflt_m:g}")
+        base_min = max(bl_h * 60.0 + bl_m, 0.05)
+        BL_MODES = ["Start of each recording (or before the event / first pellet)", "A time I choose on the graph"]
+        bl_mode = _bc[2].selectbox("Baseline ends at", BL_MODES, key="grp_bl_mode",
+                                 help="First option: the first minutes of each recording, or the minutes before 0 "
+                                      "when recordings are lined up on an event or the first pellet. Second: the "
+                                      "same moment on the graph's time axis for every recording, set by clicking "
+                                      "the graph (📍 Set baseline end) or typing it.")
+        bl_choose = bl_mode == BL_MODES[1]
+        if bl_choose:
+            if st.session_state.get("grp_bl_end") is not None and \
+                    st.session_state.get("grp_bl_synced") != (st.session_state["grp_bl_end"], alignment):
+                st.session_state["grp_bl_txt"] = _fmt_axis(st.session_state["grp_bl_end"], alignment,
+                                                           st.session_state.get("grp_ref"))
+                st.session_state["grp_bl_synced"] = (st.session_state["grp_bl_end"], alignment)
+            bl_end_text = _bc[3].text_input("Time on the graph's axis", key="grp_bl_txt",
+                                          placeholder="click the graph, or type e.g. 1:30:00 / 3:05 PM",
+                                          help="Clock time with AM/PM (3:05 PM) when lined up by clock or time of "
+                                               "day; otherwise H:MM:SS on the x axis (with clock alignment, H:MM:SS "
+                                               "counts from the first recording's start).")
+    else:
+        base_min = 30.0 if span0 >= 2 * 3600 else 0.5
     ev_label = None
     if alignment.startswith("Time since an event"):
         if not ev_labels:
@@ -819,20 +853,16 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             gap, minp = MEAL_PRESETS[preset]
             d[3].caption(f"Meals: pellets less than {gap:g} s apart, at least {minp} pellet(s).")
         e = st.columns(4)
-        _on_t = e[0].text_input("Lights on", "7:00 AM", key="grp_on_t", help="e.g. 7:00 AM, 6:30 am or 07:00")
-        _off_t = e[1].text_input("Lights off (dark starts)", "7:00 PM", key="grp_off_t",
-                                 help="e.g. 7:00 PM, 6:30 pm or 19:00")
+        _on_t = e[0].text_input("Lights on", "10:00 PM", key="grp_on_t",
+                                help="e.g. 10:00 PM, 7:00 am or 22:00. Default: reversed cycle, lights on "
+                                     "10 PM to 10 AM.")
+        _off_t = e[1].text_input("Lights off (dark starts)", "10:00 AM", key="grp_off_t",
+                                 help="e.g. 10:00 AM, 7:00 pm or 10:00")
         lights_on, lights_off = gt.parse_tod(_on_t), gt.parse_tod(_off_t)
         if lights_on is None or lights_off is None:
-            e[0].warning("Times not understood; using 7:00 AM and 7:00 PM.")
-            lights_on, lights_off = 7.0, 19.0
+            e[0].warning("Times not understood; using lights on 10:00 PM and off 10:00 AM.")
+            lights_on, lights_off = 22.0, 10.0
         shade = e[2].checkbox("Shade the dark phase", True, key="grp_shade")
-        dflt_base = 30.0 if span_guess >= 2 * 3600 else 0.5
-        base_min = e[3].number_input("Baseline period (min)", 0.1, 600.0, dflt_base, 0.1,
-                                     key=f"grp_basemin_{dflt_base:g}",
-                                     help="For the baseline normalisations: the first minutes of each recording, "
-                                          "or the minutes before the first pellet / the event when lining up on "
-                                          "it.")
         f = st.columns(4)
         per_animal = f[0].checkbox("Average recordings of the same animal first", True, key="grp_peranimal",
                                    help="So each animal counts once (Loewinger et al. 2024).")
@@ -879,6 +909,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                            fed if animals else None, sessions,
                            (r.get("settings") or {}).get("fit_R2"), ctrl, mg / 1000.0)
         m["y405"] = y405
+        m["dff_percent"] = bool(unit == "%" and str(kind).lower().startswith("df/f"))
         m["events"] = events.get(row["recording"], [])
         if ev_label:
             hits = [sec for sec, l in m["events"] if l == ev_label]
@@ -909,6 +940,20 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                 fed_members.append(ga.make_member(f"FED {an}", an, dflt, None, None, cov["start"].min(), fed,
                                                   sessions, None, None, mg / 1000.0))
     ref = ga.reference_clock(fed_members)
+    st.session_state["grp_ref"] = ref
+    bl_end = None
+    st.session_state["grp_bl_end_used"] = None
+    if bl_choose:
+        bl_end = _parse_axis(bl_end_text, alignment, ref) if bl_end_text else None
+        if bl_end_text and bl_end is None:
+            st.warning("The baseline end time was not understood; use the units of the x axis.")
+        if bl_end is not None:
+            st.session_state["grp_bl_end"] = bl_end
+            st.session_state["grp_bl_synced"] = (bl_end, alignment)
+            st.session_state["grp_bl_end_used"] = bl_end
+        else:
+            st.info("Set where the baseline ends: switch on **📍 Set baseline end** above the graph and click it, "
+                    "or type the time. Until then each recording is normalised to its first minutes.")
     spans = []
     for m in members:
         off = ga.align_offset(m, alignment, ref)
@@ -954,7 +999,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                + sc.SMOOTHING_HELP + "\n\n" + f"**{norm}.** {notes[0]}\n\n**{stat}.** {notes[1]}"
                + (f"\n\n**{fed_mode}.** {notes[2]}" if len(notes) > 2 and notes[2] else ""))
 
-    S = ga.signal_matrix(members, alignment, norm, bin_s, k, base_min, ref, per_animal)
+    S = ga.signal_matrix(members, alignment, norm, bin_s, k, base_min, ref, per_animal, baseline_end=bl_end)
     if S is None:
         st.warning("None of the selected recordings can be lined up this way (e.g. no pellets for "
                    "'Time since first pellet', or no event).")
@@ -962,7 +1007,11 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     S2 = None
     if kind == fed_view.RAW_BOTH:
         m405 = [dict(m, y=m["y405"]) for m in members if m.get("y405") is not None]
-        S2 = ga.signal_matrix(m405, alignment, norm, bin_s, k, base_min, ref, per_animal) if m405 else None
+        S2 = ga.signal_matrix(m405, alignment, norm, bin_s, k, base_min, ref, per_animal,
+                              baseline_end=bl_end) if m405 else None
+    if bl_end is not None and not np.isfinite(S["M"]).any():
+        st.warning("No recording has data in the chosen baseline period, so nothing can be normalised to it. "
+                   "Choose a baseline end inside the recordings.")
     if S["skipped"]:
         st.markdown(f'<div class="pp-note warn">Left out (cannot be aligned this way): '
                     f'{", ".join(S["skipped"])}</div>', unsafe_allow_html=True)
@@ -978,7 +1027,16 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             for ax in fig.layout:
                 if ax.startswith("xaxis") and fig.layout[ax].title.text:
                     fig.layout[ax].title.text = fig.layout[ax].title.text.replace("'event'", f"'{ev_label}'")
+        if bl_end is not None:
+            try:
+                fig.add_vrect(x0=bl_end - base_min * 60.0, x1=bl_end, fillcolor="rgba(37,99,235,0.10)", line_width=0,
+                              layer="below", row="all", col=1)
+                fig.add_vline(x=bl_end, line=dict(color="#2563eb", width=1.4, dash="dot"), row="all", col=1)
+            except Exception:
+                fig.add_vrect(x0=bl_end - base_min * 60.0, x1=bl_end, fillcolor="rgba(37,99,235,0.10)",
+                              line_width=0, layer="below")
         return fig
+    pick = "grp_bl_end" if bl_choose else None
 
     if view == "Combined (group mean)":
         F = ga.fed_matrix(fed_members, alignment, bin_s, fed_mode, ref, per_animal=per_animal) \
@@ -991,8 +1049,10 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                               evs=[e for v in rev.values() for e in v], min_n=min_n)
         _x_hover(fig, lab)
         gt.chart_block(retitle(fig), key="grp_combined", max_points=max_points, clock_start=clock_for_ruler,
-                       config=config)
+                       config=config, pick_key=pick)
         _downloads(S, F, stat, lab, "combined", S2)
+        if bl_end is not None:
+            _baseline_response_table(members, alignment, ref, bl_end, base_min, sig_label)
 
     elif view == "Each recording":
         layout = st.radio("Layout", ["Stacked panels", "One graph"], horizontal=True, key="grp_layout")
@@ -1005,7 +1065,9 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                           darks, layout, sig_label, bars, h, S2=S2, row_events=rev, own_axis_405=own_axis)
         _x_hover(fig, lab)
         gt.chart_block(retitle(fig), key="grp_each_fig", max_points=max_points * 2, clock_start=clock_for_ruler,
-                       config=config)
+                       config=config, pick_key=pick)
+        if bl_end is not None:
+            _baseline_response_table(members, alignment, ref, bl_end, base_min, sig_label)
         th.explain("How to read this graph", "Dashed red lines: events. Ticks above each trace mark single "
                    "pellets; shaded areas are the dark phase." + (" Blue: 465, green: 405." if S2 is not None
                                                                      else ""))
@@ -1019,6 +1081,14 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
         if S2 is not None:
             th.explain("How to read this graph", "The heatmap shows the 465 channel; see *Each recording* for 405.")
         st.plotly_chart(retitle(fig), use_container_width=True, config=config, key="grp_heat")
+
+    elif view == "Actogram (days, double-plotted)":
+        _actogram_view(members, norm, base_min, bl_end, alignment, ref, bin_s, lights_on, lights_off, sig_label,
+                       centred, config, h)
+
+    elif view == "Meal size vs response":
+        _meal_size_view(members, norm, base_min, bl_end, alignment, ref, gap, minp, lights_on, lights_off,
+                        sig_label, config, h)
 
     elif view == "Meal-aligned (group)":
         _aligned_view(members, norm, base_min, alignment, gap, minp, pre, post, base, resp, stat, show_each,
@@ -1369,8 +1439,9 @@ def _aligned_view(members, norm, base_min, alignment, gap, minp, pre, post, base
     with st.spinner("Aligning to meals and testing against random times for every animal…"):
         for m in with_fed:
             mm = dict(m)
-            bm = ga.baseline_mask(m, alignment, base_min) if "baseline" in norm.lower() else None
-            mm["y"] = ga.normalise(m["t"], m["y"], norm, bm)
+            bm = ga.baseline_mask(m, alignment, base_min, st.session_state.get("grp_bl_end_used"),
+                                  st.session_state.get("grp_ref")) if "baseline" in norm.lower() else None
+            mm["y"] = ga.normalise(m["t"], m["y"], norm, bm, dff_percent=bool(m.get("dff_percent")))
             R.append(ga.member_meal_response(mm, gap, minp, pre, post, base, resp, n_perm=1000))
     G = ga.group_meal_response(R, stat)
     if not G:
@@ -1431,3 +1502,227 @@ def _aligned_view(members, norm, base_min, alignment, gap, minp, pre, post, base
                              "meal_onset_sec_into_recording": round(float(tm), 2), "change": float(dlt)})
     st.download_button("Download per-meal changes (CSV, for a mixed model with animal as random effect)",
                        pd.DataFrame(per_meal).to_csv(index=False).encode(), "meal_changes_per_meal.csv", "text/csv")
+
+
+# =============================================================================
+# BASELINE AT A CHOSEN TIME (group)
+# =============================================================================
+
+def _fmt_axis(x, alignment, ref):
+    """A time on the shared axis, written the way it is typed back."""
+    if x is None:
+        return ""
+    if alignment.startswith("Clock") and ref is not None:
+        return gt.fmt12(pd.Timestamp(ref) + pd.Timedelta(seconds=float(x)), decimals=0, date=False)
+    if alignment.startswith("Time of day"):
+        return gt.fmt_tod((float(x) / 3600.0) % 24)
+    return gt.fmt_hms(float(x), 1)
+
+
+def _parse_axis(text, alignment, ref):
+    """Typed time -> seconds on the shared axis (None if not understood)."""
+    if not text:
+        return None
+    if alignment.startswith("Clock") and ref is not None:
+        low = str(text).lower()
+        if "am" in low or "pm" in low or any(ch in low for ch in "-/"):
+            return parse_clock_time(text, ref)
+        return parse_recording_time(text)          # H:MM:SS = time from the left end of the axis
+    if alignment.startswith("Time of day"):
+        h = gt.parse_tod(text)
+        return None if h is None else h * 3600.0
+    return parse_recording_time(text)
+
+
+def _baseline_response_table(members, alignment, ref, end_x, base_min, sig_label):
+    """Peak after the chosen baseline, for every recording (same baseline moment on the shared axis)."""
+    import baseline as bl
+    with st.expander("Response after the baseline, each recording", expanded=False):
+        c = st.columns([1, 1, 1, 2])
+        resp_min = c[0].number_input("Response window (min)", 0.05, 24 * 60.0, float(max(base_min, 1.0)), 0.5,
+                                     key="grp_bl_resp")
+        direction = c[1].selectbox("Look for", ["Larger change", "Peak (up)", "Dip (down)"], key="grp_bl_dir")
+        smooth = c[2].number_input("Smooth (s)", 0.0, 600.0, 2.0, 0.5, key="grp_bl_sm")
+        rows = []
+        for m in members:
+            off = ga.align_offset(m, alignment, ref)
+            if off is None or m["t"] is None:
+                continue
+            r = bl.peak_vs_baseline(m["t"] + off, m["y"], end_x, base_min * 60.0, resp_min * 60.0,
+                                    {"Larger change": "auto", "Peak (up)": "up", "Dip (down)": "down"}[direction],
+                                    smooth)
+            row = {"recording": m["name"], "animal": m["animal"] or "", "group": m["group"]}
+            if r.get("ok"):
+                row.update({"peak z (baseline only)": r["peak_z"], "peak z (baseline + response)":
+                            r["peak_z_whole_window"], "time to peak (s)": r["peak_time_s"],
+                            "back within 1 SD (s)": r["return_s"], "mean z over response": r["mean_z"],
+                            "AUC (z·s)": r["auc_z"]})
+                if m.get("dff_percent"):
+                    row["peak, % change from baseline"] = r["peak_change_pct"]
+            else:
+                row["note"] = r.get("message", "")
+            rows.append(row)
+        if not rows:
+            st.info("No recording covers the baseline.")
+            return
+        tab = pd.DataFrame(rows)
+        num = [c_ for c_ in tab.columns if c_ not in ("recording", "animal", "group", "note")]
+        for g, sub in tab.groupby("group", sort=False):
+            if len(sub) > 1:
+                r = {"recording": f"{g}: mean ± SEM (n = {len(sub)})", "group": g}
+                for c_ in num:
+                    v = pd.to_numeric(sub[c_], errors="coerce").to_numpy(float)
+                    v = v[np.isfinite(v)]
+                    r[c_] = (f"{v.mean():.3g} ± {v.std(ddof=1) / np.sqrt(v.size):.2g}" if v.size > 1 else
+                             (f"{v[0]:.3g}" if v.size else ""))
+                tab = pd.concat([tab, pd.DataFrame([r])], ignore_index=True)
+        st.dataframe(tab, use_container_width=True, hide_index=True)
+        st.caption(f"Signal: {sig_label} before normalising. Baseline = the {base_min:g} min before the chosen "
+                   "moment; z is (signal − baseline mean) ÷ baseline SD of each recording. 'Baseline + response' "
+                   "is the same peak z-scored over both windows together, for comparison.")
+        st.download_button("Download (CSV)", tab.to_csv(index=False).encode(), "peak_vs_baseline_group.csv",
+                           "text/csv", key="grp_bl_dl")
+
+
+# =============================================================================
+# ACTOGRAM AND MEAL SIZE VS RESPONSE (longitudinal.py)
+# =============================================================================
+
+def _normalised(m, norm, base_min, bl_end, alignment, ref):
+    bm = ga.baseline_mask(m, alignment, base_min, bl_end, ref) if "baseline" in norm.lower() else None
+    return ga.normalise(m["t"], m["y"], norm, bm, dff_percent=bool(m.get("dff_percent")))
+
+
+def _actogram_view(members, norm, base_min, bl_end, alignment, ref, bin_s, lights_on, lights_off, sig_label,
+                   centred, config, h):
+    import longitudinal as lg
+    c = st.columns([1, 1, 2])
+    abin = c[0].select_slider("Bin", [60, 120, 300, 600, 900, 1800, 3600], value=300 if bin_s <= 300 else 900,
+                              format_func=_bin_label, key="grp_acto_bin",
+                              help="Width of one coloured cell. 5-15 min suits day-long recordings.")
+    ticks = c[1].checkbox("Pellet ticks", True, key="grp_acto_ticks")
+    recs = [m for m in members if m["t"] is not None]
+    if not recs:
+        st.info("No recordings to show.")
+        return
+    no_clock = [m["name"] for m in recs if m["cs"] is None]
+    if no_clock:
+        st.caption(f"No clock time for {', '.join(no_clock)}: their rows are 24-h blocks from the start of the "
+                   "recording, not calendar days.")
+    darks = lg.dark_spans_48h(lights_on, lights_off)
+    for m in recs:
+        y = _normalised(m, norm, base_min, bl_end, alignment, ref)
+        A = lg.actogram(m["t"], y, m["cs"], float(abin), m["pellets"] if ticks else None)
+        if A is None:
+            continue
+        nd = len(A["day_labels"])
+        fin = A["M"][np.isfinite(A["M"])]
+        zmax = float(np.nanpercentile(np.abs(fin), 98)) if fin.size else 1.0
+        _ax, _az = gt.heatmap_arrays(A["x"], A["M"], max_cols=0)
+        fig = go.Figure(go.Heatmap(
+            x=_ax, y=list(range(nd)), z=_az,
+            colorscale="RdBu_r" if centred else "Viridis", zmid=0 if centred else None,
+            zmin=-zmax if centred else None, zmax=zmax if centred else None,
+            colorbar=dict(title=dict(text=sig_label, side="right"), thickness=12),
+            hovertemplate="%{customdata}<br>%{z:.3g}<extra></extra>",
+            customdata=[[f"{A['day_labels'][min(r + (1 if xx >= 24 else 0), nd - 1)]} "
+                         f"{gt.fmt_tod(xx % 24)}" for xx in A["x"]] for r in range(nd)]))
+        if ticks and A["ticks_x"].size:
+            fig.add_trace(go.Scatter(x=A["ticks_x"], y=A["ticks_row"] - 0.32, mode="markers", name="pellet",
+                                     marker=dict(symbol="line-ns", size=9, line=dict(color="#111827", width=1.6)),
+                                     hoverinfo="skip", showlegend=False))
+        for a, b in darks:
+            fig.add_shape(type="rect", x0=a, x1=b, y0=1.0, y1=1.04, yref="paper", fillcolor="#111827",
+                          line_width=0)
+        fig.add_shape(type="rect", x0=0, x1=48, y0=1.0, y1=1.04, yref="paper", fillcolor="rgba(0,0,0,0)",
+                      line=dict(color="#111827", width=0.6))
+        fig.add_vline(x=24, line=dict(color="#475569", width=1))
+        tv = list(range(0, 49, 6))
+        fig.update_xaxes(range=[0, 48], tickvals=tv, ticktext=[gt.fmt_tod(v % 24).replace(":00 ", " ") for v in tv],
+                         title_text="time of day (each row: that day, then the next)" if A["has_clock"]
+                         else "hours (each row: that 24 h, then the next)")
+        fig.update_yaxes(tickvals=list(range(nd)), ticktext=A["day_labels"], autorange="reversed")
+        fig.update_layout(template="plotly_white", height=int((150 + 46 * nd) * h),
+                          title=dict(text=f"{m['name']}" + (f" · {m['animal']}" if m["animal"] else ""),
+                                     font=dict(size=14)),
+                          margin=dict(l=90, r=30, t=60, b=60), font=dict(color="#111827"))
+        st.plotly_chart(fig, use_container_width=True, config=config, key=f"grp_acto_{m['name']}")
+    th.explain("How to read the actogram",
+               "Every row is one day, and it shows that day **and the next one** (0-48 h), so anything that "
+               "crosses midnight stays in one piece; each day therefore appears twice, once on the right of a row "
+               "and once on the left of the row below. Colour is the signal (" + sig_label + ") in "
+               f"{_bin_label(abin)} bins; black ticks are pellets. The black bar on top marks the dark phase "
+               "(More settings → lights on/off). Rhythms show up as vertical stripes; a shift in the stripes from "
+               "day to day is a change in timing.")
+
+
+def _meal_size_view(members, norm, base_min, bl_end, alignment, ref, gap, minp, lights_on, lights_off, sig_label,
+                    config, h):
+    import longitudinal as lg
+    with_fed = [m for m in members if m["t"] is not None and m["pellets"].size]
+    if not with_fed:
+        st.info("No recording has FED pellets matched to it. Set the animal for each recording above.")
+        return
+    c = st.columns([1.2, 1.2, 1, 2])
+    bw = c[0].text_input("Before the meal (s)", "-300, -30", key="grp_ms_base",
+                         help="Window before the first pellet of the meal used as its baseline.")
+    rw = c[1].text_input("After the meal starts (s)", "0, 600", key="grp_ms_resp",
+                         help="Window after the first pellet over which the response is averaged.")
+    xs = c[2].selectbox("Meal size as", ["pellets", "grams"], key="grp_ms_x")
+    try:
+        base = tuple(float(v) for v in bw.split(","))
+        resp = tuple(float(v) for v in rw.split(","))
+        assert len(base) == 2 and len(resp) == 2 and base[0] < base[1] and resp[0] < resp[1]
+    except Exception:
+        st.warning("Windows not understood; using -300, -30 and 0, 600.")
+        base, resp = (-300.0, -30.0), (0.0, 600.0)
+    parts = []
+    for m in with_fed:
+        mm = dict(m, y=_normalised(m, norm, base_min, bl_end, alignment, ref))
+        parts.append(lg.meal_responses(mm, gap, minp, base, resp, lights_on, lights_off))
+    df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    df = df[np.isfinite(df["response"])] if not df.empty else df
+    if df.empty:
+        st.info("No meal has both windows inside a recording. Shorten the windows or check the meal definition "
+                "(More settings).")
+        return
+    fig = go.Figure()
+    animals = list(dict.fromkeys(df["animal"]))
+    for i, an in enumerate(animals):
+        sub = df[df["animal"] == an]
+        col = PALETTE[i % len(PALETTE)]
+        for dark, sym, nm in ((True, "circle", "dark"), (False, "circle-open", "light"), (None, "diamond", "")):
+            ss_ = sub[sub["dark"].isna()] if dark is None else sub[sub["dark"] == dark]
+            if ss_.empty:
+                continue
+            fig.add_trace(go.Scatter(
+                x=ss_[xs] + np.random.default_rng(i).uniform(-0.12, 0.12, len(ss_)) * (1 if xs == "pellets" else
+                                                                                    0.002),
+                y=ss_["response"], mode="markers", name=f"{an}" + (f" ({nm})" if nm else ""), legendgroup=an,
+                marker=dict(color=col, symbol=sym, size=8, line=dict(color=col, width=1.4)),
+                customdata=np.c_[ss_["pellets"], ss_["hour_of_day"].fillna(-1)],
+                hovertemplate=f"{an}<br>%{{customdata[0]}} pellets<br>response %{{y:.3g}}<extra></extra>"))
+        if sub[xs].nunique() >= 2 and len(sub) >= 3:
+            k, b0 = np.polyfit(sub[xs].to_numpy(float), sub["response"].to_numpy(float), 1)
+            xx = np.array([sub[xs].min(), sub[xs].max()], float)
+            fig.add_trace(go.Scatter(x=xx, y=k * xx + b0, mode="lines", line=dict(color=col, width=2),
+                                     legendgroup=an, showlegend=False, hoverinfo="skip"))
+    fig.add_hline(y=0, line=dict(color="#94a3b8", width=1, dash="dot"))
+    fig.update_layout(template="plotly_white", height=int(520 * h), margin=dict(l=70, r=20, t=40, b=60),
+                      xaxis_title="meal size (" + xs + ")", yaxis_title=f"change in {sig_label}",
+                      legend=dict(orientation="h", y=1.08, x=0), font=dict(color="#111827"))
+    st.plotly_chart(fig, use_container_width=True, config=config, key="grp_mealsize")
+    per, grp = lg.slope_stats(df)
+    st.dataframe(per, use_container_width=True, hide_index=True)
+    if not grp.empty:
+        st.dataframe(grp, use_container_width=True, hide_index=True)
+    th.explain("How to read this graph",
+               f"Every point is one meal: its size (x) and how much the signal changed from before the meal "
+               f"({base[0]:g} to {base[1]:g} s) to after it started ({resp[0]:g} to {resp[1]:g} s). Filled points: "
+               "meals in the dark phase; open: light phase. Lines: least-squares fit per animal. The table gives "
+               "each animal's Spearman ρ and slope, and the group's mean slope tested against 0 with every animal "
+               "counted once (meals of one animal are not independent). Neurons that track the calories eaten, "
+               "like AgRP neurons, give a slope that is clearly not 0 (Beutler et al. 2017; Su et al. 2017). "
+               "Meals close together share windows, so with frequent meals use shorter windows.")
+    st.download_button("Download every meal (CSV)", df.to_csv(index=False).encode(), "meal_size_vs_response.csv",
+                       "text/csv", key="grp_ms_dl")

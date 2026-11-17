@@ -27,7 +27,7 @@ fc /b requirements.txt .venv\requirements_installed.txt >nul 2>nul
 if errorlevel 1 (
   echo Installing / updating packages...
   "%VPY%" -m pip install --upgrade pip -q
-  "%VPY%" -m pip install -r requirements.txt -q || (echo Package installation failed. & pause & exit /b 1)
+  "%VPY%" -m pip install --upgrade -r requirements.txt -q || (echo Package installation failed. & pause & exit /b 1)
   copy /y requirements.txt .venv\requirements_installed.txt >nul
 )
 

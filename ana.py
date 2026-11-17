@@ -169,7 +169,10 @@ def read_ppd(ppd_path: Path):
     """
     # PC-timestamped files (16 bytes per sample) are recognised here too; the
     # time model and wall-clock start are in data["clock"].
-    data = pc.read_ppd(ppd_path, clock_source=USER_SETTINGS.get("clock_source", "sample"))
+    if Path(ppd_path).suffix.lower() == ".csv":     # pyPhotometry CSV recording + .json header
+        data = pc.read_pyphotometry_csv(ppd_path, clock_source=USER_SETTINGS.get("clock_source", "auto"))
+    else:
+        data = pc.read_ppd(ppd_path, clock_source=USER_SETTINGS.get("clock_source", "auto"))
     return data["header"], data["sampling_rate"], data
 
 
@@ -1089,7 +1092,14 @@ def save_one_recording_outputs(recording, outdir: Path, roi: str, limits, scale_
         "pipeline": processed["pipeline_used"],
         "reference": ("Douglass et al. 2025 Cell Metab 37:708 (STAR Methods)"
                       if processed["pipeline_used"] == "douglass2025"
+                      else "Keevers & Jean-Richard-dit-Bressel 2025 Neurophotonics; Simpson et al. 2024 "
+                           "Neuron; Lerner et al. 2015 Cell" if processed["pipeline_used"] == "robust2025"
                       else "Akam & Walton 2019 Sci Rep 9:3521, pyPhotometry preprocess_data"),
+        "control_used": finfo.get("control_used"),
+        "control_agreement_r": finfo.get("control_agreement_r"),
+        "baseline_method": finfo.get("baseline_method"),
+        "signal_background": cfg.get("signal_background", 0.0),
+        "control_background": cfg.get("control_background", 0.0),
         "median_kernel_samples": cfg["median_kernel_samples"],
         "median_filter_sec": cfg["median_filter_sec"],
         "lowpass_hz": cfg["lowpass_hz"],
@@ -1201,7 +1211,7 @@ def main():
     MAKE_STATIC_PLOTS = not args.no_static_plots
     if args.settings_json:
         raw = args.settings_json
-        if Path(raw).exists():
+        if not raw.lstrip().startswith("{"):      # a file path, not the JSON itself
             raw = Path(raw).read_text()
         USER_SETTINGS.update(json.loads(raw))
 

@@ -33,7 +33,7 @@ STAMP=.venv/.requirements_installed
 if [ ! -f "$STAMP" ] || ! cmp -s requirements.txt "$STAMP"; then
   echo "Installing / updating packages..."
   "$VPY" -m pip install --upgrade pip -q
-  "$VPY" -m pip install -r requirements.txt -q || { echo "Package installation failed (see above)."; pause; exit 1; }
+  "$VPY" -m pip install --upgrade -r requirements.txt -q || { echo "Package installation failed (see above)."; pause; exit 1; }
   cp requirements.txt "$STAMP"
 fi
 

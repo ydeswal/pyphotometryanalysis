@@ -149,8 +149,11 @@ def reference_clock(members):
 # SIGNAL
 # =============================================================================
 
-def normalise(t, y, method, baseline_mask=None):
-    """Normalise one recording. baseline_mask selects the baseline samples."""
+def normalise(t, y, method, baseline_mask=None, dff_percent=False):
+    """Normalise one recording. baseline_mask selects the baseline samples.
+    dff_percent: y is dF/F in %, which sits around 0, so '% change from baseline mean' is the
+    change of the corrected fluorescence, (1 + y) / (1 + baseline) - 1, not y / baseline - 1
+    (dividing by a mean near 0 would blow up)."""
     y = np.asarray(y, float)
     ok = np.isfinite(y)
     if ok.sum() < 3:
@@ -177,14 +180,24 @@ def normalise(t, y, method, baseline_mask=None):
         return y - np.mean(y[b])
     if method.startswith("% change"):
         mb = np.mean(y[b])
+        if dff_percent:
+            return ((1.0 + y / 100.0) / (1.0 + mb / 100.0) - 1.0) * 100.0
         return (y / mb - 1.0) * 100.0 if mb != 0 else np.full_like(y, np.nan)
     raise ValueError(method)
 
 
-def baseline_mask(m, alignment, minutes):
+def baseline_mask(m, alignment, minutes, end_x=None, ref_clock=None):
     """Baseline samples: the first `minutes` of the recording, or the
-    `minutes` before the first pellet / the event when aligning to it."""
+    `minutes` before the first pellet / the event when aligning to it.
+    end_x: a time on the SHARED axis of this alignment (e.g. one clicked on the group
+    graph); the baseline is then the `minutes` before it, for every recording."""
     t = m["t"]
+    if end_x is not None:
+        off = align_offset(m, alignment, ref_clock)
+        if off is None:
+            return np.zeros(t.size, bool)
+        x = t + off
+        return (x >= end_x - minutes * 60.0) & (x < end_x)
     if alignment.startswith(("Time since first pellet", "Time since an event")):
         off = align_offset(m, alignment)
         if off is None:
@@ -244,7 +257,7 @@ def grid_for(members, alignment, bin_s, ref_clock=None):
 
 
 def signal_matrix(members, alignment, norm, bin_s, smooth_bins=1, baseline_min=30.0, ref_clock=None,
-                  per_animal=True):
+                  per_animal=True, baseline_end=None):
     """
     Binned, normalised signal of every member on the shared axis.
     Returns dict: x (bin centres), rows (labels), M (rows x bins), groups,
@@ -263,8 +276,9 @@ def signal_matrix(members, alignment, norm, bin_s, smooth_bins=1, baseline_min=3
         if off is None:
             skipped.append(m["name"])
             continue
-        bm = baseline_mask(m, alignment, baseline_min) if "baseline" in norm.lower() else None
-        y = normalise(m["t"], m["y"], norm, bm)
+        bm = baseline_mask(m, alignment, baseline_min, baseline_end, ref_clock) \
+            if "baseline" in norm.lower() else None
+        y = normalise(m["t"], m["y"], norm, bm, dff_percent=bool(m.get("dff_percent")))
         v = running_mean(bin_mean(m["t"] + off, y, e0, bin_s, n), smooth_bins)
         rows.append(m["name"])
         M.append(v)

@@ -1,0 +1,25 @@
+pyPhotometry analysis app (Sweeney lab) - run it on your own computer
+=====================================================================
+
+1. Install Python 3.12 from https://www.python.org/downloads/
+   (Windows: tick "Add python.exe to PATH" on the first installer screen.)
+
+2. Unzip this folder anywhere, then double-click:
+     macOS    run_local.command   (first time: right-click -> Open -> Open)
+     Windows  run_local.bat
+     Linux    bash run_local.sh
+   The first run installs the packages into a private .venv folder (1-3 minutes,
+   needs internet). The app then opens at http://localhost:8501 .
+   If you already had an older copy with a .venv folder, the script upgrades the
+   packages automatically the first time.
+
+3. In the app: drag ONE ZIP into "Upload files or one ZIP" (sidebar). It can hold
+   the .ppd recordings and the zipped FED3_data folder together. Everything is
+   sorted and the analysis starts by itself.
+
+Optional - the "Ask AI" panel: create .streamlit/secrets.toml with your own key, e.g.
+     GEMINI_API_KEY = "your key"
+   (never put the key in any file you share or upload).
+
+What is new in this version: see README.md, section "17 November 2026".
+To put it on the website: copy these files over your GitHub clone and push.

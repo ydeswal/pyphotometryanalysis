@@ -128,7 +128,21 @@ def to_two_channel(df, roi, fibre="F1", signal_nm=None, control_nm=None):
     dt = np.diff(out["time_sec"].to_numpy())
     fs = 1.0 / np.median(dt[dt > 0]) if (dt > 0).any() else float("nan")
     gaps = int((dt > 1.5 / fs).sum()) if np.isfinite(fs) else 0
+    # Camera dark level: a channel of this fibre that is flat (no indicator, so no light) and
+    # below the two channels in use shows what the camera reads with no fluorescence.
+    dark, dark_nm = None, None
+    for w in ch[fibre]:
+        if w in (sig, ctl):
+            continue
+        v = pd.to_numeric(df[f"RawF_{w}_{fibre}"], errors="coerce").to_numpy(float)
+        v = v[np.isfinite(v)]
+        if v.size > 100:
+            med = float(np.median(v))
+            if med > 0 and np.std(v) < 0.002 * med and med < min(out.iloc[:, 1].min(), out.iloc[:, 2].min()):
+                if dark is None or med < dark:
+                    dark, dark_nm = med, w
     info = {"input_type": "plexon_csv", "plexon_fibre": fibre, "plexon_signal_nm": sig, "plexon_control_nm": ctl,
+            "plexon_dark_level": dark, "plexon_dark_nm": dark_nm,
             "plexon_all_nm": ch[fibre], "plexon_fibres": list(ch), "plexon_frame_gaps": gaps,
             "plexon_fs": float(fs)}
     return out, info
@@ -141,6 +155,10 @@ def notes_for(info):
          "through the same pipeline as pyPhotometry data; Plexon's own ΔF/F (R columns) is kept as plexon_R_<nm>.",
          "Plexon files store time from the start of the recording only, not the clock time, so clock-time "
          "features (FED alignment, time of day) are not available for them."]
+    if info.get("plexon_dark_level"):
+        n.append(f"Camera dark level: the unused {info['plexon_dark_nm']} nm channel is flat at "
+                 f"{info['plexon_dark_level']:.2f}, which is what the camera reads with no fluorescence. "
+                 "Without subtracting it every dF/F is several times too small.")
     if str(info.get("plexon_control_nm")) == "410":
         n.append("The control is 410 nm, closer to GCaMP's isosbestic point than 405 nm, so it should barely "
                  "move with calcium. Where the app says '405', read 'the control channel'.")

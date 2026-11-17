@@ -35,6 +35,123 @@ allowed.
 
 ---
 
+## 17 November 2026: one ZIP in, everything out; baseline you choose; new acquisition build
+
+**Upload one ZIP and it runs.** The main uploader now takes `.ppd`, `.csv`, `.json` and `.zip`. A ZIP may
+hold the recordings and a zipped `FED3_data` folder (ZIPs inside ZIPs are opened). Every file is sorted
+(`intake.py`):
+
+| Found | Goes to |
+|---|---|
+| `.ppd`, pyPhotometry CSV recordings (`Analog1, Analog2, …` + `.json` header) | photometry |
+| `FED###_<animal>_data.csv`, `_pc_events.csv`, `session_info.json`, `alerts_log.csv` | FED3 feeding data (no second upload needed) |
+| Plexon exports and their event CSVs, CSVs already processed by the app | photometry, as before |
+| snapshots (`_snap-`, `_autosnap-`, header `snapshot: true`) | used only if the finished recording is missing (newest one) |
+| `.xlsx` copies, notes, images | left out, listed under "file(s) not used" with the reason |
+
+The analysis starts by itself after an upload (switch: *Run automatically when files are added*).
+Recordings are paired with FED animals by the ID in the name (`Gp3_P1_8424G-….ppd` ↔ `FED000_P1_8424G_data.csv`).
+*Feeding (FED3)* now lists how many pellets fall during each recording and how many before/after it.
+
+Fixed: a FED3 `_data.csv` put in the main uploader went to the photometry CSV reader (it took
+`Device_Number` for time and failed with "Could not identify raw 405/isosbestic and 465/signal columns").
+
+**New pyPhotometry build (16 Nov 2026).** Read and checked against files written in its exact format:
+header padded to 4096 bytes, 16 bytes per sample (4 data words + float64 PC time), `pc_clock.source =
+"system_clock"`. For these files the time axis now follows the per-sample system-clock stamps (jitter
+removed), because that is the clock the FED3 controller writes into `PC_Timestamp`; in a test with a
+30 ppm board crystal every sample landed within 1 ms of its true PC time, while the board's sample clock
+would have been 72 ms off after 40 min. Older files keep the sample clock (their stamps drifted).
+Sidebar → Processing method → *Time axis*: **Automatic** (default), or force either. Also new:
+Windows clock adjustments listed in the header (`clock_summary.clock_steps`) are not mistaken for lost
+samples; dropped chunks (`skipped_chunks`, `corrupt_chunks`) are reported; an `end_time` equal to the
+start time (file copied while recording, or the program closed without Stop) is explained instead of
+flagged; snapshot files are labelled; LED on-time / duty are shown; CSV recordings (`.csv` + `.json`)
+are read with their `PC_timestamp` column.
+
+The report that "the app reads these files as 8 bytes per sample" was not right for this app: the reader has
+handled the 16-byte layout since 15 Oct 2026 (it reads `bytes_per_sample` from the header). It is now also
+tested with the padded header.
+
+**Normalise to a baseline you choose** (one recording, and Group analysis). One recording: switch on
+*Normalise to a baseline period*, give the length (hours + minutes) and set where it ends, either by typing
+the time (`1:30:00`, or `3:05 PM`) or by switching on **📍 Set baseline end** above any graph and clicking.
+Every graph of that recording is redrawn: z = (dF/F − baseline mean) ÷ baseline SD, and dF/F as % change
+from the baseline level ((1 + dF/F) ÷ (1 + baseline) − 1). The baseline is shaded blue.
+*Response after the baseline* then gives the peak (or dip): % change, z against the baseline alone, the same
+peak z-scored over baseline + response together (what a whole-recording z does), time to peak, and when the
+signal is back within 1 SD. Example (a test in `test_intake.py`): 5 min flat, then a 6 % peak that is gone
+in ~3 min: z = 12 against the baseline, z = 3 over the whole 8 min.
+Group analysis: *Normalise each recording → z-score to a baseline period* (or % change / subtract), then
+*Baseline ends at → A time I choose on the graph*; the same moment on the shared time axis is used for every
+recording, with a per-recording peak table (mean ± SEM per group).
+
+**Lights.** Default cycle is now lights OFF 10:00 AM – 10:00 PM, ON 10:00 PM – 10:00 AM (single-recording
+z-score shading, on by default for clock-timed recordings ≥ 2 h, and Group analysis).
+
+**Two new Group analysis views** (`longitudinal.py`):
+- *Actogram (days, double-plotted)*: each row is a day and the next one (0–48 h), signal as colour, pellets as
+  ticks, the dark phase as a bar on top; the standard way to see daily rhythms and their drift
+  (cf. Douglass et al. 2024, Cell Metab.).
+- *Meal size vs response*: every meal's signal change (before vs after its first pellet) against its size,
+  a fit per animal, Spearman ρ and slope per animal, and the group's slopes tested against 0 with the animal as
+  the unit (Loewinger et al. 2024). Calorie-tracking neurons such as AgRP neurons should give a slope that is
+  not 0 (Beutler et al. 2017; Su et al. 2017).
+
+**Local launch vs the website.** The run_local scripts installed packages only when missing, so a local `.venv`
+made earlier kept old versions (e.g. plotly 5.x), while the website always gets the newest. With the oldest
+versions requirements.txt allowed (Streamlit 1.50, plotly 5.24), parts of the app crashed: the Group analysis
+graphs ("Invalid property … 'unifiedhovertitle'", a plotly ≥ 6.1 feature) and every "download" button
+("Invalid binary data format: function", a Streamlit ≥ 1.52 feature). Both now fall back gracefully, the
+scripts run `pip install --upgrade -r requirements.txt`, and requirements.txt asks for streamlit ≥ 1.52 and
+plotly ≥ 6.1. The full browser test passes on both the newest versions and Streamlit 1.50 + plotly 5.24.
+Heatmaps are also sent as plain, capped (≤ 2000 columns) lists, which every Plotly version draws.
+
+Tests: `test_intake.py` (new, 44 checks) plus all earlier test files.
+
+## 13 November 2026: new default dF/F pipeline ("Robust isosbestic"), Plexon dark level
+
+Sidebar → Processing method → **Pipeline**. The default is now **Robust isosbestic**; the Douglass 2025
+and pyPhotometry pipelines are unchanged and still selectable, so older results can be reproduced.
+
+What the robust pipeline does, for pyPhotometry (Doric minicube, 465/405) and Plexon (465/410) alike:
+
+1. **Background first.** Plexon: the camera reads about 15 with no fluorescence (seen on the unused,
+   flat 560 channel). It is found per file and subtracted from both channels (sidebar checkbox
+   "Subtract the camera dark level"). Without this, every dF/F is too small by the factor
+   signal ÷ (signal − 15), often 5–8×. pyPhotometry: optional "Background to subtract (V)" if you measured
+   the reading with the fibre unplugged from the animal; default 0.
+2. **Robust fit of the control to the signal** (Tukey bisquare, tuning 1.4; Keevers &
+   Jean-Richard-dit-Bressel 2025). Real responses get no weight, so they do not bend the fit. It is run
+   from several starting points and the line the bulk of the recording agrees on is kept.
+3. **dF/F = (signal − fitted control) ÷ fitted control.** The fitted control carries bleaching and
+   movement together, so both are removed in one step, and the denominator bleaches with the signal.
+4. **The control is checked before it is trusted.** 405 nm (GCaMP) and 410 nm (GRAB sensors) are not
+   exactly isosbestic, so the "control" can carry an inverted copy of the response. If its fast changes
+   run against the signal's (r < −0.10) or the fitted slope is negative, it is **not subtracted**. Then:
+   bleaching is taken from the control's own bleaching curve, scaled to the signal, and if the control's
+   fast changes still go with the signal's (r > 0.30) those alone (movement, light-source noise) are
+   removed. A processing note says which of these happened for each recording.
+5. **Guard against swallowing sustained responses.** If the free fit is more than 3× steeper than the
+   465 ÷ control ratio (a lasting response coinciding with bleaching), the control is scaled in proportion
+   instead, which is the plain 465 ÷ control ratio.
+
+"Use the control channel": Automatic (default) / Always / Never.
+
+Checked on: simulated recordings with a known true dF/F (`test_pipeline.py`: recovers it within 1 % RMS,
+better than the previous default; a 40 % sustained fall is kept; a block of response does not bend the
+fit); 28 AgRP food-response recordings (new dF/F change equals the raw 465 ÷ 405 change within 1 point in 25 of
+28 and within 2 points in all); 13 rated Plexon GRAB recordings (grades unchanged except 8781B Excellent → Very good
+and 8786B Good → OK, both recordings where the 410 channel could not be used as a whole).
+
+Limits that no software removes: when the control is rejected, slow movement artefacts stay in the
+trace; bleaching is then assumed to be the same fraction in both channels; over 18 h recordings the
+slow baseline of dF/F is not trustworthy with either method when the control disagrees with the signal
+(all five k_ longitudinal recordings are in that state) - use events and transients, not the absolute
+level. A control LED at the sensor's true isosbestic point is the only real fix for that.
+
+Also fixed: the analysis script failed with "File name too long" when the settings grew.
+
 ## 9 November 2026 (e): AI sees events added a moment ago
 
 * Fixed: right after adding an event in Group analysis, the AI could answer "no events are marked". The chat

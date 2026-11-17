@@ -70,7 +70,24 @@ DEFAULTS = {
     # Which published pipeline to run.
     #   "douglass2025" : Douglass et al. 2025 Cell Metab (default)
     #   "pyphotometry" : Akam & Walton pyPhotometry preprocess_data
+    #   "robust2025"   : IRLS (Tukey bisquare) fit of the control, dF/F = (signal - fitted
+    #                    control) / fitted control (Lerner 2015; Keevers & Jean-Richard-dit-
+    #                    Bressel 2025; Simpson et al. 2024). If the control is not a valid
+    #                    control for this recording (it moves AGAINST the signal), the signal
+    #                    is corrected for bleaching alone and no control is subtracted.
     "pipeline": "douglass2025",
+    # Light that is not fluorescence (camera dark level, detector offset), subtracted from the
+    # raw channels before anything else. 0 = none. Needed for camera systems (Plexon), where
+    # a ~15-count dark level otherwise shrinks every dF/F several-fold.
+    "signal_background": 0.0,
+    "control_background": 0.0,
+    "bisquare_tuning": 1.4,        # Keevers 2025: lower tuning constants performed better
+    # robust2025: the control is rejected when its fast changes run opposite to the signal's
+    # (Pearson r of 1-s means, slow trend removed) below this value.
+    "control_reject_r": -0.10,
+    "control_use": "auto",         # "auto" | "always" | "never" (robust2025 only)
+    "max_slope_vs_ratio": 3.0,    # robust2025: above this the fit goes through the origin
+    "fast_correction_r": 0.30,     # robust2025: rejected control still removes fast shared changes above this r
     # Median filter. The paper says "median-filtered" without a kernel size;
     # pyPhotometry specifies the kernel in SAMPLES, so that is the default here.
     "median_kernel_samples": 5,
@@ -118,8 +135,52 @@ def _parse_version(version_string) -> tuple:
         return (0, 0, 0)
 
 
+def parse_header_bytes(raw) -> dict:
+    """JSON header of a .ppd file. The custom acquisition build (2026-11-16) pads the
+    header with spaces to 4096 bytes so it can be rewritten when recording stops; padding
+    (spaces, or NULs from an interrupted rewrite) is ignored."""
+    text = raw.decode("utf-8", errors="replace").strip(" \x00\r\n\t")
+    return json.loads(text)
+
+
+def recording_info_notes(header, n_samples_read, fs):
+    """Plain-language notes and warnings about what the acquisition program wrote
+    into the header (custom build 2026-11-16 and later): snapshot copies, dropped
+    chunks, the sample count it saved, LED pulse settings."""
+    notes, warns = [], []
+    if header.get("snapshot"):
+        when = _parse_local(header.get("snapshot_time"))
+        notes.append(
+            "This file is a SNAPSHOT: a copy taken while the recording was still running"
+            + (f" (at {_clock12(when, ms=False, date=True)})" if when is not None else "")
+            + (f", of {header.get('snapshot_of')}" if header.get("snapshot_of") else "")
+            + ". It holds the data up to that moment; the finished recording has more.")
+    sk, co = int(header.get("skipped_chunks") or 0), int(header.get("corrupt_chunks") or 0)
+    if sk or co:
+        warns.append(f"The acquisition program dropped {sk} incomplete and {co} corrupt data chunk(s) "
+                     "during the recording (USB trouble). The samples in them are missing; the time "
+                     "axis includes the gaps where the PC timestamps show them.")
+    n_hdr = header.get("n_samples")
+    if n_hdr is not None and n_samples_read is not None:
+        n_hdr = int(n_hdr)
+        if n_samples_read < n_hdr:
+            warns.append(f"The header says {n_hdr:,} samples were recorded but the file holds only "
+                         f"{n_samples_read:,} ({(n_hdr - n_samples_read) / fs:.1f} s missing at the end): the "
+                         "file was probably copied before it was completely written.")
+        elif n_samples_read > n_hdr + max(2, fs):
+            notes.append(f"The file holds {n_samples_read - n_hdr:,} more samples than the header's count "
+                         f"({n_hdr:,}); the header was written before the last data was flushed. All "
+                         "samples in the file were used.")
+    on_us, duty = header.get("LED_on_time_us"), header.get("LED_duty_percent")
+    if on_us is not None:
+        notes.append(f"LED pulse: {float(on_us) / 1000:.2f} ms on"
+                     + (f", {float(duty):.1f} % duty per LED" if duty is not None else "")
+                     + (f"; build {header.get('build')}" if header.get("build") else "") + ".")
+    return notes, warns
+
+
 def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
-             with_time=False, clock_source="sample") -> dict:
+             with_time=False, clock_source="auto") -> dict:
     """
     Read a pyPhotometry .ppd file into named signals.
 
@@ -150,7 +211,10 @@ def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
     sawtooth and wreck the 405 fit. See _pc_layout() and build_clock_model().
 
     clock_source
-        "sample" (default): elapsed time comes from the board's sample counter
+        "auto" (default): "pc" when the header says the timestamps come from the
+                  system clock (custom build 2026-11-16 and later: the same clock as
+                  FED3 PC_Timestamp), otherwise "sample".
+        "sample": elapsed time comes from the board's sample counter
                   (k / fs), anchored to the PC clock at sample 0. The per-sample
                   PC timestamps are used to find the start time, to detect lost
                   samples, and to cross-check the clock, but not to stretch the
@@ -166,7 +230,7 @@ def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
     dtype = np.dtype(dtype)
     with open(ppd_path, "rb") as f:
         header_size = int.from_bytes(f.read(2), "little")
-        header = json.loads(f.read(header_size).decode("utf-8"))
+        header = parse_header_bytes(f.read(header_size))
     # Memory-map the data block instead of reading it into RAM. A 48 h, 130 Hz
     # PC-timestamped file is 360 MB; read() made all of it resident for the
     # whole analysis, while mapped pages are only touched as channels are
@@ -302,7 +366,9 @@ def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
         del raw
     del buf
 
-    clock["warnings"] = read_warnings + clock["warnings"]
+    info_notes, info_warns = recording_info_notes(header, n_samples, fs)
+    clock["warnings"] = read_warnings + info_warns + clock["warnings"]
+    clock["notes"] = info_notes + clock["notes"]
     out["clock"] = clock
     out["n_samples"] = n_samples
     out["duration_sec"] = clock["duration_sec"]
@@ -310,6 +376,82 @@ def read_ppd(ppd_path, dtype=np.float32, keep_components=False,
     # 130 Hz). Callers that need it ask for it, or use ppd_time_axis().
     if with_time:
         out["time_sec"] = ppd_time_axis(clock, n_samples)
+    return out
+
+
+def is_pyphotometry_csv(columns):
+    """A pyPhotometry CSV recording: columns Analog1, Analog2, (Digital1, Digital2,
+    PC_timestamp). Its header is in a .json file of the same name."""
+    cols = [str(c).strip().lower() for c in columns]
+    return "analog1" in cols and "analog2" in cols
+
+
+def read_pyphotometry_csv(csv_path, dtype=np.float32, clock_source="auto", json_path=None) -> dict:
+    """
+    Read a pyPhotometry recording saved as CSV (data file type 'csv'): the data in
+    <name>.csv (Analog1, Analog2, Digital1, Digital2 and, with PC timestamps,
+    PC_timestamp) and the header in <name>.json. Returns the same dict as read_ppd.
+
+    The analog columns are ADC counts, already LED-off-subtracted by the acquisition
+    program in pulsed mode, and are converted to volts with the header's
+    volts_per_division. Columns that already look like volts are left alone.
+    """
+    csv_path = Path(csv_path)
+    json_path = Path(json_path) if json_path else csv_path.with_suffix(".json")
+    header = {}
+    if json_path.exists():
+        header = parse_header_bytes(json_path.read_bytes())
+    df = pd.read_csv(csv_path, skipinitialspace=True)
+    df.columns = [str(c).strip() for c in df.columns]
+    low = {c.lower(): c for c in df.columns}
+    if not is_pyphotometry_csv(df.columns):
+        raise ValueError(f"{csv_path.name}: not a pyPhotometry CSV (no Analog1 / Analog2 columns).")
+    analog = sorted((c for c in df.columns if c.lower().startswith("analog")), key=lambda c: int(c[6:] or 0))
+    digital = sorted((c for c in df.columns if c.lower().startswith("digital")), key=lambda c: int(c[7:] or 0))
+    pc_t = None
+    tcol = low.get("pc_timestamp") or low.get("pc_time")
+    if tcol is not None:
+        pc_t = pd.to_numeric(df[tcol], errors="coerce").to_numpy(np.float64)
+    warns_extra = []
+    fs = header.get("sampling_rate")
+    if fs is None:
+        if pc_t is not None and np.isfinite(pc_t).sum() > 10:
+            fs = float(1.0 / np.nanmedian(np.diff(pc_t)))
+            fs = float(round(fs)) if abs(fs - round(fs)) < 0.05 * fs else fs
+            warns_extra.append(f"No header (.json) was found for {csv_path.name}; the sampling rate "
+                               f"({fs:g} Hz) was worked out from the PC timestamps.")
+        else:
+            raise ValueError(f"{csv_path.name}: the header file {json_path.name} is missing, so the "
+                             "sampling rate is unknown. Upload the .json together with the .csv.")
+    fs = float(fs)
+    n_an = len(analog)
+    vpd_raw = header.get("volts_per_division", [None] * n_an)
+    vpd = [vpd_raw] * n_an if np.isscalar(vpd_raw) or vpd_raw is None else list(vpd_raw)
+    while len(vpd) < n_an:
+        vpd.append(vpd[-1] if vpd else None)
+    out = {"header": header, "sampling_rate": fs, "mode": str(header.get("mode", "")),
+           "version": header.get("version", ""), "subject_ID": header.get("subject_ID", ""),
+           "n_analog_channels": n_an, "volts_per_division": vpd, "frame_layout": "pyphotometry_csv",
+           "layout_note": f"pyPhotometry CSV recording ({', '.join(df.columns)})"
+                          + (f" with header {json_path.name}" if header else ", no header file") + "."}
+    for i, c in enumerate(analog):
+        v = pd.to_numeric(df[c], errors="coerce").to_numpy(np.float64)
+        fin = v[np.isfinite(v)]
+        counts = fin.size and np.all(np.abs(fin - np.round(fin)) < 1e-9) and np.nanmax(np.abs(fin)) > 20
+        if counts and vpd[i]:
+            v = v * float(vpd[i])
+        out[f"analog_{i + 1}"] = v.astype(dtype)
+        out[f"analog_{i + 1}_clipping_fraction"] = 0.0
+    for i, c in enumerate(digital):
+        out[f"digital_{i + 1}"] = (pd.to_numeric(df[c], errors="coerce").fillna(0).to_numpy() > 0).astype(np.uint8)
+    n = len(df)
+    clock = build_clock_model(header, fs, n, pc_t, clock_source=clock_source)
+    info_notes, info_warns = recording_info_notes(header, n, fs)
+    clock["warnings"] = warns_extra + info_warns + clock["warnings"]
+    clock["notes"] = info_notes + clock["notes"]
+    out["clock"] = clock
+    out["n_samples"] = n
+    out["duration_sec"] = clock["duration_sec"]
     return out
 
 
@@ -446,7 +588,14 @@ def _refine_step(t_pc, t_ref, fs, lo, hi, before, step):
     return int(lo + (idx[0] if idx.size else (hi - lo) // 2))
 
 
-def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
+def pc_stamps_are_system_clock(header):
+    """True when the acquisition program stamped samples with the Windows system clock
+    (custom build 2026-11-16 and later; header pc_clock.source = "system_clock")."""
+    src = str((header.get("pc_clock") or {}).get("source", "")).lower()
+    return src in ("system_clock", "system", "wall_clock", "time.time")
+
+
+def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="auto"):
     """
     Map sample index -> elapsed seconds and wall-clock time, and check it.
 
@@ -468,6 +617,14 @@ def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
     were lost (a step in PC time the sample counter does not show), and this
     cross-check. clock_source="pc" follows the stamps instead.
 
+    From the custom build of 2026-11-16 on, the stamps are read from the Windows
+    SYSTEM clock (header pc_clock.source = "system_clock"), the very clock the
+    FED3 controller writes into PC_Timestamp. Then following the stamps (a
+    jitter-free fit) is the better axis: the board's crystal can differ from it
+    by tens of ppm. clock_source="auto" (default) picks "pc" for those files and
+    "sample" for older ones. Steps the header lists in clock_summary.clock_steps
+    (Windows time sync) are clock adjustments, not lost samples.
+
     Returns a dict:
       source          "sample" | "pc" | "header" (no PC stamps; start from
                       the header date_time)
@@ -481,8 +638,18 @@ def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
     notes, warns = [], []
     pc_info = header.get("pc_clock") or {}
     utc_offset = pc_info.get("utc_offset_s")
+    system_clock = pc_stamps_are_system_clock(header)
+    if clock_source not in ("sample", "pc"):
+        clock_source = "pc" if system_clock else "sample"
+    csum = header.get("clock_summary") or {}
+    hdr_steps = [st_ for st_ in (csum.get("clock_steps") or []) if isinstance(st_, dict)]
+    # New-build files report dropped chunks; with none dropped, a forward jump in the
+    # system-clock stamps can only be the clock being adjusted.
+    no_drops = ("skipped_chunks" in header and not int(header.get("skipped_chunks") or 0)
+                and not int(header.get("corrupt_chunks") or 0))
     clock = {
-        "source": "header", "has_pc_timestamps": pc_t is not None,
+        "source": "header", "has_pc_timestamps": pc_t is not None, "system_clock": system_clock,
+        "clock_steps": [],
         "start_unix": None, "start_local": None, "utc_offset_s": utc_offset,
         "segments": [{"i0": 0, "i1": int(n_samples), "t0": 0.0, "dt": 1.0 / fs}],
         "duration_sec": n_samples / fs, "gaps": [], "pc_drift_ppm": None,
@@ -544,18 +711,27 @@ def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
     # time pass that the sample counter did not: samples were lost (or the PC
     # clock was moved forward). A backward step cannot be lost samples; it is
     # the PC clock being set back, and is ignored for the sample-clock axis.
-    bounds, gaps, ignored = [0], [], []
+    bounds, gaps, ignored, csteps = [0], [], [], []
     for j, size in steps:
         lo = int(max(0, centres[j] - block))
         hi = int(min(n_samples, centres[min(j + 1, centres.size - 1)] + block))
         before = float(np.median(levels[max(0, j - 2): j + 1]))
         i_step = _refine_step(pc_t, t_ref, fs, lo, hi, before, size)
-        if size > 0:
+        listed = any(abs(int(h.get("sample", -10**12)) - i_step) <= 2 * block
+                     and abs(float(h.get("step_s", 0.0)) - size) < max(0.25, 0.2 * abs(size))
+                     for h in hdr_steps)
+        if size > 0 and system_clock and (listed or no_drops):
+            # The Windows clock was adjusted (time sync): a clock step, not lost samples.
+            csteps.append({"at_sample": i_step, "step_sec": float(size), "listed_in_header": bool(listed)})
+            bounds.append(i_step)
+        elif size > 0:
             bounds.append(i_step)
             gaps.append({"at_sample": i_step, "gap_sec": float(size)})
         else:
             ignored.append((i_step, float(size)))
     bounds.append(int(n_samples))
+    clock["clock_steps"] = csteps
+    step_at = {c["at_sample"] for c in csteps}
 
     # Linear fit of PC time against sample index within each segment, on the
     # block lower envelopes (jitter-free). level(c) = a + b*c.
@@ -607,13 +783,14 @@ def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
                      "was used instead.")
         source = "sample"
     segs, gap_total = [], 0.0
+    gap_of = {g["at_sample"]: g["gap_sec"] for g in gaps}
     for s, (i0, i1, a, b) in enumerate(seg_fits):
         if source == "pc":
             t0 = (i0 / fs + a + b * i0) - seg_fits[0][2]
             dt = 1.0 / fs + b
         else:
-            if s > 0:
-                gap_total += gaps[s - 1]["gap_sec"]
+            if s > 0 and i0 not in step_at:
+                gap_total += gap_of.get(i0, 0.0)
             t0 = i0 / fs + gap_total
             dt = 1.0 / fs
         segs.append({"i0": int(i0), "i1": int(i1), "t0": float(t0), "dt": float(dt)})
@@ -621,8 +798,10 @@ def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
     clock["source"] = source
     last = segs[-1]
     clock["duration_sec"] = float(last["t0"] + (last["i1"] - last["i0"]) * last["dt"])
-    for g, sg in zip(gaps, segs[1:]):
-        g["at_elapsed_sec"] = sg["t0"] - g["gap_sec"]
+    seg_by_i0 = {sg["i0"]: sg for sg in segs}
+    for g in gaps:
+        sg = seg_by_i0.get(g["at_sample"])
+        g["at_elapsed_sec"] = (sg["t0"] - g["gap_sec"]) if sg else g["at_sample"] / fs
     clock["gaps"] = gaps
 
     start_txt = (_clock12(clock["start_local"], date=True)
@@ -635,10 +814,20 @@ def build_clock_model(header, fs, n_samples, pc_t=None, clock_source="sample"):
     notes.append(
         f"PC timestamps vs the board's sample clock: {clock['pc_drift_ppm']:+.1f} ppm, "
         f"i.e. {clock['pc_drift_sec']:+.2f} s over the {span / 3600:.2f} h recording.")
+    if system_clock:
+        notes.append(
+            "The timestamps come from the Windows system clock, the same clock the FED3 controller "
+            "writes into PC_Timestamp, so FED events line up with them directly.")
     notes.append(
         "Time axis: " + ("board sample clock, anchored to the PC clock at the first "
-                         "sample (default)." if source == "sample" else
-                         "per-sample PC timestamps (piecewise-linear fit)."))
+                         "sample." if source == "sample" else
+                         "per-sample PC timestamps (jitter-free fit), i.e. the PC system clock."))
+    for c in csteps:
+        notes.append(f"The Windows clock was adjusted by {c['step_sec']:+.2f} s near sample "
+                     f"{c['at_sample']:,} (time sync"
+                     + (", also listed in the header" if c["listed_in_header"] else "") + "). No samples "
+                     "were lost there" + (", and the time axis follows the adjusted clock, as FED3 "
+                                          "PC_Timestamp does." if source == "pc" else "."))
     if not gaps and not ignored:
         notes.append("No lost samples: the PC timestamps run continuously from the "
                      "first sample to the last.")
@@ -676,6 +865,17 @@ def _end_time_check(clock, header, start_hdr, fs, n_samples):
     end_hdr = _parse_local(header.get("end_time"))
     start = _parse_local(clock.get("start_local")) or start_hdr
     if end_hdr is None or start is None:
+        return
+    if (start_hdr is not None and abs((end_hdr - start_hdr).total_seconds()) < 2.0
+            and n_samples / fs > 30):
+        # pyPhotometry writes end_time = start time when the file is created and only
+        # overwrites it when recording is stopped normally.
+        clock["end_time_check"] = {"end_time": end_hdr.isoformat(), "not_written": True}
+        clock["notes"].append(
+            "The header's end_time equals its start time: it was never updated, because the file was "
+            "copied while recording or the program closed without stopping. Nothing is wrong with the "
+            "data; the end of the recording comes from the samples"
+            + (" and their PC timestamps." if clock.get("has_pc_timestamps") else "."))
         return
     segs = clock["segments"]
     last_elapsed = segs[-1]["t0"] + (segs[-1]["i1"] - 1 - segs[-1]["i0"]) * segs[-1]["dt"]
@@ -931,6 +1131,163 @@ def _irls_fit(x, y, tuning=1.345, max_iter=50, tol=1e-8):
     return float(beta[0]), float(beta[1])
 
 
+def _bisquare_fit(x, y, tuning=1.4, max_iter=100, tol=1e-9):
+    """
+    IRLS with Tukey's bisquare weights, w = (1 - u^2)^2 for |u| < 1 and 0 beyond,
+    u = residual / (tuning * 1.4826 * MAD). Unlike Huber weights, points far from the
+    line (real transients) get NO weight at all. Keevers & Jean-Richard-dit-Bressel
+    (2025, Neurophotonics) found this, with a low tuning constant (1.4), recovered
+    simulated signals best.
+
+    Bisquare IRLS only finds the solution nearest its starting point, and a long block of
+    response (e.g. the signal staying low after food) can drag an ordinary or Huber start
+    with it. So it is run from several starts - the Huber fit and ordinary fits to each
+    quarter of the recording - and the solution whose residuals have the smallest robust
+    spread (MAD) is kept, i.e. the line that the bulk of the recording agrees on.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.size > 200_000:
+        # Very long recordings: fit on block means (about 100,000 points). Two parameters
+        # do not need a million samples, and it keeps the fit to about a second.
+        step = int(np.ceil(x.size / 100_000))
+        x, _ = _block_mean(x, step)
+        y, _ = _block_mean(y, step)
+        x, y = x[:min(x.size, y.size)], y[:min(x.size, y.size)]
+    A = np.column_stack([x, np.ones_like(x)])
+
+    def refine(beta):
+        beta = np.asarray(beta, dtype=float)
+        for _ in range(max_iter):
+            resid = y - A @ beta
+            scale = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+            if not np.isfinite(scale) or scale <= 0:
+                break
+            u = resid / (tuning * scale)
+            w = np.where(np.abs(u) < 1.0, (1.0 - u * u) ** 2, 0.0)
+            if (w > 0).sum() < 10:
+                break
+            sw = np.sqrt(w)
+            beta_new, *_ = np.linalg.lstsq(A * sw[:, None], y * sw, rcond=None)
+            done = np.max(np.abs(beta_new - beta)) < tol * max(1.0, np.max(np.abs(beta)))
+            beta = beta_new
+            if done:
+                break
+        resid = y - A @ beta
+        return beta, float(np.median(np.abs(resid - np.median(resid))))
+
+    starts = [_irls_fit(x, y)]
+    n = x.size
+    if n >= 400:
+        for q in range(4):
+            sl = slice(q * n // 4, (q + 1) * n // 4)
+            if np.ptp(x[sl]) > 0:
+                starts.append(_ols_fit(x[sl], y[sl]))
+    best, best_mad = None, np.inf
+    for st in starts:
+        if not np.all(np.isfinite(st)):
+            continue
+        beta, mad = refine(st)
+        if np.all(np.isfinite(beta)) and mad < best_mad * (1 - 1e-9):
+            best, best_mad = beta, mad
+    if best is None:
+        best = np.asarray(starts[0], dtype=float)
+    return float(best[0]), float(best[1])
+
+
+def control_agreement(control, signal, fs, trend_sec=60.0):
+    """
+    Do the control's faster changes go WITH the signal's (movement, fibre, blood: a valid
+    control) or AGAINST them (the indicator itself responding at the control wavelength)?
+
+    Both channels are averaged in 1-s blocks, a running median of `trend_sec` is removed
+    (bleaching and slow drift, which every channel shares regardless), and the Pearson r
+    of what is left is returned with the number of points used.
+
+    A clearly negative r means the "control" carries an inverted copy of the signal. This
+    happens when the control wavelength is not the indicator's isosbestic point (405 nm
+    with GCaMP during large responses; 405/410 nm with green GRAB sensors, whose
+    isosbestic point is ~440 nm; Simpson et al. 2024). Subtracting such a control ADDS
+    signal instead of removing artefact, so it must not be used.
+    """
+    step = max(int(round(fs)), 1)
+    a, _ = _block_mean(np.asarray(signal, dtype=float), step)
+    b, _ = _block_mean(np.asarray(control, dtype=float), step)
+    n = min(a.size, b.size)
+    if n < 30:
+        return float("nan"), int(n)
+    a, b = a[:n], b[:n]
+    win = int(max(5, min(round(trend_sec), n // 3))) | 1
+    ha = a - pd.Series(a).rolling(win, center=True, min_periods=1).median().to_numpy()
+    hb = b - pd.Series(b).rolling(win, center=True, min_periods=1).median().to_numpy()
+    if np.nanstd(ha) == 0 or np.nanstd(hb) == 0:
+        return float("nan"), int(n)
+    return float(np.corrcoef(ha, hb)[0, 1]), int(n)
+
+
+def fast_component(values, fs, trend_sec=60.0):
+    """values minus their slow trend (running median over `trend_sec` of 1-s block means,
+    interpolated back to every sample): what is left are changes faster than ~trend_sec."""
+    v = np.asarray(values, dtype=float)
+    step = max(int(round(fs)), 1)
+    small, centres = _block_mean(v, step)
+    if small.size < 30:
+        return v - np.nanmedian(v)
+    win = int(max(5, min(round(trend_sec), small.size // 3))) | 1
+    trend = pd.Series(small).rolling(win, center=True, min_periods=1).median().to_numpy()
+    return v - np.interp(np.arange(v.size), centres, trend)
+
+
+def bleaching_baseline(signal, control, fs, tuning=1.4):
+    """
+    Baseline of the signal channel when the control cannot be subtracted (it carries an
+    inverted copy of the indicator's response). Bleaching still has to be removed, and
+    the control still shows its time course, so:
+
+        B_ctl(t)  = double-exponential bleaching curve of the CONTROL (smooth, monotonic:
+                    it cannot follow responses or movement)
+        baseline  = a * B_ctl(t),  a = median(signal / B_ctl)
+
+    i.e. the signal is assumed to fade by the same fraction as the control. Two things
+    are deliberately NOT done. The curve is not fitted to the signal itself, and no free
+    slope/intercept is fitted: on a short recording a response that lasts most of the
+    session is indistinguishable from bleaching in one channel, and either fit absorbs
+    it (tested on fasted AgRP mice given food: a 13-20 % fall shrank to 3-12 %). If the
+    control's curve cannot be fitted, the baseline is the signal's median (no bleaching
+    correction). Returns (baseline, description).
+    """
+    from scipy.optimize import curve_fit
+    sig = np.asarray(signal, dtype=float)
+    ctl = np.asarray(control, dtype=float)
+    med = float(np.nanmedian(sig))
+    flat = np.full(sig.size, med)
+    step = max(int(round(fs)), 1)
+    small, centres = _block_mean(ctl, step)
+    t = centres / fs
+    T = float(ctl.size) / fs
+    if small.size < 30:
+        return flat, "median of the signal (recording too short to model bleaching)"
+    lo, hi = float(np.min(small)), float(np.max(small))
+    span = max(hi - lo, 1e-12)
+    try:
+        bounds = ([0, 0, 0, 1.0, 10.0], [hi, 20 * span, 20 * span, max(T, 5.0), 50 * T + 100])
+        p0 = [lo, span * 0.3, span * 0.7, max(T / 20, 2.0), max(T / 2, 20.0)]
+        p0 = [min(max(p, b0 + 1e-12), b1 - 1e-12) for p, b0, b1 in zip(p0, *bounds)]
+        params, _ = curve_fit(_double_exponential, t, small, p0=p0, bounds=bounds, maxfev=20000,
+                              loss="soft_l1",
+                              f_scale=max(1.4826 * np.median(np.abs(small - np.median(small))) * 0.2, 1e-9))
+        b_ctl = _double_exponential(np.arange(ctl.size) / fs, *params)
+    except Exception:
+        return flat, "median of the signal (the control's bleaching curve could not be fitted)"
+    if not np.all(np.isfinite(b_ctl)) or b_ctl.min() <= 0:
+        return flat, "median of the signal (the control's bleaching curve was not usable)"
+    with np.errstate(divide="ignore", invalid="ignore"):
+        a_ = float(np.nanmedian(sig / b_ctl))
+    if not np.isfinite(a_) or a_ <= 0:
+        return flat, "median of the signal (the bleaching curve could not be scaled)"
+    return a_ * b_ctl, "control's bleaching curve, scaled to the signal"
+
+
 def fit_control_to_signal(control, signal, method="ols", tuning=1.345,
                           negative_slope_policy="zero"):
     """
@@ -967,6 +1324,8 @@ def fit_control_to_signal(control, signal, method="ols", tuning=1.345,
     x, y = control[good], signal[good]
     if method == "irls":
         slope, intercept = _irls_fit(x, y, tuning=tuning)
+    elif method == "bisquare":
+        slope, intercept = _bisquare_fit(x, y, tuning=tuning)
     else:
         slope, intercept = _ols_fit(x, y)
 
@@ -1215,6 +1574,17 @@ def process_photometry(signal_raw, control_raw, fs, settings=None,
       6. dF/F0 = dF / F0
       7. z    = (dF/F0 - mean) / SD over the session
 
+    pipeline = "robust2025" (app default; Keevers & Jean-Richard-dit-Bressel 2025,
+                             Simpson et al. 2024, Lerner et al. 2015)
+      0. subtract the non-fluorescence background, if one is set
+      1-2 as above
+      3. fitted = a*control + b by IRLS with Tukey bisquare weights (tuning 1.4)
+      4. if a > 0 and the control's fast changes do not run against the signal's:
+             dF/F = (signal - fitted) / fitted
+         otherwise the control is not used:
+             dF/F = (signal - B) / B,  B = double-exponential bleaching curve of the signal
+      5. z as above
+
     pipeline = "pyphotometry" (Akam & Walton preprocess_data)
       1-2 as above
       3. B465, B405 = double-exponential bleaching fits
@@ -1249,6 +1619,19 @@ def process_photometry(signal_raw, control_raw, fs, settings=None,
         del control_raw
         control_raw = None
 
+    # Light that is not fluorescence (camera dark level / detector offset).
+    bg_s, bg_c = float(cfg.get("signal_background") or 0.0), float(cfg.get("control_background") or 0.0)
+    if bg_s or bg_c:
+        sig_filt = sig_filt - bg_s
+        ctl_filt = ctl_filt - bg_c
+        if keep:
+            sig_med, ctl_med = sig_med - bg_s, ctl_med - bg_c
+        notes_out.append(f"Background subtracted before the analysis: {bg_s:g} from the signal channel, "
+                         f"{bg_c:g} from the control channel (light that is not fluorescence).")
+        if np.nanmin(sig_filt) <= 0 or np.nanmin(ctl_filt) <= 0:
+            warnings_out.append("After background subtraction a channel reaches zero or below, so the "
+                                "background value is too high for this recording. dF/F is unreliable.")
+
     if cfg["lowpass_hz"] >= 0.99 * fs_in / 2.0:
         notes_out.append(
             f"The {cfg['lowpass_hz']:g} Hz low-pass is at or above the Nyquist frequency "
@@ -1278,7 +1661,74 @@ def process_photometry(signal_raw, control_raw, fs, settings=None,
                 "Douglass 2025 pipeline for this recording.")
             pipeline = "douglass2025"
 
-    if pipeline == "pyphotometry":
+    control_used = True
+    agree_r = float("nan")
+    if pipeline == "robust2025":
+        agree_r, _n_agree = control_agreement(ctl_filt, sig_filt, fs)
+        ctl_fit, slope, intercept, finfo = fit_control_to_signal(
+            ctl_filt, sig_filt, method="bisquare", tuning=cfg["bisquare_tuning"],
+            negative_slope_policy="zero")
+        finfo["control_agreement_r"] = agree_r
+        mode = str(cfg.get("control_use", "auto")).lower()
+        reject = finfo["slope_clamped"] or np.nanmin(ctl_fit) <= 0 or mode == "never" or (
+            mode == "auto" and np.isfinite(agree_r) and agree_r < cfg["control_reject_r"])
+        # Guard: a free fit lets a large SUSTAINED change in the signal be explained by the
+        # control's slow bleaching (slope far steeper than the channels' ratio). Then fit
+        # through the origin instead, signal = a * control, which is the plain 465/control ratio.
+        prop = float(np.nanmedian(sig_filt / ctl_filt)) if np.all(ctl_filt > 0) else np.nan
+        steep = finfo["raw_slope"] / prop if np.isfinite(prop) and prop > 0 else np.nan
+        finfo["slope_vs_ratio"] = float(steep) if np.isfinite(steep) else None
+        proportional = (not reject) and mode != "always" and np.isfinite(steep) and steep > cfg["max_slope_vs_ratio"]
+        if proportional:
+            ctl_fit = prop * ctl_filt
+            slope, intercept = prop, 0.0
+            finfo["baseline_method"] = "control scaled in proportion (465 / control ratio)"
+            warnings_out.append(
+                f"The free fit of the control to the signal had a slope {steep:.1f} times steeper than the "
+                "ratio of the two channels, which happens when a large, lasting change in the signal coincides "
+                "with the control's slow bleaching and would be removed as if it were bleaching. The control "
+                "was therefore scaled in proportion instead (dF/F follows the 465 / control ratio).")
+        if reject:
+            control_used = False
+            # The control as a whole cannot be subtracted, but if its FAST changes still go
+            # with the signal's (movement, light-source noise) those are removed on their own:
+            # slope fitted between the two fast components only, slow trends left untouched.
+            sig_use, fast_note = sig_filt, ""
+            finfo["fast_correction_slope"] = None
+            if mode != "never" and np.isfinite(agree_r) and agree_r > cfg["fast_correction_r"]:
+                cf = fast_component(ctl_filt, fs)
+                sf = fast_component(sig_filt, fs)
+                s_fast, _ = _bisquare_fit(cf, sf, cfg["bisquare_tuning"])
+                if np.isfinite(s_fast) and s_fast > 0:
+                    sig_use = sig_filt - s_fast * cf
+                    finfo["fast_correction_slope"] = float(s_fast)
+                    fast_note = (" Its fast changes do go with the signal's (r = "
+                                 f"{agree_r:.2f}), so those (movement, light-source noise; faster than about a "
+                                 "minute) WERE removed; slower artefacts were not.")
+            f0, how = bleaching_baseline(sig_use, ctl_filt, fs, cfg["bisquare_tuning"])
+            delta_f = sig_use - f0
+            why = ("it was switched off in the settings" if mode == "never" else
+                   f"the fitted slope was negative ({finfo['raw_slope']:.3g})" if finfo["slope_clamped"] else
+                   f"its fast changes run opposite to the signal's (r = {agree_r:.2f})"
+                   if np.isfinite(agree_r) and agree_r < cfg["control_reject_r"] else
+                   "the fitted control was not positive")
+            warnings_out.append(
+                f"The control channel was NOT used for this recording because {why}. A control that moves "
+                "against the signal carries an inverted copy of the indicator's own response (the control "
+                "wavelength is not exactly the indicator's isosbestic point), and subtracting it would add "
+                f"signal instead of removing artefact. dF/F = (signal - baseline) / baseline, with the {how} "
+                "as baseline." + (fast_note or " Movement artefacts are therefore NOT removed: check the raw "
+                                  "control trace around the events you analyse."))
+            slope, intercept = 0.0, float(np.nanmean(sig_filt))
+            finfo["slope_clamped"] = False        # reported above; avoid the older message
+            finfo["control_used"] = False
+            finfo["baseline_method"] = how
+            ctl_fit = f0
+        else:
+            finfo["control_used"] = True
+            delta_f = sig_filt - ctl_fit
+            f0 = ctl_fit
+    elif pipeline == "pyphotometry":
         sig_bc = sig_filt - sig_exp
         ctl_bc = ctl_filt - ctl_exp
         motion, slope, intercept, finfo = fit_control_to_signal(
@@ -1315,7 +1765,7 @@ def process_photometry(signal_raw, control_raw, fs, settings=None,
             "nm below GCaMP's isosbestic point, so when calcium falls 405 rises slightly (and "
             "the reverse). Common in strong recordings, e.g. AgRP neurons falling when food "
             "appears. Still check the raw 405 for movement by eye.")
-    elif np.isfinite(finfo["r2"]) and finfo["r2"] < 0.05:
+    elif control_used and np.isfinite(finfo["r2"]) and finfo["r2"] < 0.05:
         warnings_out.append(
             f"405 explains only {100 * finfo['r2']:.1f}% of the 465 variance, so motion "
             "correction removed very little. This does not show that the animal moved little: "

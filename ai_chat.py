@@ -1002,7 +1002,8 @@ def tool_raw_ppd_window(ctx, recording=None, start=None, end=None, points=30):
 def tool_recording_info(ctx, recording=None):
     res = ctx.rec(recording)
     s = res.get("settings") or {}
-    keep = ("input_type", "pipeline", "fit_slope_used", "fit_slope_unconstrained", "fit_slope_clamped",
+    keep = ("input_type", "pipeline", "control_used", "control_agreement_r", "baseline_method",
+            "signal_background", "fit_slope_used", "fit_slope_unconstrained", "fit_slope_clamped",
             "fit_R2", "pearson_r_405_vs_465", "F0_median_volts", "lowpass_hz", "median_filter_sec",
             "f0_method", "zscore_mode", "clipping_fraction", "duration_sec", "pc_timestamps",
             "time_axis", "cropped")
