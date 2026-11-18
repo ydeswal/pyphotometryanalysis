@@ -105,8 +105,8 @@ def controls(key, t_min, t_max, clock_start=None):
         cfg = {"on": bool(on and end is not None and length > 0), "end": end, "length": length,
                "dff_too": bool(dff_too), "key": key, "wanted": bool(on)}
         if on and end is None:
-            st.caption("Now set where the baseline ends: switch on **📍 Set baseline end** above a graph and "
-                       "click it, or type the time.")
+            st.caption("Now click the graph below where the baseline should end (**📍 Set baseline end** is on), "
+                       "or type the time.")
         elif on and length <= 0:
             st.caption("Give the baseline a length.")
         elif cfg["on"]:

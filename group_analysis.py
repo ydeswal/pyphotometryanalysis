@@ -415,6 +415,53 @@ def fed_matrix(members, alignment, bin_s, mode="Pellets per bin", ref_clock=None
             "M": M, "groups": groups, "animals": animals, "skipped": skipped}
 
 
+def _is_dark(hod, lights_on_h, lights_off_h):
+    """Is this hour of day (0-24) in the dark phase?"""
+    if lights_on_h is None or lights_off_h is None:
+        return None
+    if lights_on_h < lights_off_h:            # dark from lights off (evening) to lights on (morning)
+        return bool(hod < lights_on_h or hod >= lights_off_h)
+    return bool(lights_off_h <= hod < lights_on_h)
+
+
+def meal_list(members, max_gap_s=60.0, min_pellets=2, lights_on_h=None, lights_off_h=None):
+    """
+    Every meal of every member, one row each (same meal definition and recording window as
+    meal_table):
+      meal, onset_s / offset_s (member's own axis), onset_clock, hour_of_day, dark,
+      pellets, grams, duration_min (first to last pellet), pellets_per_min (within the meal),
+      gap_before_min (end of the previous meal -> this onset: the inter-meal interval),
+      interval_after_min (end of this meal -> next onset), satiety_ratio (interval_after_min
+      per pellet of this meal), recording, animal, group.
+    """
+    rows = []
+    for m in members:
+        a, b = window_of(m)
+        p = m["pellets"][(m["pellets"] >= a) & (m["pellets"] <= b)]
+        meals = fed3.find_meals(p, max_gap_s, min_pellets)
+        if not len(meals):
+            continue
+        on = meals["onset"].to_numpy(float)
+        off = meals["offset"].to_numpy(float)
+        n = meals["n_pellets"].to_numpy(int)
+        after = np.r_[on[1:] - off[:-1], np.nan] / 60.0
+        before = meals["gap_before_s"].to_numpy(float) / 60.0
+        for i in range(len(meals)):
+            dur = (off[i] - on[i]) / 60.0
+            clk = (m["cs"] + pd.Timedelta(seconds=float(on[i]))) if m["cs"] is not None else pd.NaT
+            hod = (clk.hour + clk.minute / 60.0 + clk.second / 3600.0) if m["cs"] is not None else np.nan
+            rows.append({
+                "group": m["group"], "animal": m["animal"] or "", "recording": m["name"], "meal": i + 1,
+                "onset_s": on[i], "offset_s": off[i], "onset_clock": clk, "hour_of_day": hod,
+                "dark": _is_dark(hod, lights_on_h, lights_off_h) if np.isfinite(hod) else None,
+                "pellets": int(n[i]), "grams": float(n[i] * m["grams"]), "duration_min": dur,
+                "pellets_per_min": (n[i] - 1) / dur if dur > 0 else np.nan,
+                "gap_before_min": before[i], "interval_after_min": after[i],
+                "satiety_ratio": after[i] / n[i] if np.isfinite(after[i]) else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
 def meal_table(members, max_gap_s=60.0, min_pellets=2, lights_on_h=None, lights_off_h=None):
     """
     Feeding pattern of every member inside its window, plus group rows

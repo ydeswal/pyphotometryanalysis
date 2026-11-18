@@ -35,6 +35,29 @@ allowed.
 
 ---
 
+## 17 November 2026 (b): group baseline you can see, meals by size and timing
+
+**Group analysis → "Normalise to a baseline I choose"** is now a switch at the top of the group settings. Turn it
+on and the graph is ready for a click (**📍 Set baseline end** is switched on for you): click where the
+baseline should end, or type the time. Every recording is then z-scored to the same period on the time axis,
+the graph is redrawn, the baseline is shaded blue, and **Response after the baseline** opens underneath with
+a graph (each recording faintly, group mean ± SEM, z against the baseline, ±1 SD band) and a table per
+recording plus a separate group mean ± SEM table. (Before, the choice was hidden behind the normalisation
+menu, and the table mixed numbers and "mean ± SEM" text, which Streamlit had to convert: the
+"Serialization of dataframe to Arrow table" message.)
+
+**Group analysis → "Meals: size & timing"**: every meal on the time axis (size, with a bar for its duration;
+time since the previous meal; satiety ratio), box plots of meal size, duration and inter-meal interval per
+animal, and three tables: each animal, group mean ± SEM, and every meal (clock time, hour of day,
+dark/light, pellets, grams, duration, eating rate within the meal, time since the previous / until the next
+meal, satiety ratio). Downloadable.
+
+**Checked by hand** (`test_meals.py`, 30 checks): every meal value on a pellet list worked out on paper, the
+per-animal table equal to the averages of the meal list, dark/light for the 10 AM–10 PM cycle, the group
+baseline mask on the shared clock axis, z = 0 ± 1 inside each baseline, and z = step ÷ SD after a step. On real
+data (k_M2, 4 Nov) the app's numbers (206 pellets, 35 meals, 5.886 pellets/meal, 2.416 min, 19.31 min
+between meals, satiety ratio 4.218) equal a separate calculation straight from the FED3 CSV.
+
 ## 17 November 2026: one ZIP in, everything out; baseline you choose; new acquisition build
 
 **Upload one ZIP and it runs.** The main uploader now takes `.ppd`, `.csv`, `.json` and `.zip`. A ZIP may

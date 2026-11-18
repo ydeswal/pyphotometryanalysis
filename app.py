@@ -3034,6 +3034,7 @@ else:
                 peaks=kind in ("Main dFF", "Z-score sliding mean", "Z-score range analysis"),
                 peak_default_on=False,
                 pick_key=baseline_view.pick_key(_bkey) if bl_cfg.get("wanted") else None,
+                pick_default=kind in ("Overview", "Main dFF"),
             )
 
         def render_chart(kind):

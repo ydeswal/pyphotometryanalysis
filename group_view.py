@@ -53,7 +53,8 @@ _FED = "#b45309"
 _DARK = "rgba(15,23,42,0.055)"
 
 VIEWS = ["Combined (group mean)", "Each recording", "Heatmap", "Actogram (days, double-plotted)",
-         "Meal size vs response", "Event response & signal check", "Meal-aligned (group)", "Feeding pattern table"]
+         "Meals: size & timing", "Meal size vs response", "Event response & signal check", "Meal-aligned (group)",
+         "Feeding pattern table"]
 RATIO = "465 ÷ 405 ratio (raw)"
 RAW_KINDS = (fed_view.RAW_BOTH, RATIO, "465 raw", "405 raw", "465 filtered")
 _UV = "#009E73"
@@ -770,6 +771,14 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     med_dur = float(np.median(durations)) if durations else 0.0
     no_clock = [n for n, v in clock_starts.items() if v is None]
     starts_differ = spread > max(60.0, 0.05 * med_dur) or bool(no_clock)
+    pick_on = st.toggle("Normalise to a baseline I choose (click the graph where it should end)", key="grp_bl_pick_on",
+                        help="Every recording is normalised to the same period on the time axis: the hours/minutes "
+                             "before the moment you click (or type). The graphs then show z against that baseline, "
+                             "and 'Response after the baseline' shows each recording's peak against it.")
+    if pick_on:
+        for _k in ("grp_norm_raw", "grp_norm_proc"):     # switch the normalisation to a baseline one
+            if "baseline" not in str(st.session_state.get(_k, "")).lower():
+                st.session_state[_k] = "z-score to a baseline period"
     c = st.columns([1.5, 1.3, 1.6, 1.2])
     alignment = c[0].selectbox("Line recordings up by", ga.ALIGNMENTS, index=2 if starts_differ else 0,
                                key="grp_align",
@@ -792,25 +801,23 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     span0 = max(durations) if durations else 3600.0
     bl_end_text, bl_choose = None, False
     if "baseline" in norm.lower():
-        _bc = st.columns([0.7, 0.7, 1.6, 2.0])
+        _bc = st.columns([0.7, 0.7, 2.6])
         dflt_h, dflt_m = (0, 30.0) if span0 >= 2 * 3600 else (0, 0.5)
         bl_h = _bc[0].number_input("Baseline: hours", 0, 96, dflt_h, 1, key="grp_bl_h")
         bl_m = _bc[1].number_input("minutes", 0.0, 59.99, dflt_m, 0.5, key=f"grp_bl_m_{dflt_m:g}")
         base_min = max(bl_h * 60.0 + bl_m, 0.05)
-        BL_MODES = ["Start of each recording (or before the event / first pellet)", "A time I choose on the graph"]
-        bl_mode = _bc[2].selectbox("Baseline ends at", BL_MODES, key="grp_bl_mode",
-                                 help="First option: the first minutes of each recording, or the minutes before 0 "
-                                      "when recordings are lined up on an event or the first pellet. Second: the "
-                                      "same moment on the graph's time axis for every recording, set by clicking "
-                                      "the graph (📍 Set baseline end) or typing it.")
-        bl_choose = bl_mode == BL_MODES[1]
+        bl_choose = bool(pick_on)
+        if not bl_choose:
+            _bc[2].caption("Baseline: the first minutes of each recording (or the minutes before the event / first "
+                           "pellet when lined up on it). To pick the moment yourself, switch on **Normalise to a "
+                           "baseline I choose** above.")
         if bl_choose:
             if st.session_state.get("grp_bl_end") is not None and \
                     st.session_state.get("grp_bl_synced") != (st.session_state["grp_bl_end"], alignment):
                 st.session_state["grp_bl_txt"] = _fmt_axis(st.session_state["grp_bl_end"], alignment,
                                                            st.session_state.get("grp_ref"))
                 st.session_state["grp_bl_synced"] = (st.session_state["grp_bl_end"], alignment)
-            bl_end_text = _bc[3].text_input("Time on the graph's axis", key="grp_bl_txt",
+            bl_end_text = _bc[2].text_input("Baseline ends at (time on the graph's axis)", key="grp_bl_txt",
                                           placeholder="click the graph, or type e.g. 1:30:00 / 3:05 PM",
                                           help="Clock time with AM/PM (3:05 PM) when lined up by clock or time of "
                                                "day; otherwise H:MM:SS on the x axis (with clock alignment, H:MM:SS "
@@ -952,8 +959,8 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             st.session_state["grp_bl_synced"] = (bl_end, alignment)
             st.session_state["grp_bl_end_used"] = bl_end
         else:
-            st.info("Set where the baseline ends: switch on **📍 Set baseline end** above the graph and click it, "
-                    "or type the time. Until then each recording is normalised to its first minutes.")
+            st.info("Click the graph below where the baseline should end (or type the time above). Until then "
+                    "each recording is normalised to its first minutes.")
     spans = []
     for m in members:
         off = ga.align_offset(m, alignment, ref)
@@ -1049,10 +1056,10 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                               evs=[e for v in rev.values() for e in v], min_n=min_n)
         _x_hover(fig, lab)
         gt.chart_block(retitle(fig), key="grp_combined", max_points=max_points, clock_start=clock_for_ruler,
-                       config=config, pick_key=pick)
+                       config=config, pick_key=pick, pick_default=True)
         _downloads(S, F, stat, lab, "combined", S2)
         if bl_end is not None:
-            _baseline_response_table(members, alignment, ref, bl_end, base_min, sig_label)
+            _baseline_response_table(members, alignment, ref, bl_end, base_min, sig_label, stat, h)
 
     elif view == "Each recording":
         layout = st.radio("Layout", ["Stacked panels", "One graph"], horizontal=True, key="grp_layout")
@@ -1065,9 +1072,9 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                           darks, layout, sig_label, bars, h, S2=S2, row_events=rev, own_axis_405=own_axis)
         _x_hover(fig, lab)
         gt.chart_block(retitle(fig), key="grp_each_fig", max_points=max_points * 2, clock_start=clock_for_ruler,
-                       config=config, pick_key=pick)
+                       config=config, pick_key=pick, pick_default=True)
         if bl_end is not None:
-            _baseline_response_table(members, alignment, ref, bl_end, base_min, sig_label)
+            _baseline_response_table(members, alignment, ref, bl_end, base_min, sig_label, stat, h)
         th.explain("How to read this graph", "Dashed red lines: events. Ticks above each trace mark single "
                    "pellets; shaded areas are the dark phase." + (" Blue: 465, green: 405." if S2 is not None
                                                                      else ""))
@@ -1085,6 +1092,10 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
     elif view == "Actogram (days, double-plotted)":
         _actogram_view(members, norm, base_min, bl_end, alignment, ref, bin_s, lights_on, lights_off, sig_label,
                        centred, config, h)
+
+    elif view == "Meals: size & timing":
+        _meals_view(fed_members if animals else members, alignment, ref, gap, minp, lights_on, lights_off, darks,
+                    S, config, h)
 
     elif view == "Meal size vs response":
         _meal_size_view(members, norm, base_min, bl_end, alignment, ref, gap, minp, lights_on, lights_off,
@@ -1534,52 +1545,94 @@ def _parse_axis(text, alignment, ref):
     return parse_recording_time(text)
 
 
-def _baseline_response_table(members, alignment, ref, end_x, base_min, sig_label):
-    """Peak after the chosen baseline, for every recording (same baseline moment on the shared axis)."""
+def _baseline_response_table(members, alignment, ref, end_x, base_min, sig_label, stat="Mean ± SEM", h=1.0):
+    """Graph + table: every recording against the SAME baseline moment on the shared axis."""
     import baseline as bl
-    with st.expander("Response after the baseline, each recording", expanded=False):
+    with st.expander("Response after the baseline: graph and table, each recording", expanded=True):
         c = st.columns([1, 1, 1, 2])
         resp_min = c[0].number_input("Response window (min)", 0.05, 24 * 60.0, float(max(base_min, 1.0)), 0.5,
                                      key="grp_bl_resp")
         direction = c[1].selectbox("Look for", ["Larger change", "Peak (up)", "Dip (down)"], key="grp_bl_dir")
         smooth = c[2].number_input("Smooth (s)", 0.0, 600.0, 2.0, 0.5, key="grp_bl_sm")
-        rows = []
+        base_s, resp_s = base_min * 60.0, resp_min * 60.0
+        rows, curves = [], []
+        npts = 600
+        grid_step = (base_s + resp_s) / npts
         for m in members:
             off = ga.align_offset(m, alignment, ref)
             if off is None or m["t"] is None:
                 continue
-            r = bl.peak_vs_baseline(m["t"] + off, m["y"], end_x, base_min * 60.0, resp_min * 60.0,
+            x = m["t"] + off
+            r = bl.peak_vs_baseline(x, m["y"], end_x, base_s, resp_s,
                                     {"Larger change": "auto", "Peak (up)": "up", "Dip (down)": "down"}[direction],
                                     smooth)
-            row = {"recording": m["name"], "animal": m["animal"] or "", "group": m["group"]}
+            row = {"group": m["group"], "animal": m["animal"] or "", "recording": m["name"]}
             if r.get("ok"):
-                row.update({"peak z (baseline only)": r["peak_z"], "peak z (baseline + response)":
-                            r["peak_z_whole_window"], "time to peak (s)": r["peak_time_s"],
-                            "back within 1 SD (s)": r["return_s"], "mean z over response": r["mean_z"],
-                            "AUC (z·s)": r["auc_z"]})
+                row.update({"baseline mean": r["baseline_mean_pct"], "baseline SD": r["baseline_sd_pct"],
+                            "peak z (baseline only)": r["peak_z"],
+                            "peak z (baseline + response)": r["peak_z_whole_window"],
+                            "time to peak (s)": r["peak_time_s"],
+                            "back within 1 SD (s)": r["return_s"] if r["return_s"] is not None else np.nan,
+                            "mean z over response": r["mean_z"], "AUC (z·s)": r["auc_z"]})
                 if m.get("dff_percent"):
                     row["peak, % change from baseline"] = r["peak_change_pct"]
+                ys = bl.smooth_by_time(x, m["y"], smooth)
+                zb = (ys - r["baseline_mean_pct"]) / r["baseline_sd_pct"]
+                curves.append((m["name"], m["group"], ga.bin_mean(x - end_x, zb, -base_s, grid_step, npts)))
             else:
                 row["note"] = r.get("message", "")
             rows.append(row)
         if not rows:
             st.info("No recording covers the baseline.")
             return
+        if curves:
+            tx = -base_s + (np.arange(npts) + 0.5) * grid_step
+            unit = 60.0 if base_s + resp_s > 600 else 1.0
+            fig = go.Figure()
+            fig.add_vrect(x0=-base_s / unit, x1=0, fillcolor="rgba(37,99,235,0.10)", line_width=0, layer="below")
+            fig.add_hrect(y0=-1, y1=1, fillcolor="rgba(100,116,139,0.10)", line_width=0, layer="below")
+            groups = list(dict.fromkeys(g for _, g, _ in curves))
+            for gi, g in enumerate(groups):
+                col = PALETTE[gi % len(PALETTE)]
+                M = np.vstack([v for _, gg, v in curves if gg == g])
+                for nm, gg, v in curves:
+                    if gg == g:
+                        fig.add_trace(go.Scatter(x=tx / unit, y=v, mode="lines", name=nm, legendgroup=g,
+                                                 line=dict(color=col, width=0.9), opacity=0.35, showlegend=False,
+                                                 hovertemplate=f"{nm}: %{{y:.2f}}<extra></extra>"))
+                gc, glo, ghi, _n = ga.group_stat(M, stat)
+                okb = np.isfinite(glo) & np.isfinite(ghi)
+                if okb.any():
+                    fig.add_trace(go.Scatter(x=np.r_[tx[okb], tx[okb][::-1]] / unit,
+                                             y=np.r_[ghi[okb], glo[okb][::-1]], fill="toself",
+                                             fillcolor=_rgba(col, 0.2), line_width=0, hoverinfo="skip",
+                                             showlegend=False, legendgroup=g))
+                fig.add_trace(go.Scatter(x=tx / unit, y=gc, mode="lines", name=f"{g} ({stat}, n={M.shape[0]})",
+                                         line=dict(color=col, width=2.6), legendgroup=g))
+            fig.add_vline(x=0, line=dict(color="#2563eb", width=1.4, dash="dot"))
+            fig.update_layout(template="plotly_white", height=int(460 * h), margin=dict(l=60, r=20, t=40, b=50),
+                              legend=dict(orientation="h", y=1.1, x=0), hovermode="x unified",
+                              xaxis_title=f"{'minutes' if unit == 60 else 'seconds'} from the end of the baseline",
+                              yaxis_title="z against the baseline")
+            st.plotly_chart(fig, use_container_width=True, key="grp_bl_fig")
         tab = pd.DataFrame(rows)
+        st.dataframe(tab.round(3), use_container_width=True, hide_index=True)
         num = [c_ for c_ in tab.columns if c_ not in ("recording", "animal", "group", "note")]
+        summ = []
         for g, sub in tab.groupby("group", sort=False):
-            if len(sub) > 1:
-                r = {"recording": f"{g}: mean ± SEM (n = {len(sub)})", "group": g}
-                for c_ in num:
-                    v = pd.to_numeric(sub[c_], errors="coerce").to_numpy(float)
-                    v = v[np.isfinite(v)]
-                    r[c_] = (f"{v.mean():.3g} ± {v.std(ddof=1) / np.sqrt(v.size):.2g}" if v.size > 1 else
-                             (f"{v[0]:.3g}" if v.size else ""))
-                tab = pd.concat([tab, pd.DataFrame([r])], ignore_index=True)
-        st.dataframe(tab, use_container_width=True, hide_index=True)
+            r = {"group": g, "n": int(len(sub))}
+            for c_ in num:
+                v = pd.to_numeric(sub[c_], errors="coerce").to_numpy(float)
+                v = v[np.isfinite(v)]
+                r[c_] = (f"{v.mean():.3g} ± {v.std(ddof=1) / np.sqrt(v.size):.2g}" if v.size > 1 else
+                         (f"{v[0]:.3g}" if v.size else ""))
+            summ.append(r)
+        st.markdown("**Group mean ± SEM**")
+        st.dataframe(pd.DataFrame(summ).astype(str), use_container_width=True, hide_index=True)
         st.caption(f"Signal: {sig_label} before normalising. Baseline = the {base_min:g} min before the chosen "
-                   "moment; z is (signal − baseline mean) ÷ baseline SD of each recording. 'Baseline + response' "
-                   "is the same peak z-scored over both windows together, for comparison.")
+                   "moment (blue band); z = (signal − baseline mean) ÷ baseline SD of each recording; grey band = "
+                   "±1 SD. 'Baseline + response' is the same peak z-scored over both windows together, for "
+                   "comparison.")
         st.download_button("Download (CSV)", tab.to_csv(index=False).encode(), "peak_vs_baseline_group.csv",
                            "text/csv", key="grp_bl_dl")
 
@@ -1726,3 +1779,102 @@ def _meal_size_view(members, norm, base_min, bl_end, alignment, ref, gap, minp, 
                "Meals close together share windows, so with frequent meals use shorter windows.")
     st.download_button("Download every meal (CSV)", df.to_csv(index=False).encode(), "meal_size_vs_response.csv",
                        "text/csv", key="grp_ms_dl")
+
+
+def _meals_view(members, alignment, ref, gap, minp, lights_on, lights_off, darks, S, config, h):
+    """Every meal on the time axis: size, duration, gap before it, satiety ratio; per-meal and per-animal tables."""
+    ML = ga.meal_list(members, gap, minp, lights_on, lights_off)
+    if ML.empty:
+        st.info("No meals: load FED3 data and set the animal for each recording (or check the meal definition "
+                "under More settings).")
+        return
+    animals = list(dict.fromkeys(ML["animal"].replace("", np.nan).fillna(ML["recording"])))
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        subplot_titles=("Meal size (pellets); bar = meal duration",
+                                        "Time since the previous meal ended (min)",
+                                        "Satiety ratio (min without food after the meal, per pellet)"))
+    by_name = {m["name"]: m for m in members}
+    for i, an in enumerate(animals):
+        sub = ML[(ML["animal"].replace("", np.nan).fillna(ML["recording"])) == an]
+        col = PALETTE[i % len(PALETTE)]
+        xs = []
+        for _, rr in sub.iterrows():
+            off = ga.align_offset(by_name[rr["recording"]], alignment, ref)
+            xs.append(np.nan if off is None else rr["onset_s"] + off)
+        xs = np.asarray(xs, float)
+        when = [gt.fmt12(v, decimals=0) if pd.notna(v) else "" for v in sub["onset_clock"]]
+        cd = np.c_[sub["meal"], sub["pellets"], sub["duration_min"].round(2), sub["gap_before_min"].round(1),
+                   sub["satiety_ratio"].round(2), np.array(when, dtype=object)]
+        hov = ("<b>" + str(an) + "</b> meal %{customdata[0]} · %{customdata[5]}<br>%{customdata[1]} pellets over "
+               "%{customdata[2]} min<br>%{customdata[3]} min since the previous meal<br>satiety ratio "
+               "%{customdata[4]} min/pellet<extra></extra>")
+        fig.add_trace(go.Scatter(x=xs, y=sub["pellets"], mode="markers", name=str(an), legendgroup=str(an),
+                                 marker=dict(color=col, size=7 + 2.2 * np.sqrt(sub["pellets"].to_numpy(float)),
+                                             line=dict(color="white", width=0.8)),
+                                 error_x=dict(type="data", symmetric=False,
+                                              array=sub["duration_min"].to_numpy(float) * 60.0,
+                                              arrayminus=np.zeros(len(sub)), color=col, thickness=2, width=0),
+                                 customdata=cd, hovertemplate=hov), row=1, col=1)
+        fig.add_trace(go.Scatter(x=xs, y=sub["gap_before_min"], mode="markers+lines", legendgroup=str(an),
+                                 showlegend=False, line=dict(color=col, width=1), marker=dict(color=col, size=6),
+                                 customdata=cd, hovertemplate=hov), row=2, col=1)
+        fig.add_trace(go.Scatter(x=xs, y=sub["satiety_ratio"], mode="markers", legendgroup=str(an),
+                                 showlegend=False, marker=dict(color=col, size=6, symbol="diamond"),
+                                 customdata=cd, hovertemplate=hov), row=3, col=1)
+    for r in (1, 2, 3):            # after the traces: plotly skips shapes on still-empty panels
+        for a, b in darks:
+            fig.add_vrect(x0=a, x1=b, fillcolor=_DARK, line_width=0, layer="below", row=r, col=1,
+                          exclude_empty_subplots=False)
+    _apply_axis(fig, S, alignment, ref, lights_on if alignment.startswith("Time of day") else None, rows=[1, 2, 3])
+    fig.update_xaxes(title_text=axis_title(alignment), row=3, col=1)
+    fig.update_yaxes(title_text="pellets", rangemode="tozero", row=1, col=1)
+    fig.update_yaxes(title_text="min", rangemode="tozero", row=2, col=1)
+    fig.update_yaxes(title_text="min / pellet", rangemode="tozero", row=3, col=1)
+    fig.update_layout(template="plotly_white", height=int(820 * h), margin=dict(l=70, r=20, t=60, b=60),
+                      legend=dict(orientation="h", y=1.06, x=0), font=dict(color="#111827"), dragmode="pan")
+    st.plotly_chart(fig, use_container_width=True, config=config, key="grp_meals_fig")
+
+    # per-animal distributions: meal size and inter-meal interval
+    d = make_subplots(rows=1, cols=3, subplot_titles=("Meal size (pellets)", "Meal duration (min)",
+                                                      "Inter-meal interval (min)"))
+    for i, an in enumerate(animals):
+        sub = ML[(ML["animal"].replace("", np.nan).fillna(ML["recording"])) == an]
+        col = PALETTE[i % len(PALETTE)]
+        for k, colname in enumerate(("pellets", "duration_min", "gap_before_min"), start=1):
+            d.add_trace(go.Box(y=sub[colname], name=str(an), marker_color=col, boxpoints="all", jitter=0.4,
+                               pointpos=0, showlegend=False, line=dict(width=1.4)), row=1, col=k)
+    d.update_layout(template="plotly_white", height=int(360 * h), margin=dict(l=50, r=20, t=50, b=40),
+                    font=dict(color="#111827"))
+    st.plotly_chart(d, use_container_width=True, config=config, key="grp_meals_box")
+
+    tab, summ = ga.meal_table(members, gap, minp, lights_on, lights_off)
+    st.markdown("**Each animal**")
+    st.dataframe(tab.round(3), hide_index=True, use_container_width=True)
+    if not summ.empty:
+        st.markdown("**Group mean ± SEM**")
+        st.dataframe(summ.astype(str), hide_index=True, use_container_width=True)
+    st.markdown("**Every meal**")
+    show = ML.drop(columns=["onset_s", "offset_s"]).copy()
+    show["onset_clock"] = [gt.fmt12(v, decimals=0) if pd.notna(v) else "" for v in show["onset_clock"]]
+    show.insert(4, "onset (time on axis)", [_fmt_axis(x + (ga.align_offset(by_name[r], alignment, ref) or 0.0),
+                                                     alignment, ref) for x, r in zip(ML["onset_s"], ML["recording"])])
+    show["dark"] = show["dark"].map({True: "dark", False: "light"}).fillna("")
+    show = show.rename(columns={"onset_clock": "onset (clock)", "hour_of_day": "hour of day",
+                                "duration_min": "duration (min)", "pellets_per_min": "pellets / min in meal",
+                                "gap_before_min": "min since previous meal", "interval_after_min": "min until next meal",
+                                "satiety_ratio": "satiety ratio (min/pellet)"})
+    st.dataframe(show.round(3), hide_index=True, use_container_width=True)
+    th.explain("What these numbers mean",
+               f"**Meal**: pellets less than {gap:g} s apart, at least {minp} pellet(s) (More settings → meal "
+               "definition). **Duration**: first to last pellet of the meal. **Eating rate in the meal**: "
+               "(pellets − 1) ÷ duration. **Time since the previous meal** (inter-meal interval): end of the "
+               "previous meal to the start of this one. **Satiety ratio**: time from the end of this meal to the "
+               "start of the next, per pellet eaten in it (a longer pause after a smaller meal = a stronger "
+               "satiating effect per pellet). The last meal has no next meal, so no satiety ratio. Dark/light "
+               "uses the lights-off/on hours under More settings. Only pellets inside each recording's window "
+               "count (or inside the FED's logged time for FED-only animals).")
+    c = st.columns(2)
+    c[0].download_button("Download every meal (CSV)", ML.to_csv(index=False).encode(), "meals_every_meal.csv",
+                         "text/csv", key="grp_meals_dl")
+    c[1].download_button("Download per animal (CSV)", tab.to_csv(index=False).encode(), "meals_per_animal.csv",
+                         "text/csv", key="grp_meals_dl2")

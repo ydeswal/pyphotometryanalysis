@@ -669,7 +669,8 @@ def download_button(label, data, *args, **kwargs):
 @st.fragment
 def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0,
                 peaks=False, peak_default_on=False, config=None, ruler=True, compact=False,
-                event_counts=None, time_hover=None, pick_key=None, pick_label="📍 Set baseline end"):
+                event_counts=None, time_hover=None, pick_key=None, pick_label="📍 Set baseline end",
+                pick_default=False):
     """
     Show one Plotly figure with an optional peaks panel and two-click time
     ruler. event_counts: optional list of (label, times_sec, grams_each or
@@ -689,6 +690,8 @@ def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0
                      ([1, 1, 1.4] if compact else [1, 1, 1.5, 2]))
     if st.session_state.pop(f"{key}_pick_reset", False):
         st.session_state[f"{key}_pick"] = False
+    elif pick_key and pick_default and st.session_state.get(pick_key) is None:
+        st.session_state[f"{key}_pick"] = True      # nothing chosen yet: ready for the click
     pick_on = bar[2].toggle(pick_label, key=f"{key}_pick",
                             help="Then click the graph at the moment the baseline should END (e.g. just "
                                  "before an event). The baseline is the period of the chosen length before "
