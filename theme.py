@@ -522,10 +522,10 @@ def note(text, kind=""):
     st.markdown(f'<div class="pp-note {kind}">{text}</div>', unsafe_allow_html=True)
 
 
-def explain(label, text, container=None, use_container_width=False):
+def explain(label, text, container=None, width="content"):
     """A small button that opens an explanation only when someone asks for it."""
     where = container if container is not None else st
-    with where.popover(label, use_container_width=use_container_width):
+    with where.popover(label, width=width):
         st.markdown(text, unsafe_allow_html=True)
 
 

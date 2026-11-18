@@ -463,12 +463,12 @@ def _peak_controls(fig, key, trace_k, x_unit_sec, clock_start, default_markers, 
         st.markdown(f"**Highest peaks (ceilings)** · {label}")
         ed_hi = st.data_editor(_table(hi), key=f"{key}_pk_hi_{ver}", hide_index=True,
                                disabled=["#", "Value", "Elapsed", "Clock"], column_config=cfg,
-                               use_container_width=True)
+                               width="stretch")
     with e2:
         st.markdown(f"**Lowest troughs (floors)** · {label}")
         ed_lo = st.data_editor(_table(lo), key=f"{key}_pk_lo_{ver}", hide_index=True,
                                disabled=["#", "Value", "Elapsed", "Clock"], column_config=cfg,
-                               use_container_width=True)
+                               width="stretch")
 
     finite = y[np.isfinite(y)]
     baseline = float(np.median(finite)) if finite.size else 0.0
@@ -751,7 +751,7 @@ def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0
                                selected=dict(marker=dict(opacity=0)),
                                unselected=dict(marker=dict(opacity=0)))
         fig.update_layout(clickmode="event+select", dragmode="pan")
-        ev = st.plotly_chart(fig, use_container_width=True, config=cfg, key=f"{key}_pickchart",
+        ev = st.plotly_chart(fig, width="stretch", config=cfg, key=f"{key}_pickchart",
                              on_select="rerun", selection_mode="points")
         sel = getattr(getattr(ev, "selection", None), "points", None) or \
             (ev.get("selection", {}).get("points", []) if isinstance(ev, dict) else [])
@@ -779,7 +779,7 @@ def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0
                                selected=dict(marker=dict(opacity=0)),
                                unselected=dict(marker=dict(opacity=0)))
         fig.update_layout(clickmode="event+select", dragmode="pan")
-        ev = st.plotly_chart(fig, use_container_width=True, config=cfg, key=f"{key}_chart",
+        ev = st.plotly_chart(fig, width="stretch", config=cfg, key=f"{key}_chart",
                              on_select="rerun", selection_mode="points")
         sel = getattr(getattr(ev, "selection", None), "points", None) or \
             (ev.get("selection", {}).get("points", []) if isinstance(ev, dict) else [])
@@ -797,7 +797,7 @@ def chart_block(fig, key, *, max_points=12_000, clock_start=None, x_unit_sec=1.0
                     st.rerun(scope="fragment")
         _ruler_readout(pts, clock_start, target_t, target_y, target_label, event_counts)
     else:
-        st.plotly_chart(fig, use_container_width=True, config=cfg, key=f"{key}_chart")
+        st.plotly_chart(fig, width="stretch", config=cfg, key=f"{key}_chart")
 
 
 def _ruler_readout(pts, clock_start, t, y, label, event_counts=None):

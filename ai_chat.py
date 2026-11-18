@@ -2252,7 +2252,7 @@ def _show_checks(h):
     c1, c2 = st.columns([5, 1.3])
     c1.markdown(f"<div style='font-size:0.86rem;color:{colour};padding-top:6px'><b>Data check:</b> {label}"
                 f"{warn}</div>", unsafe_allow_html=True)
-    with c2.popover("Details", use_container_width=True):
+    with c2.popover("Details", width="stretch"):
         st.caption("Fixed rules in the app, not the AI.")
         for c in uniq[:6]:
             st.markdown(f"**{c.get('label', c['level'])}** · {c.get('where', '')}\n\n{c['verdict']}")
@@ -2274,7 +2274,7 @@ def _show_graphs(h, ctx, idx):
         except Exception as e:
             st.caption(f"(The graph could not be redrawn: {e})")
             continue
-        st.plotly_chart(fig, use_container_width=True, key=f"ai_fig_{idx}_{j}",
+        st.plotly_chart(fig, width="stretch", key=f"ai_fig_{idx}_{j}",
                         config={"displaylogo": False, "scrollZoom": False})
 
 

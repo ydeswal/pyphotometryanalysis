@@ -232,7 +232,7 @@ def response_panel(df_raw, roi, cfg, key, clock_start=None, height=430):
     fig.update_layout(template="plotly_white", height=height, margin=dict(l=60, r=20, t=40, b=50),
                       legend=dict(orientation="h", y=1.08, x=0), hovermode="x unified",
                       xaxis_title="seconds from the end of the baseline", yaxis_title="z")
-    st.plotly_chart(fig, use_container_width=True, key=f"{key}_bl_fig")
+    st.plotly_chart(fig, width="stretch", key=f"{key}_bl_fig")
     th.explain("Why the two z-scores differ",
                "**Blue (solid):** z against the baseline only, the band shaded blue. 0 is the baseline mean, and "
                "±1 (grey band) its normal ups and downs.\n\n**Grey (dashed):** the same signal z-scored over "

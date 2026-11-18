@@ -1759,7 +1759,7 @@ def render_zscore_range_controls(base_key):
     with c3:
         z_show_range_annotations = st.checkbox("Show average/range labels", value=True, key=f"{base_key}_z_show_range_annotations")
     z_show_stats_table = st.checkbox("Show statistics table below graph", value=True, key=f"{base_key}_z_show_stats_table")
-    if st.button("Clear z-score ranges", use_container_width=True, key=f"{base_key}_clear_z_ranges"):
+    if st.button("Clear z-score ranges", width="stretch", key=f"{base_key}_clear_z_ranges"):
         st.session_state[f"{base_key}_num_z_ranges"] = 0
     num_z_ranges = st.number_input("Number of z-score ranges", min_value=0, max_value=30, step=1, key=f"{base_key}_num_z_ranges")
     z_range_periods = []
@@ -2001,7 +2001,7 @@ with st.sidebar:
             if INTAKE["fed"]:
                 st.caption(f"FED3 files: {len(INTAKE['fed'])} (added to *FED3 feeding data* automatically).")
             if INTAKE["skipped"]:
-                with st.popover(f"{len(INTAKE['skipped'])} file(s) not used", use_container_width=True):
+                with st.popover(f"{len(INTAKE['skipped'])} file(s) not used", width="stretch"):
                     for _n, _why in INTAKE["skipped"]:
                         st.markdown(f"- `{_n}`: {_why}")
             if st.button("Remove these files", key="clear_staged"):
@@ -2386,8 +2386,8 @@ with st.sidebar:
                    "* **Remove rows from visual display**: those samples are left out of the graphs.\n\n"
                    "Either way it changes **only what the graphs show**. The motion correction, dF/F, z-scores "
                    "and the downloaded CSV still use every sample. To really cut the recording, use **Crop** "
-                   "instead.", use_container_width=True)
-        if st.button("Clear hidden time periods", use_container_width=True):
+                   "instead.", width="stretch")
+        if st.button("Clear hidden time periods", width="stretch"):
             st.session_state["num_exclusions"] = 0
         exclusion_mode = st.radio(
             "How to hide selected regions",
@@ -2425,7 +2425,7 @@ with st.sidebar:
                     st.warning("End time must be after start time for this hidden region.")
 
     with st.expander("Event lines / shaded epochs", expanded=False):
-        if st.button("Clear event annotations", use_container_width=True):
+        if st.button("Clear event annotations", width="stretch"):
             st.session_state["num_events"] = 0
         num_events = st.number_input(
             "Number of events/epochs",
@@ -2553,7 +2553,7 @@ if "num_events" not in st.session_state:
 if "num_z_ranges" not in st.session_state:
     st.session_state["num_z_ranges"] = 0
 
-run_clicked = st.button("Run / refresh analysis", type="primary", use_container_width=True)
+run_clicked = st.button("Run / refresh analysis", type="primary", width="stretch")
 if st.session_state.pop("auto_run", False) and uploaded_files:
     run_clicked = True
 
@@ -2817,12 +2817,12 @@ def standalone_lick_section(file_obj, cfg):
         srow = {"Bottle": n_, **srow}
         rows.append(srow)
     st.markdown("**Per bottle**")
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     bouts = lk.detect_bouts(pooled, cfg["inter_bout_sec"],
                             cfg["min_licks_per_bout"])
     with st.expander(f"Bouts ({len(bouts)})"):
-        st.dataframe(bouts, use_container_width=True, hide_index=True)
+        st.dataframe(bouts, width="stretch", hide_index=True)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -3118,7 +3118,7 @@ else:
                             "Max z-score": "{:.4f}",
                             "Z-score range": "{:.4f}",
                         }),
-                        use_container_width=True,
+                        width="stretch",
                         height=min(420, 105 + 35 * len(z_stats_df)),
                     )
                     st.download_button(
@@ -3153,7 +3153,7 @@ else:
             render_chart(focus_graph)
             with st.expander("Data preview and downloads"):
                 th.explain("About this preview", "Preview of the displayed data window. The downloadable CSV remains the full processed data.")
-                st.dataframe(_preview_12h(view_df.head(500)), use_container_width=True, height=360)
+                st.dataframe(_preview_12h(view_df.head(500)), width="stretch", height=360)
                 gt.download_button(
                     label=f"Download full processed CSV for {result['name']}",
                     data=lambda _d=full_df: _d.to_csv(index=False).encode("utf-8"),
@@ -3174,7 +3174,7 @@ else:
         )
         if view == "Data preview":
             th.explain("About this preview", "Preview of the displayed data window. The downloadable CSV remains the full processed data.")
-            st.dataframe(_preview_12h(view_df.head(500)), use_container_width=True, height=360)
+            st.dataframe(_preview_12h(view_df.head(500)), width="stretch", height=360)
             gt.download_button(
                 label=f"Download full processed CSV for {result['name']}",
                 data=lambda _d=full_df: _d.to_csv(index=False).encode("utf-8"),
@@ -3561,7 +3561,7 @@ else:
                 show = bouts.copy()
                 for c in ("onset_sec", "offset_sec"):
                     show[c.replace("_sec", "_hms")] = [seconds_to_hms(v) for v in show[c]]
-                st.dataframe(show.round(3), use_container_width=True, height=340)
+                st.dataframe(show.round(3), width="stretch", height=340)
                 st.download_button(
                     "Download bout table (CSV)",
                     show.to_csv(index=False).encode("utf-8"),
@@ -3581,7 +3581,7 @@ else:
         data=lambda: make_zip_from_results(results, roi_name),
         file_name="photometry_analysis_outputs.zip",
         mime="application/zip",
-        use_container_width=True,
+        width="stretch",
     )
 
     with _ai_slot:

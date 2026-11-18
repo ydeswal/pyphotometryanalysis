@@ -603,7 +603,7 @@ def _events_editor(names, clock_starts):
         when = q[1].text_input("Time", "1:00", key="grp_q_time")
         kind = q[2].selectbox("Time is", EVENT_TIME_KINDS, key="grp_q_kind")
         q[3].write("")
-        if q[3].button("Add to every recording", key="grp_q_add", use_container_width=True):
+        if q[3].button("Add to every recording", key="grp_q_add", width="stretch"):
             cur = ss.get("grp_events_cur", ss["grp_events_base"])
             ss["grp_events_base"] = pd.concat([cur, pd.DataFrame([{"event": lab, "recording": "All recordings",
                                                                    "time": when, "time is": kind}])],
@@ -611,7 +611,7 @@ def _events_editor(names, clock_starts):
             ss["grp_events_ver"] += 1
             st.rerun()
         ed = st.data_editor(ss["grp_events_base"], key=f"grp_events_{ss['grp_events_ver']}", num_rows="dynamic",
-                            hide_index=True, use_container_width=True,
+                            hide_index=True, width="stretch",
                             column_config={
                                 "event": st.column_config.TextColumn("Event", required=True),
                                 "recording": st.column_config.SelectboxColumn(
@@ -737,7 +737,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                    "or days (e.g. Day 1 / Day 7, or Control / Drug). The same animal in two groups is compared "
                    "as a paired design.")
         opts = sorted(set(animals) | set(base_df["animal"]))
-        ed = st.data_editor(base_df, key="grp_editor", hide_index=True, use_container_width=True,
+        ed = st.data_editor(base_df, key="grp_editor", hide_index=True, width="stretch",
                             disabled=["recording"],
                             column_config={
                                 "include": st.column_config.CheckboxColumn("Use", width="small"),
@@ -1087,7 +1087,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
                              sig_label, centred, h, row_events=rev)
         if S2 is not None:
             th.explain("How to read this graph", "The heatmap shows the 465 channel; see *Each recording* for 405.")
-        st.plotly_chart(retitle(fig), use_container_width=True, config=config, key="grp_heat")
+        st.plotly_chart(retitle(fig), width="stretch", config=config, key="grp_heat")
 
     elif view == "Actogram (days, double-plotted)":
         _actogram_view(members, norm, base_min, bl_end, alignment, ref, bin_s, lights_on, lights_off, sig_label,
@@ -1111,9 +1111,9 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             st.info("Load FED3 data to see feeding patterns.")
             return
         st.markdown("**Group mean ± SEM**")
-        st.dataframe(summ, hide_index=True, use_container_width=True)
+        st.dataframe(summ, hide_index=True, width="stretch")
         st.markdown("**Each animal**")
-        st.dataframe(tab.round(3), hide_index=True, use_container_width=True)
+        st.dataframe(tab.round(3), hide_index=True, width="stretch")
         th.explain("What these columns mean", f"Meals: pellets less than {gap:g} s apart, at least {minp} pellet(s). Satiety ratio: minutes "
                    "without eating after a meal per pellet in that meal. Hours logged excludes times the FED "
                    "was not recording. % pellets in dark uses the lights-off/on hours under More settings.")
@@ -1328,7 +1328,7 @@ def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, 
                              if v is not None and clock_starts.get(n) is not None else ""
                              for n, v in zip(tdf["recording"], tdf["event at (s into recording)"])]
         key = f"sc_times_{abs(hash((label, tuple(first_ev.items())))) % 10 ** 8}"
-        tdf = st.data_editor(tdf, key=key, hide_index=True, use_container_width=True,
+        tdf = st.data_editor(tdf, key=key, hide_index=True, width="stretch",
                              disabled=["recording", "clock time"],
                              column_config={"event at (s into recording)": st.column_config.NumberColumn(
                                  format="%.1f", help="Seconds since that recording started")})
@@ -1405,7 +1405,7 @@ def _signal_check_view(ed, by_name, events, ev_labels, roi, prepare_df, config, 
             sty = sty.format(precision=3, subset=["noise %"], na_rep="–")
     except AttributeError:
         sty = show.style.applymap(colour, subset=["grade"]).format(precision=1, na_rep="–")
-    st.dataframe(sty, hide_index=True, use_container_width=True,
+    st.dataframe(sty, hide_index=True, width="stretch",
                  column_config={"notes": st.column_config.TextColumn(width="large")})
     dl = st.columns(2)
     dl[0].download_button("Download grades (CSV)", tab.to_csv(index=False).encode(), "signal_check_grades.csv",
@@ -1494,7 +1494,7 @@ def _aligned_view(members, norm, base_min, alignment, gap, minp, pre, post, base
                                  else None})
         if comp:
             st.markdown("**Between groups** (animal-level)")
-            st.dataframe(pd.DataFrame(comp), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(comp), hide_index=True, width="stretch")
 
     tbl = pd.DataFrame([{
         "animal": r["animal"], "group": r["group"], "meals used": r["n_meals"],
@@ -1503,7 +1503,7 @@ def _aligned_view(members, norm, base_min, alignment, gap, minp, pre, post, base
         "405 change": round(r["control"]["effect"], 3) if r["control"]["effect"] is not None else None,
         "405 p": round(r["control"]["p"], 4) if r["control"]["p"] is not None else None,
         "data check": r["check"]["label"]} for r in R if r is not None])
-    st.dataframe(tbl, hide_index=True, use_container_width=True)
+    st.dataframe(tbl, hide_index=True, width="stretch")
     per_meal = []
     for r in R:
         if r is None:
@@ -1614,9 +1614,9 @@ def _baseline_response_table(members, alignment, ref, end_x, base_min, sig_label
                               legend=dict(orientation="h", y=1.1, x=0), hovermode="x unified",
                               xaxis_title=f"{'minutes' if unit == 60 else 'seconds'} from the end of the baseline",
                               yaxis_title="z against the baseline")
-            st.plotly_chart(fig, use_container_width=True, key="grp_bl_fig")
+            st.plotly_chart(fig, width="stretch", key="grp_bl_fig")
         tab = pd.DataFrame(rows)
-        st.dataframe(tab.round(3), use_container_width=True, hide_index=True)
+        st.dataframe(tab.round(3), width="stretch", hide_index=True)
         num = [c_ for c_ in tab.columns if c_ not in ("recording", "animal", "group", "note")]
         summ = []
         for g, sub in tab.groupby("group", sort=False):
@@ -1628,7 +1628,7 @@ def _baseline_response_table(members, alignment, ref, end_x, base_min, sig_label
                          (f"{v[0]:.3g}" if v.size else ""))
             summ.append(r)
         st.markdown("**Group mean ± SEM**")
-        st.dataframe(pd.DataFrame(summ).astype(str), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(summ).astype(str), width="stretch", hide_index=True)
         st.caption(f"Signal: {sig_label} before normalising. Baseline = the {base_min:g} min before the chosen "
                    "moment (blue band); z = (signal − baseline mean) ÷ baseline SD of each recording; grey band = "
                    "±1 SD. 'Baseline + response' is the same peak z-scored over both windows together, for "
@@ -1699,7 +1699,7 @@ def _actogram_view(members, norm, base_min, bl_end, alignment, ref, bin_s, light
                           title=dict(text=f"{m['name']}" + (f" · {m['animal']}" if m["animal"] else ""),
                                      font=dict(size=14)),
                           margin=dict(l=90, r=30, t=60, b=60), font=dict(color="#111827"))
-        st.plotly_chart(fig, use_container_width=True, config=config, key=f"grp_acto_{m['name']}")
+        st.plotly_chart(fig, width="stretch", config=config, key=f"grp_acto_{m['name']}")
     th.explain("How to read the actogram",
                "Every row is one day, and it shows that day **and the next one** (0-48 h), so anything that "
                "crosses midnight stays in one piece; each day therefore appears twice, once on the right of a row "
@@ -1734,7 +1734,10 @@ def _meal_size_view(members, norm, base_min, bl_end, alignment, ref, gap, minp, 
         mm = dict(m, y=_normalised(m, norm, base_min, bl_end, alignment, ref))
         parts.append(lg.meal_responses(mm, gap, minp, base, resp, lights_on, lights_off))
     df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-    df = df[np.isfinite(df["response"])] if not df.empty else df
+    if not df.empty:
+        for c_ in ("response", "base", "after", "pellets", "grams", "hour_of_day", "onset_s", "duration_s"):
+            df[c_] = pd.to_numeric(df[c_], errors="coerce")
+        df = df[np.isfinite(df["response"].to_numpy(float))]
     if df.empty:
         st.info("No meal has both windows inside a recording. Shorten the windows or check the meal definition "
                 "(More settings).")
@@ -1764,11 +1767,11 @@ def _meal_size_view(members, norm, base_min, bl_end, alignment, ref, gap, minp, 
     fig.update_layout(template="plotly_white", height=int(520 * h), margin=dict(l=70, r=20, t=40, b=60),
                       xaxis_title="meal size (" + xs + ")", yaxis_title=f"change in {sig_label}",
                       legend=dict(orientation="h", y=1.08, x=0), font=dict(color="#111827"))
-    st.plotly_chart(fig, use_container_width=True, config=config, key="grp_mealsize")
+    st.plotly_chart(fig, width="stretch", config=config, key="grp_mealsize")
     per, grp = lg.slope_stats(df)
-    st.dataframe(per, use_container_width=True, hide_index=True)
+    st.dataframe(per, width="stretch", hide_index=True)
     if not grp.empty:
-        st.dataframe(grp, use_container_width=True, hide_index=True)
+        st.dataframe(grp, width="stretch", hide_index=True)
     th.explain("How to read this graph",
                f"Every point is one meal: its size (x) and how much the signal changed from before the meal "
                f"({base[0]:g} to {base[1]:g} s) to after it started ({resp[0]:g} to {resp[1]:g} s). Filled points: "
@@ -1832,7 +1835,7 @@ def _meals_view(members, alignment, ref, gap, minp, lights_on, lights_off, darks
     fig.update_yaxes(title_text="min / pellet", rangemode="tozero", row=3, col=1)
     fig.update_layout(template="plotly_white", height=int(820 * h), margin=dict(l=70, r=20, t=60, b=60),
                       legend=dict(orientation="h", y=1.06, x=0), font=dict(color="#111827"), dragmode="pan")
-    st.plotly_chart(fig, use_container_width=True, config=config, key="grp_meals_fig")
+    st.plotly_chart(fig, width="stretch", config=config, key="grp_meals_fig")
 
     # per-animal distributions: meal size and inter-meal interval
     d = make_subplots(rows=1, cols=3, subplot_titles=("Meal size (pellets)", "Meal duration (min)",
@@ -1845,14 +1848,14 @@ def _meals_view(members, alignment, ref, gap, minp, lights_on, lights_off, darks
                                pointpos=0, showlegend=False, line=dict(width=1.4)), row=1, col=k)
     d.update_layout(template="plotly_white", height=int(360 * h), margin=dict(l=50, r=20, t=50, b=40),
                     font=dict(color="#111827"))
-    st.plotly_chart(d, use_container_width=True, config=config, key="grp_meals_box")
+    st.plotly_chart(d, width="stretch", config=config, key="grp_meals_box")
 
     tab, summ = ga.meal_table(members, gap, minp, lights_on, lights_off)
     st.markdown("**Each animal**")
-    st.dataframe(tab.round(3), hide_index=True, use_container_width=True)
+    st.dataframe(tab.round(3), hide_index=True, width="stretch")
     if not summ.empty:
         st.markdown("**Group mean ± SEM**")
-        st.dataframe(summ.astype(str), hide_index=True, use_container_width=True)
+        st.dataframe(summ.astype(str), hide_index=True, width="stretch")
     st.markdown("**Every meal**")
     show = ML.drop(columns=["onset_s", "offset_s"]).copy()
     show["onset_clock"] = [gt.fmt12(v, decimals=0) if pd.notna(v) else "" for v in show["onset_clock"]]
@@ -1863,7 +1866,7 @@ def _meals_view(members, alignment, ref, gap, minp, lights_on, lights_off, darks
                                 "duration_min": "duration (min)", "pellets_per_min": "pellets / min in meal",
                                 "gap_before_min": "min since previous meal", "interval_after_min": "min until next meal",
                                 "satiety_ratio": "satiety ratio (min/pellet)"})
-    st.dataframe(show.round(3), hide_index=True, use_container_width=True)
+    st.dataframe(show.round(3), hide_index=True, width="stretch")
     th.explain("What these numbers mean",
                f"**Meal**: pellets less than {gap:g} s apart, at least {minp} pellet(s) (More settings → meal "
                "definition). **Duration**: first to last pellet of the meal. **Eating rate in the meal**: "

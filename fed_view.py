@@ -442,9 +442,9 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             for c in ses.columns:
                 if pd.api.types.is_datetime64_any_dtype(ses[c]):
                     ses[c] = [gt.fmt12(v, decimals=0) for v in ses[c]]
-            st.dataframe(ses, hide_index=True, use_container_width=True)
+            st.dataframe(ses, hide_index=True, width="stretch")
         cnt = fed.events.groupby(["animal", "session", "kind"]).size().unstack(fill_value=0)
-        st.dataframe(cnt, use_container_width=True)
+        st.dataframe(cnt, width="stretch")
 
     # ---- settings -----------------------------------------------------------
     labels = fed.sessions["session"].tolist() if not fed.sessions.empty else sorted(fed.events["session"].unique())
@@ -493,7 +493,7 @@ def render(results, fed, roi, prepare_df, max_points=12_000, height_mult=1.0, co
             outside = int(cov_tab["before it started"].sum() + cov_tab["after it ended"].sum())
             with st.expander("Pellets during each recording" + (f" ({outside} outside the recordings)"
                                                                  if outside else ""), expanded=False):
-                st.dataframe(cov_tab, hide_index=True, use_container_width=True)
+                st.dataframe(cov_tab, hide_index=True, width="stretch")
                 st.caption("Pellets taken before the photometry started or after it stopped have no signal to "
                            "go with them; they still count in the intake graphs.")
 
@@ -782,7 +782,7 @@ def _aligned(t, y, sig_label, pellets_s, meals, cov_s, pel_rows, cs, animal, gra
         tbl.insert(3, "pellets in meal", mm["n_pellets"].to_numpy())
         tbl.insert(4, "meal (g)", np.round(mm["n_pellets"].to_numpy() * grams_each, 3))
         tbl.insert(5, "meal length (s)", np.round(mm["duration_s"].to_numpy(), 1))
-    st.dataframe(tbl, hide_index=True, use_container_width=True, height=min(420, 40 + 35 * len(tbl)))
+    st.dataframe(tbl, hide_index=True, width="stretch", height=min(420, 40 + 35 * len(tbl)))
     gt.download_button("Download this table (CSV)", data=lambda: tbl.to_csv(index=False).encode(),
                        file_name=f"{animal}_{'meals' if meal_mode else 'pellets'}_aligned.csv",
                        mime="text/csv", key=f"fed_dl_{animal}_{meal_mode}")
@@ -831,7 +831,7 @@ def _all_animals(fed, sessions, grams_each, bin_min, ref, max_points, height_mul
     if len(hs) and (hs.drop(columns="animal").to_numpy(dtype=object) != 0).any():
         tbl = tbl.merge(hs[["animal", "jams", "JAMMED", "jam time (min)", "disconnects", "disconnected (min)",
                             "restarts", "email alerts"]], on="animal", how="left")
-    st.dataframe(tbl, hide_index=True, use_container_width=True)
+    st.dataframe(tbl, hide_index=True, width="stretch")
     th.explain("How to read this", "Grey: no FED logging for any animal. Meals in this table use the default "
                "definition; change it per animal in the other views. Jam / disconnect / restart columns come "
                "from the FED3 controller 2.0 status rows; see the FED health view.")
@@ -925,7 +925,7 @@ def _fed_health(fed, sessions, ref, max_points, height_mult, config, results, re
                "◆ email alert sent; ● 'problem fixed' email. Use the 📏 ruler to measure any period.")
 
     st.markdown("**Per animal**")
-    st.dataframe(summ[summ["animal"].isin(show)], hide_index=True, use_container_width=True)
+    st.dataframe(summ[summ["animal"].isin(show)], hide_index=True, width="stretch")
 
     # every problem as one list
     rows = []
@@ -943,7 +943,7 @@ def _fed_health(fed, sessions, ref, max_points, height_mult, config, results, re
     if rows:
         lst = pd.DataFrame(rows).sort_values("_t").drop(columns="_t")
         st.markdown(f"**Every FED problem and alert** ({len(lst)})")
-        st.dataframe(lst, hide_index=True, use_container_width=True, height=min(460, 40 + 35 * len(lst)))
+        st.dataframe(lst, hide_index=True, width="stretch", height=min(460, 40 + 35 * len(lst)))
         gt.download_button("Download this list (CSV)", data=lambda: lst.to_csv(index=False).encode(),
                            file_name="fed_health_events.csv", mime="text/csv", key="fed_h_dl")
     else:

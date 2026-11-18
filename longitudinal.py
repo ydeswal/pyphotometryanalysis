@@ -168,8 +168,11 @@ def slope_stats(df):
     """
     from scipy import stats as ss
     per = []
+    df = df.copy()
+    for c_ in ("response", "pellets"):
+        df[c_] = pd.to_numeric(df[c_], errors="coerce")
     for (g, an), sub in df.groupby(["group", "animal"], sort=False):
-        sub = sub[np.isfinite(sub["response"])]
+        sub = sub[np.isfinite(sub["response"].to_numpy(float))]
         row = {"group": g, "animal": an, "meals": int(len(sub)), "rho": np.nan, "p (rho)": np.nan,
                "slope per pellet": np.nan, "mean response": float(sub["response"].mean()) if len(sub) else np.nan}
         if len(sub) >= 3 and sub["pellets"].nunique() >= 2:
